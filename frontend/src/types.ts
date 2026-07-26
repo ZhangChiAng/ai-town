@@ -2,6 +2,13 @@ export const AGENT_IDS = ["A", "B", "C"] as const;
 
 export type AgentId = (typeof AGENT_IDS)[number];
 
+export interface TimelineRecord {
+  message_id: string;
+  direction: "sent" | "received";
+  counterpart_id: AgentId;
+  content: string;
+}
+
 export interface Agent {
   id: AgentId;
   name: string;
@@ -9,7 +16,7 @@ export interface Agent {
   desire: string;
   fear: string;
   memory: string;
-  timeline: unknown[];
+  timeline: TimelineRecord[];
 }
 
 export interface Scene {
@@ -36,4 +43,10 @@ export interface AgentUpdate {
 export interface SceneUpdate {
   name: string;
   agents: AgentUpdate[];
+}
+
+export interface MessageCreate {
+  sender_id: AgentId;
+  recipient_id: AgentId;
+  content: string;
 }

@@ -51,6 +51,27 @@ def update_payload(name: str = "雨夜港口") -> dict[str, Any]:
     }
 
 
+def send_message(
+    client: TestClient,
+    scene_id: str,
+    *,
+    sender_id: str = "A",
+    recipient_id: str = "B",
+    content: str = "你今晚会来码头吗？",
+) -> dict[str, Any]:
+    """Confirm a message and return the updated scene response."""
+    response = client.post(
+        f"/api/scenes/{scene_id}/messages",
+        json={
+            "sender_id": sender_id,
+            "recipient_id": recipient_id,
+            "content": content,
+        },
+    )
+    assert response.status_code == 201
+    return response.json()
+
+
 def test_create_scene_writes_one_utf8_json_file(
     client: TestClient, scene_directory: Path
 ) -> None:
@@ -198,6 +219,181 @@ def test_update_replaces_only_editable_fields(
         (scene_directory / f"{original['id']}.json").read_text(encoding="utf-8")
     )
     assert saved == updated
+
+
+def test_message_appends_matching_records_only_to_participants(
+    client: TestClient,
+) -> None:
+    """A confirmed message gives matching records only to its participants."""
+    scene = create_scene(client)
+
+    updated = send_message(
+        client,
+        scene["id"],
+        sender_id="A",
+        recipient_id="C",
+        content="  灯塔下见。  ",
+    )
+
+    sender_record = updated["agents"][0]["timeline"][0]
+    recipient_record = updated["agents"][2]["timeline"][0]
+    UUID(sender_record["message_id"])
+    assert sender_record == {
+        "message_id": recipient_record["message_id"],
+        "direction": "sent",
+        "counterpart_id": "C",
+        "content": "灯塔下见。",
+    }
+    assert recipient_record == {
+        "message_id": sender_record["message_id"],
+        "direction": "received",
+        "counterpart_id": "A",
+        "content": "灯塔下见。",
+    }
+    assert updated["agents"][1]["timeline"] == []
+
+
+def test_messages_preserve_each_agents_timeline_order(
+    client: TestClient,
+) -> None:
+    """Successive messages remain in confirmation order per agent."""
+    scene = create_scene(client)
+
+    send_message(client, scene["id"], content="第一条")
+    send_message(
+        client,
+        scene["id"],
+        sender_id="C",
+        recipient_id="A",
+        content="第二条",
+    )
+    updated = send_message(
+        client,
+        scene["id"],
+        sender_id="A",
+        recipient_id="B",
+        content="第三条",
+    )
+
+    assert [
+        (record["direction"], record["counterpart_id"], record["content"])
+        for record in updated["agents"][0]["timeline"]
+    ] == [
+        ("sent", "B", "第一条"),
+        ("received", "C", "第二条"),
+        ("sent", "B", "第三条"),
+    ]
+    assert [
+        record["content"] for record in updated["agents"][1]["timeline"]
+    ] == ["第一条", "第三条"]
+    assert [
+        record["content"] for record in updated["agents"][2]["timeline"]
+    ] == ["第二条"]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"sender_id": "A", "recipient_id": "B", "content": " \t "},
+        {"sender_id": "A", "recipient_id": "A", "content": "自言自语"},
+        {"sender_id": "D", "recipient_id": "A", "content": "非法发送者"},
+        {"sender_id": "A", "recipient_id": "D", "content": "非法接收者"},
+        {
+            "sender_id": "A",
+            "recipient_id": "B",
+            "content": "正文",
+            "unexpected": True,
+        },
+    ],
+)
+def test_message_rejects_invalid_payloads(
+    client: TestClient,
+    payload: dict[str, Any],
+) -> None:
+    """Invalid content, participants, and extra fields return 422."""
+    scene = create_scene(client)
+
+    response = client.post(
+        f"/api/scenes/{scene['id']}/messages",
+        json=payload,
+    )
+
+    assert response.status_code == 422
+    reopened = client.get(f"/api/scenes/{scene['id']}")
+    assert [agent["timeline"] for agent in reopened.json()["agents"]] == [
+        [],
+        [],
+        [],
+    ]
+
+
+def test_message_for_missing_scene_returns_404(client: TestClient) -> None:
+    """Confirming a message in a missing scene returns 404."""
+    response = client.post(
+        f"/api/scenes/{uuid4()}/messages",
+        json={
+            "sender_id": "A",
+            "recipient_id": "B",
+            "content": "无人收到",
+        },
+    )
+
+    assert response.status_code == 404
+
+
+def test_message_timeline_survives_restart_and_later_scene_update(
+    scene_directory: Path,
+) -> None:
+    """Messages reload after restart and survive editable-field updates."""
+    first_client = TestClient(create_app(SceneStorage(scene_directory)))
+    scene = create_scene(first_client)
+    messaged = send_message(first_client, scene["id"], content="保留这条消息")
+
+    restarted_client = TestClient(create_app(SceneStorage(scene_directory)))
+    reopened = restarted_client.get(f"/api/scenes/{scene['id']}")
+    assert reopened.status_code == 200
+    assert reopened.json() == messaged
+
+    update_response = restarted_client.put(
+        f"/api/scenes/{scene['id']}",
+        json=update_payload("消息后的场景"),
+    )
+    assert update_response.status_code == 200
+    assert [
+        agent["timeline"] for agent in update_response.json()["agents"]
+    ] == [agent["timeline"] for agent in messaged["agents"]]
+
+
+def test_failed_message_write_leaves_no_single_sided_record(
+    client: TestClient,
+    scene_directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed atomic save keeps both timelines and disk unchanged."""
+    scene = create_scene(client)
+    scene_path = scene_directory / f"{scene['id']}.json"
+    original_contents = scene_path.read_bytes()
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(storage_module.os, "replace", fail_replace)
+
+    response = client.post(
+        f"/api/scenes/{scene['id']}/messages",
+        json={
+            "sender_id": "A",
+            "recipient_id": "B",
+            "content": "不能只写给一方",
+        },
+    )
+
+    assert response.status_code == 500
+    assert scene_path.read_bytes() == original_contents
+    assert list(scene_directory.glob("*.tmp")) == []
+    assert [
+        agent["timeline"] for agent in json.loads(original_contents)["agents"]
+    ] == [[], [], []]
 
 
 @pytest.mark.parametrize(

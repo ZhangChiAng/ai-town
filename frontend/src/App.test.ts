@@ -85,6 +85,19 @@ async function setFieldValue(
   await nextTick();
 }
 
+async function setSelectValue(
+  selector: string,
+  value: string,
+): Promise<void> {
+  const field = container.querySelector<HTMLSelectElement>(selector);
+  if (field === null) {
+    throw new Error(`Could not find select "${selector}"`);
+  }
+  field.value = value;
+  field.dispatchEvent(new Event("change", { bubbles: true }));
+  await nextTick();
+}
+
 async function openFirstScene(): Promise<void> {
   const button = container.querySelector<HTMLButtonElement>(
     ".scene-list-button",
@@ -181,6 +194,149 @@ describe("App", () => {
       1,
     );
     expect(container.textContent).toContain("当前内容已保存");
+  });
+
+  it("requires an explicit recipient and confirms a message for both timelines", async () => {
+    const scene = makeScene();
+    const confirmed = makeScene();
+    confirmed.agents[0].timeline = [
+      {
+        message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        direction: "sent",
+        counterpart_id: "B",
+        content: "今晚在灯塔下见。",
+      },
+    ];
+    confirmed.agents[1].timeline = [
+      {
+        message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        direction: "received",
+        counterpart_id: "A",
+        content: "今晚在灯塔下见。",
+      },
+    ];
+    let messageBody: unknown;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (
+          input === `/api/scenes/${scene.id}/messages` &&
+          options?.method === "POST"
+        ) {
+          messageBody = JSON.parse(String(options.body));
+          return jsonResponse(confirmed, 201);
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+
+    const recipient =
+      container.querySelector<HTMLSelectElement>("#message-recipient");
+    expect(recipient?.value).toBe("");
+    expect(
+      Array.from(recipient?.options ?? []).map((option) => option.value),
+    ).toEqual(["", "B", "C"]);
+    expect(findButton("确认发送").disabled).toBe(true);
+
+    await setFieldValue(
+      "#message-content",
+      "  今晚在灯塔下见。  ",
+    );
+    expect(findButton("确认发送").disabled).toBe(true);
+
+    await setSelectValue("#message-recipient", "B");
+    expect(findButton("确认发送").disabled).toBe(false);
+    findButton("确认发送").click();
+    await flushAsyncUpdates();
+
+    expect(messageBody).toEqual({
+      sender_id: "A",
+      recipient_id: "B",
+      content: "今晚在灯塔下见。",
+    });
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("");
+    expect(container.textContent).toContain(
+      "发送给 B：今晚在灯塔下见。",
+    );
+
+    findButton("Agent B").click();
+    await nextTick();
+    expect(container.textContent).toContain("A：今晚在灯塔下见。");
+
+    findButton("Agent C").click();
+    await nextTick();
+    expect(container.textContent).toContain("时间线为空");
+    expect(container.textContent).not.toContain("今晚在灯塔下见。");
+  });
+
+  it("keeps the draft and reports an error when message confirmation fails", async () => {
+    const scene = makeScene();
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (options?.method === "POST") {
+          return jsonResponse(
+            { detail: "Could not save scene: disk is full" },
+            500,
+          );
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setSelectValue("#message-recipient", "C");
+    await setFieldValue("#message-content", "不要丢掉这份草稿");
+
+    findButton("确认发送").click();
+    await flushAsyncUpdates();
+
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("C");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("不要丢掉这份草稿");
+    expect(container.textContent).toContain(
+      "Could not save scene: disk is full",
+    );
   });
 
   it("merges a created scene with an older list response", async () => {
@@ -447,6 +603,118 @@ describe("App", () => {
     ).toBe(false);
   });
 
+  it("blocks message confirmation until scene edits are saved", async () => {
+    const scene = makeScene();
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (options?.method === "PUT") {
+          return jsonResponse({
+            ...scene,
+            agents: scene.agents.map((agent) =>
+              agent.id === "A"
+                ? { ...agent, persona: "尚未保存的人设" }
+                : agent,
+            ),
+          });
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setFieldValue("#agent-persona", "尚未保存的人设");
+    await setSelectValue("#message-recipient", "B");
+    await setFieldValue("#message-content", "保存后才能发送");
+
+    expect(container.textContent).toContain("请先保存场景");
+    expect(findButton("确认发送").disabled).toBe(true);
+    findButton("确认发送").click();
+    await flushAsyncUpdates();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    findButton("保存场景").click();
+    await flushAsyncUpdates();
+
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("B");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("保存后才能发送");
+    expect(findButton("确认发送").disabled).toBe(false);
+  });
+
+  it("keeps a separate in-memory message draft for each agent", async () => {
+    const scene = makeScene();
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValueOnce(
+          jsonResponse([{ id: scene.id, name: scene.name }]),
+        )
+        .mockResolvedValueOnce(jsonResponse(scene)),
+    );
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setSelectValue("#message-recipient", "B");
+    await setFieldValue("#message-content", "A 的草稿");
+
+    findButton("Agent B").click();
+    await nextTick();
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("");
+    await setSelectValue("#message-recipient", "C");
+    await setFieldValue("#message-content", "B 的草稿");
+
+    findButton("Agent A").click();
+    await nextTick();
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("B");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("A 的草稿");
+
+    findButton("Agent B").click();
+    await nextTick();
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("C");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("B 的草稿");
+  });
+
   it("asks before switching away from dirty scene content", async () => {
     const first = makeScene(FIRST_ID, "第一个场景");
     const second = makeScene(SECOND_ID, "第二个场景");
@@ -500,6 +768,74 @@ describe("App", () => {
     ).toBe("第二个场景");
   });
 
+  it("protects drafts on scene exit and discards them only after open succeeds", async () => {
+    const first = makeScene(FIRST_ID, "第一个场景");
+    const second = makeScene(SECOND_ID, "第二个场景");
+    let secondOpenAttempts = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (input === "/api/scenes") {
+        return jsonResponse([
+          { id: first.id, name: first.name },
+          { id: second.id, name: second.name },
+        ]);
+      }
+      if (input === `/api/scenes/${first.id}`) {
+        return jsonResponse(first);
+      }
+      if (input === `/api/scenes/${second.id}`) {
+        secondOpenAttempts += 1;
+        return secondOpenAttempts === 1
+          ? jsonResponse({ detail: "Scene temporarily unavailable" }, 500)
+          : jsonResponse(second);
+      }
+      throw new Error(`Unexpected request: ${String(input)}`);
+    });
+    const confirmMock = vi.fn().mockReturnValue(true);
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("confirm", confirmMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setSelectValue("#message-recipient", "B");
+    await setFieldValue("#message-content", "还未确认的草稿");
+
+    const secondButton =
+      container.querySelectorAll<HTMLButtonElement>(
+        ".scene-list-button",
+      )[1];
+    secondButton.click();
+    await flushAsyncUpdates();
+
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain(
+      "Scene temporarily unavailable",
+    );
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("还未确认的草稿");
+
+    secondButton.click();
+    await flushAsyncUpdates();
+
+    expect(confirmMock).toHaveBeenCalledTimes(2);
+    expect(
+      container.querySelector<HTMLInputElement>("#scene-name")?.value,
+    ).toBe("第二个场景");
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("");
+  });
+
   it("asks before creating a new scene when the editor is dirty", async () => {
     const existing = makeScene(FIRST_ID, "已有场景");
     const created = makeScene(SECOND_ID, "新场景");
@@ -551,6 +887,63 @@ describe("App", () => {
     ).toBe("新场景");
   });
 
+  it("protects message drafts when creating a new scene", async () => {
+    const existing = makeScene(FIRST_ID, "已有场景");
+    const created = makeScene(SECOND_ID, "新场景");
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([
+            { id: existing.id, name: existing.name },
+          ]);
+        }
+        if (input === `/api/scenes/${existing.id}`) {
+          return jsonResponse(existing);
+        }
+        if (input === "/api/scenes" && options?.method === "POST") {
+          return jsonResponse(created, 201);
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    const confirmMock = vi
+      .fn()
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("confirm", confirmMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setSelectValue("#message-recipient", "C");
+    await setFieldValue("#message-content", "创建前的草稿");
+    await setFieldValue("#new-scene-name", "新场景");
+
+    findButton("创建").click();
+    await flushAsyncUpdates();
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("创建前的草稿");
+
+    findButton("创建").click();
+    await flushAsyncUpdates();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(
+      container.querySelector<HTMLInputElement>("#scene-name")?.value,
+    ).toBe("新场景");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("");
+  });
+
   it("protects dirty content when the page is about to close", async () => {
     const scene = makeScene();
     vi.stubGlobal(
@@ -572,6 +965,13 @@ describe("App", () => {
     });
     window.dispatchEvent(cleanEvent);
     expect(cleanEvent.defaultPrevented).toBe(false);
+
+    await setFieldValue("#message-content", "关闭前的草稿");
+    const draftEvent = new Event("beforeunload", {
+      cancelable: true,
+    });
+    window.dispatchEvent(draftEvent);
+    expect(draftEvent.defaultPrevented).toBe(true);
 
     await setFieldValue("#agent-persona", "还没有保存的人设");
     const dirtyEvent = new Event("beforeunload", {

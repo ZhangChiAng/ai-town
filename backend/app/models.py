@@ -15,6 +15,7 @@ SCHEMA_VERSION = 1
 AGENT_IDS = ("A", "B", "C")
 
 AgentId = Literal["A", "B", "C"]
+MessageDirection = Literal["sent", "received"]
 
 
 class ApiModel(BaseModel):
@@ -31,6 +32,25 @@ def _strip_non_blank_name(value: str) -> str:
     return stripped
 
 
+def _strip_non_blank_content(value: str) -> str:
+    """Strip whitespace and require non-empty message content."""
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("content must not be blank")
+    return stripped
+
+
+class TimelineRecord(ApiModel):
+    """One confirmed message as seen from an individual agent."""
+
+    message_id: UUID
+    direction: MessageDirection
+    counterpart_id: AgentId
+    content: str
+
+    _validate_content = field_validator("content")(_strip_non_blank_content)
+
+
 class Agent(ApiModel):
     """An agent in a scene with identity, personality traits, and a timeline."""
 
@@ -40,7 +60,7 @@ class Agent(ApiModel):
     desire: str = ""
     fear: str = ""
     memory: str = ""
-    timeline: list[object] = Field(default_factory=list, max_length=0)
+    timeline: list[TimelineRecord] = Field(default_factory=list)
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
 
@@ -109,6 +129,23 @@ class UpdateSceneRequest(ApiModel):
         return self
 
 
+class CreateMessageRequest(ApiModel):
+    """Payload for confirming a manually authored message."""
+
+    sender_id: AgentId
+    recipient_id: AgentId
+    content: str
+
+    _validate_content = field_validator("content")(_strip_non_blank_content)
+
+    @model_validator(mode="after")
+    def validate_distinct_participants(self) -> Self:
+        """Require two different agents to participate in the message."""
+        if self.sender_id == self.recipient_id:
+            raise ValueError("sender_id and recipient_id must be different")
+        return self
+
+
 def create_scene(name: str) -> Scene:
     """Create a new scene with default agents.
 
@@ -123,6 +160,45 @@ def create_scene(name: str) -> Scene:
         name=name,
         agents=[Agent(id=agent_id, name=agent_id) for agent_id in AGENT_IDS],
     )
+
+
+def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
+    """Append matching timeline records for a confirmed message.
+
+    Args:
+        scene: The scene receiving the message.
+        message: Validated sender, recipient, and message content.
+
+    Returns:
+        A new Scene with one record appended to each participant's timeline.
+    """
+    message_id = uuid4()
+    agents: list[Agent] = []
+
+    for agent in scene.agents:
+        timeline = list(agent.timeline)
+        if agent.id == message.sender_id:
+            timeline.append(
+                TimelineRecord(
+                    message_id=message_id,
+                    direction="sent",
+                    counterpart_id=message.recipient_id,
+                    content=message.content,
+                )
+            )
+        elif agent.id == message.recipient_id:
+            timeline.append(
+                TimelineRecord(
+                    message_id=message_id,
+                    direction="received",
+                    counterpart_id=message.sender_id,
+                    content=message.content,
+                )
+            )
+
+        agents.append(agent.model_copy(update={"timeline": timeline}))
+
+    return scene.model_copy(update={"agents": agents})
 
 
 def update_scene(scene: Scene, update: UpdateSceneRequest) -> Scene:

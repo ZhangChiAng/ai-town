@@ -8,10 +8,12 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from app.models import (
+    CreateMessageRequest,
     CreateSceneRequest,
     Scene,
     SceneSummary,
     UpdateSceneRequest,
+    add_message,
     create_scene,
     update_scene,
 )
@@ -99,6 +101,20 @@ def create_app(scene_storage: SceneStorage | None = None) -> FastAPI:
     ) -> Scene:
         current_scene = storage(request).get(scene_id)
         updated_scene = update_scene(current_scene, payload)
+        storage(request).save(updated_scene)
+        return updated_scene
+
+    @application.post(
+        "/api/scenes/{scene_id}/messages",
+        status_code=status.HTTP_201_CREATED,
+    )
+    def post_message(
+        scene_id: UUID,
+        payload: CreateMessageRequest,
+        request: Request,
+    ) -> Scene:
+        current_scene = storage(request).get(scene_id)
+        updated_scene = add_message(current_scene, payload)
         storage(request).save(updated_scene)
         return updated_scene
 

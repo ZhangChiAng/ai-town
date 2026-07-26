@@ -11,6 +11,7 @@ import {
   getScene,
   listScenes,
   saveScene,
+  sendMessage,
 } from "./api";
 import {
   AGENT_IDS,
@@ -22,6 +23,10 @@ import {
 
 type ListState = "loading" | "ready" | "error";
 type SaveState = "idle" | "saving" | "success" | "error";
+interface MessageDraft {
+  recipientId: AgentId | "";
+  content: string;
+}
 
 const sceneSummaries = ref<SceneSummary[]>([]);
 const currentScene = ref<Scene | null>(null);
@@ -37,12 +42,31 @@ const openingSceneId = ref<string | null>(null);
 const isCreating = ref(false);
 const saveState = ref<SaveState>("idle");
 const saveError = ref("");
+const messageDrafts = ref<Record<AgentId, MessageDraft>>(
+  emptyMessageDrafts(),
+);
+const messageErrors = ref<Record<AgentId, string>>(
+  emptyMessageErrors(),
+);
+const sendingAgentId = ref<AgentId | null>(null);
 
 let listRequestToken = 0;
 let summaryMutationVersion = 0;
 
 function cloneScene(scene: Scene): Scene {
   return JSON.parse(JSON.stringify(scene)) as Scene;
+}
+
+function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
+  return {
+    A: { recipientId: "", content: "" },
+    B: { recipientId: "", content: "" },
+    C: { recipientId: "", content: "" },
+  };
+}
+
+function emptyMessageErrors(): Record<AgentId, string> {
+  return { A: "", B: "", C: "" };
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -89,20 +113,50 @@ const activeAgent = computed(() =>
   ),
 );
 
+const activeMessageDraft = computed(
+  () => messageDrafts.value[activeAgentId.value],
+);
+
+const recipientOptions = computed(() =>
+  AGENT_IDS.filter((agentId) => agentId !== activeAgentId.value),
+);
+
+const hasMessageDrafts = computed(() =>
+  AGENT_IDS.some((agentId) => {
+    const draft = messageDrafts.value[agentId];
+    return draft.recipientId !== "" || draft.content !== "";
+  }),
+);
+
 const editorLocked = computed(
   () =>
     saveState.value === "saving" ||
+    sendingAgentId.value !== null ||
     isCreating.value ||
     openingSceneId.value !== null,
+);
+
+const canSendMessage = computed(
+  () =>
+    currentScene.value !== null &&
+    !isDirty.value &&
+    !editorLocked.value &&
+    activeMessageDraft.value.recipientId !== "" &&
+    activeMessageDraft.value.content.trim() !== "",
 );
 
 function installScene(
   scene: Scene,
   desiredActiveAgentId: AgentId = "A",
+  preserveMessageDrafts = false,
 ): void {
   savedScene.value = cloneScene(scene);
   currentScene.value = cloneScene(scene);
   activeAgentId.value = desiredActiveAgentId;
+  if (!preserveMessageDrafts) {
+    messageDrafts.value = emptyMessageDrafts();
+    messageErrors.value = emptyMessageErrors();
+  }
   saveState.value = "idle";
   saveError.value = "";
   actionError.value = "";
@@ -120,11 +174,11 @@ function upsertSummary(scene: Scene): void {
 }
 
 function confirmDiscardChanges(): boolean {
-  return (
-    !isDirty.value ||
-    window.confirm(
-      "当前场景有未保存的更改。确定要放弃这些更改吗？",
-    )
+  if (!isDirty.value && !hasMessageDrafts.value) {
+    return true;
+  }
+  return window.confirm(
+    "当前场景有未保存的更改或未确认的消息草稿。确定要放弃吗？",
   );
 }
 
@@ -168,7 +222,8 @@ async function openScene(summary: SceneSummary): Promise<void> {
     summary.id === currentScene.value?.id ||
     openingSceneId.value !== null ||
     isCreating.value ||
-    saveState.value === "saving"
+    saveState.value === "saving" ||
+    sendingAgentId.value !== null
   ) {
     return;
   }
@@ -201,6 +256,7 @@ async function submitNewScene(): Promise<void> {
     isCreating.value ||
     openingSceneId.value !== null ||
     saveState.value === "saving" ||
+    sendingAgentId.value !== null ||
     !confirmDiscardChanges()
   ) {
     return;
@@ -245,7 +301,11 @@ function sceneUpdate(scene: Scene): SceneUpdate {
 
 async function saveCurrentScene(): Promise<void> {
   const scene = currentScene.value;
-  if (scene === null || saveState.value === "saving") {
+  if (
+    scene === null ||
+    saveState.value === "saving" ||
+    sendingAgentId.value !== null
+  ) {
     return;
   }
   const selectedAgentId = activeAgentId.value;
@@ -265,7 +325,7 @@ async function saveCurrentScene(): Promise<void> {
   try {
     const saved = await saveScene(scene.id, sceneUpdate(scene));
     upsertSummary(saved);
-    installScene(saved, selectedAgentId);
+    installScene(saved, selectedAgentId, true);
     saveState.value = "success";
   } catch (error) {
     saveState.value = "error";
@@ -273,8 +333,50 @@ async function saveCurrentScene(): Promise<void> {
   }
 }
 
+function markMessageDraftEdited(): void {
+  messageErrors.value[activeAgentId.value] = "";
+}
+
+async function confirmMessage(): Promise<void> {
+  const scene = currentScene.value;
+  const senderId = activeAgentId.value;
+  const draft = messageDrafts.value[senderId];
+  if (
+    scene === null ||
+    isDirty.value ||
+    sendingAgentId.value !== null ||
+    draft.recipientId === "" ||
+    draft.content.trim() === ""
+  ) {
+    return;
+  }
+
+  sendingAgentId.value = senderId;
+  messageErrors.value[senderId] = "";
+
+  try {
+    const updated = await sendMessage(scene.id, {
+      sender_id: senderId,
+      recipient_id: draft.recipientId,
+      content: draft.content.trim(),
+    });
+    installScene(updated, senderId, true);
+    messageDrafts.value[senderId] = {
+      recipientId: "",
+      content: "",
+    };
+  } catch (error) {
+    messageErrors.value[senderId] = errorMessage(
+      error,
+      "消息发送失败，请重试。",
+    );
+  } finally {
+    sendingAgentId.value = null;
+  }
+}
+
 function handleBeforeUnload(event: BeforeUnloadEvent): void {
-  if (!isDirty.value) {
+  if (!isDirty.value && !hasMessageDrafts.value) {
     return;
   }
   event.preventDefault();
@@ -303,7 +405,7 @@ onBeforeUnmount(() => {
       </a>
       <p class="milestone">
         <span aria-hidden="true"></span>
-        手动编辑 · 显式保存
+        手工消息 · 显式确认
       </p>
     </header>
 
@@ -327,13 +429,13 @@ onBeforeUnmount(() => {
               type="text"
               autocomplete="off"
               placeholder="例如：雨夜港口"
-              :disabled="isCreating"
+              :disabled="editorLocked"
               @input="createError = ''"
             />
             <button
               class="primary-button create-button"
               type="submit"
-              :disabled="isCreating"
+              :disabled="editorLocked"
             >
               {{ isCreating ? "创建中…" : "创建" }}
             </button>
@@ -596,15 +698,115 @@ onBeforeUnmount(() => {
               </label>
             </div>
 
+            <section
+              class="message-card"
+              aria-labelledby="message-draft-title"
+            >
+              <div class="message-card-heading">
+                <div>
+                  <p class="eyebrow">MANUAL MESSAGE</p>
+                  <h3 id="message-draft-title">手工消息草稿</h3>
+                </div>
+                <p>
+                  发送者
+                  <strong>Agent {{ activeAgent.id }}</strong>
+                </p>
+              </div>
+
+              <div class="message-fields">
+                <label class="message-recipient" for="message-recipient">
+                  <span>接收者</span>
+                  <select
+                    id="message-recipient"
+                    v-model="activeMessageDraft.recipientId"
+                    :disabled="editorLocked"
+                    @change="markMessageDraftEdited"
+                  >
+                    <option value="">请选择接收者</option>
+                    <option
+                      v-for="agentId in recipientOptions"
+                      :key="agentId"
+                      :value="agentId"
+                    >
+                      Agent {{ agentId }} ·
+                      {{
+                        currentScene.agents.find(
+                          (agent) => agent.id === agentId,
+                        )?.name
+                      }}
+                    </option>
+                  </select>
+                </label>
+
+                <label class="message-content" for="message-content">
+                  <span>正文</span>
+                  <textarea
+                    id="message-content"
+                    v-model="activeMessageDraft.content"
+                    rows="4"
+                    :disabled="editorLocked"
+                    placeholder="手工填写这位 Agent 要发送的内容"
+                    @input="markMessageDraftEdited"
+                  ></textarea>
+                </label>
+              </div>
+
+              <div class="message-actions">
+                <p v-if="isDirty" class="message-hint">
+                  请先保存场景，再确认发送。
+                </p>
+                <p
+                  v-else-if="messageErrors[activeAgent.id]"
+                  class="form-error message-error"
+                  role="alert"
+                >
+                  {{ messageErrors[activeAgent.id] }}
+                </p>
+                <p v-else class="message-hint">
+                  只有确认后的消息才会进入双方个人时间线。
+                </p>
+                <button
+                  class="primary-button message-send-button"
+                  type="button"
+                  :disabled="!canSendMessage"
+                  @click="confirmMessage"
+                >
+                  {{
+                    sendingAgentId === activeAgent.id
+                      ? "发送中…"
+                      : "确认发送"
+                  }}
+                </button>
+              </div>
+            </section>
+
             <section class="timeline-card" aria-labelledby="timeline-title">
-              <div>
+              <div class="timeline-heading">
                 <p class="eyebrow">TIMELINE</p>
                 <h3 id="timeline-title">个人时间线</h3>
+                <small>按确认顺序排列，仅当前 Agent 可见的记录</small>
               </div>
-              <p>时间线为空</p>
-              <small>
-                本里程碑不生成消息；时间线不可编辑，也不会自动推进。
-              </small>
+              <p
+                v-if="activeAgent.timeline.length === 0"
+                class="timeline-empty"
+              >
+                时间线为空
+              </p>
+              <ol v-else class="timeline-list">
+                <li
+                  v-for="record in activeAgent.timeline"
+                  :key="`${record.message_id}-${record.direction}`"
+                >
+                  <span class="timeline-direction">
+                    {{
+                      record.direction === "sent"
+                        ? `发送给 ${record.counterpart_id}：`
+                        : `${record.counterpart_id}：`
+                    }}
+                  </span>
+                  <span>{{ record.content }}</span>
+                </li>
+              </ol>
             </section>
           </div>
         </template>

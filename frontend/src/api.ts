@@ -1,6 +1,7 @@
 import type {
   Agent,
   AgentId,
+  MessageCreate,
   Scene,
   SceneSummary,
   SceneUpdate,
@@ -35,7 +36,18 @@ function isAgent(value: unknown): value is Agent {
     typeof value.desire === "string" &&
     typeof value.fear === "string" &&
     typeof value.memory === "string" &&
-    Array.isArray(value.timeline)
+    Array.isArray(value.timeline) &&
+    value.timeline.every(isTimelineRecord)
+  );
+}
+
+function isTimelineRecord(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    typeof value.message_id === "string" &&
+    (value.direction === "sent" || value.direction === "received") &&
+    isAgentId(value.counterpart_id) &&
+    typeof value.content === "string"
   );
 }
 
@@ -161,6 +173,24 @@ export async function saveScene(
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(update),
+    },
+  );
+  if (!isScene(body)) {
+    throw new ApiError("后端返回了无法识别的场景数据。");
+  }
+  return body;
+}
+
+export async function sendMessage(
+  sceneId: string,
+  message: MessageCreate,
+): Promise<Scene> {
+  const body = await requestJson(
+    `/api/scenes/${encodeURIComponent(sceneId)}/messages`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(message),
     },
   );
   if (!isScene(body)) {
