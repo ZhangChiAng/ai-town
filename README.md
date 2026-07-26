@@ -77,8 +77,15 @@ Set-Location frontend
 npm run dev
 ```
 
-打开 Vite 输出的本地地址（默认是 `http://127.0.0.1:5173`）。开发服务器会把
-相对路径 `/api` 代理到 `http://127.0.0.1:8000`。
+本机开发时，打开 Vite 输出的地址（默认是 `http://127.0.0.1:5173`）。
+开发服务器会把相对路径 `/api` 代理到 `http://127.0.0.1:8000`。
+
+使用 VS Code Remote - SSH 在云端开发机运行项目时，需要把云端端口转发到个人
+电脑。启动服务后，执行 VS Code 命令面板中的
+`Ports: Focus on Ports View`，点击“转发端口（Forward a Port）”并输入
+`5173`，然后打开端口面板显示的本地地址。该地址通常是个人电脑上的
+`http://localhost:5173`；若本地端口被占用，VS Code 会分配其他端口，必须
+以面板显示的地址为准。
 
 ## 场景数据
 
@@ -101,7 +108,8 @@ npm run dev
 - `GET /api/scenes/{id}`
 - `PUT /api/scenes/{id}`
 
-可在后端运行后打开 `http://127.0.0.1:8000/docs` 查看交互式接口文档。
+本机运行后可打开 `http://127.0.0.1:8000/docs` 查看交互式接口文档。通过
+Remote - SSH 运行时，请使用 VS Code“端口”面板中 `AI Town API` 的本地地址。
 
 ## 验证
 
