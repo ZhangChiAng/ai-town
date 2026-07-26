@@ -13,3 +13,12 @@ baseline.
   mechanisms, numeric state, automatic recall, or automatic simulation.
 - Clarify major product and behavioral decisions with the user before
   implementing them.
+
+# Coding Style
+
+Follow Google Python Style for organization, naming, imports, docstrings, and
+readability. Use Ruff as the formatting and linting tool.
+
+Add short inline comments inside functions to explain non-obvious
+implementation logic. Explain intent and control flow, not what an individual
+line already says.
