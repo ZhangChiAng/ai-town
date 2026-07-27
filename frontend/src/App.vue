@@ -34,7 +34,6 @@ interface MessageDraft {
   recipientId: AgentId | "";
   content: string;
   usage: MessageDraftUsage | null;
-  requestSnapshot: ModelRequest | null;
 }
 
 const sceneSummaries = ref<SceneSummary[]>([]);
@@ -80,19 +79,16 @@ function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
       recipientId: "",
       content: "",
       usage: null,
-      requestSnapshot: null,
     },
     B: {
       recipientId: "",
       content: "",
       usage: null,
-      requestSnapshot: null,
     },
     C: {
       recipientId: "",
       content: "",
       usage: null,
-      requestSnapshot: null,
     },
   };
 }
@@ -168,19 +164,6 @@ const activeDraftHasContent = computed(() => {
   const draft = activeMessageDraft.value;
   return draft.recipientId !== "" || draft.content !== "";
 });
-
-const observableRequests = computed(() => [
-  {
-    key: "preview",
-    title: "下一次请求预览",
-    request: requestPreviews.value[activeAgentId.value],
-  },
-  {
-    key: "snapshot",
-    title: "当前草稿实际请求",
-    request: activeMessageDraft.value.requestSnapshot,
-  },
-]);
 
 const deletableMessageIds = computed(() => {
   const scene = currentScene.value;
@@ -488,7 +471,6 @@ async function generateDraft(): Promise<void> {
       recipientId: generated.recipient_id,
       content: generated.content,
       usage: generated.usage,
-      requestSnapshot: generated.request_snapshot,
     };
   } catch (error) {
     messageErrors.value[senderId] = errorMessage(
@@ -528,7 +510,6 @@ async function confirmMessage(): Promise<void> {
       recipientId: "",
       content: "",
       usage: null,
-      requestSnapshot: null,
     };
   } catch (error) {
     messageErrors.value[senderId] = errorMessage(
@@ -654,66 +635,12 @@ function discardActiveDraft(): void {
     recipientId: "",
     content: "",
     usage: null,
-    requestSnapshot: null,
   };
   messageErrors.value[agentId] = "";
 }
 
 function prettyJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
-}
-
-function requestSystemText(request: ModelRequest): string {
-  const system = request.system;
-  if (!Array.isArray(system) || typeof system[0] !== "object") {
-    return "";
-  }
-  const block = system[0] as Record<string, unknown>;
-  return typeof block.text === "string" ? block.text : "";
-}
-
-function requestSystemHasCacheControl(request: ModelRequest): boolean {
-  const system = request.system;
-  if (!Array.isArray(system) || typeof system[0] !== "object") {
-    return false;
-  }
-  const block = system[0] as Record<string, unknown>;
-  return typeof block.cache_control === "object";
-}
-
-function requestTimelineMessages(
-  request: ModelRequest,
-): { role: string; text: string; cacheControl: boolean }[] {
-  const messages = request.messages;
-  if (!Array.isArray(messages)) {
-    return [];
-  }
-  return messages.flatMap((message) => {
-    if (typeof message !== "object" || message === null) {
-      return [];
-    }
-    const record = message as Record<string, unknown>;
-    const content = record.content;
-    if (!Array.isArray(content)) {
-      return [];
-    }
-    const blocks = content.filter(
-      (block): block is Record<string, unknown> =>
-        typeof block === "object" && block !== null,
-    );
-    return [
-      {
-        role: typeof record.role === "string" ? record.role : "",
-        text: blocks
-          .map((block) => block.text)
-          .filter((text): text is string => typeof text === "string")
-          .join(""),
-        cacheControl: blocks.some(
-          (block) => typeof block.cache_control === "object",
-        ),
-      },
-    ];
-  });
 }
 
 function handleBeforeUnload(event: BeforeUnloadEvent): void {
@@ -1227,8 +1154,8 @@ onBeforeUnmount(() => {
             >
               <div class="message-card-heading">
                 <div>
-                  <p class="eyebrow">MODEL INPUT</p>
-                  <h3 id="observability-title">完整模型输入</h3>
+                  <p class="eyebrow">MODEL REQUEST</p>
+                  <h3 id="observability-title">JSON 请求预览</h3>
                 </div>
                 <button
                   class="secondary-button preview-button"
@@ -1257,67 +1184,16 @@ onBeforeUnmount(() => {
                 {{ previewErrors[activeAgent.id] }}
               </p>
 
-              <div class="request-view-grid">
-                <article
-                  v-for="view in observableRequests"
-                  :key="view.key"
-                  class="request-view"
+              <div class="request-preview">
+                <p
+                  v-if="requestPreviews[activeAgent.id] === null"
+                  class="request-empty"
                 >
-                  <h4>{{ view.title }}</h4>
-                  <p v-if="view.request === null" class="request-empty">
-                    {{
-                      view.key === "preview"
-                        ? "尚未加载已保存场景的下一次请求。"
-                        : "尚无模型生成草稿，或草稿已被确认/放弃。"
-                    }}
-                  </p>
-                  <template v-else>
-                    <details open>
-                      <summary>分段可读视图</summary>
-                      <div class="request-section">
-                        <h5>
-                          System（唯一角色提示）
-                          <span
-                            v-if="requestSystemHasCacheControl(view.request)"
-                          >
-                            · 缓存断点
-                          </span>
-                        </h5>
-                        <pre>{{ requestSystemText(view.request) }}</pre>
-                      </div>
-                      <div
-                        v-for="(message, index) in requestTimelineMessages(
-                          view.request,
-                        )"
-                        :key="index"
-                        class="request-section"
-                      >
-                        <h5>
-                          {{ message.role }}
-                          <span v-if="message.cacheControl">
-                            · 缓存断点
-                          </span>
-                        </h5>
-                        <pre>{{ message.text }}</pre>
-                      </div>
-                      <div class="request-section">
-                        <h5>工具输出约束与强制选择</h5>
-                        <pre>{{
-                          prettyJson({
-                            tools: view.request.tools,
-                            tool_choice: view.request.tool_choice,
-                          })
-                        }}</pre>
-                      </div>
-                    </details>
-                    <details>
-                      <summary>完整原始请求 JSON</summary>
-                      <pre class="raw-request">{{
-                        prettyJson(view.request)
-                      }}</pre>
-                    </details>
-                  </template>
-                </article>
+                  尚未加载已保存场景的下一次请求。
+                </p>
+                <pre v-else>{{
+                  prettyJson(requestPreviews[activeAgent.id])
+                }}</pre>
               </div>
               <p class="observability-note">
                 此处展示传给 Anthropic Messages API 的完整载荷，不含 API

@@ -1025,7 +1025,7 @@ describe("App", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("marks saved-scene previews stale and renders readable and raw input", async () => {
+  it("marks saved-scene previews stale and renders only request JSON", async () => {
     const scene = makeScene();
     const request = {
       model: "observable-model",
@@ -1072,14 +1072,20 @@ describe("App", () => {
     await flushAsyncUpdates();
 
     expectText("当前显示为旧版本");
+    expectText("JSON 请求预览");
+    expect(
+      container.querySelector(".request-preview pre")?.textContent,
+    ).toBe(JSON.stringify(request, null, 2));
     expectText("PREVIEW_SYSTEM_TEXT");
     expectText("observable-model");
     expectText("user");
     expectText("From B: 你今晚有空吗？");
     expectText("assistant");
     expectText("To B: 有空，灯塔见。");
-    expectText("工具输出约束与强制选择");
-    expectText("缓存断点");
+    expectNoText("完整模型输入");
+    expectNoText("分段可读视图");
+    expectNoText("当前草稿实际请求");
+    expectNoText("工具输出约束与强制选择");
     expectNoText("当前 Agent\nID:");
     expectNoText("候选接收人");
     expectNoText("个人时间线 1");

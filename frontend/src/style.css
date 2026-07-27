@@ -1022,15 +1022,8 @@ textarea:disabled {
   line-height: 1.55;
 }
 
-.request-view-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+.request-preview {
   margin-top: 18px;
-}
-
-.request-view {
-  overflow: hidden;
   min-width: 0;
   padding: 15px;
   border: 1px solid rgb(57 72 93 / 12%);
@@ -1038,40 +1031,9 @@ textarea:disabled {
   background: rgb(255 255 255 / 68%);
 }
 
-.request-view h4 {
-  margin: 0 0 12px;
-  color: #334052;
-  font-size: 0.82rem;
-}
-
-.request-view details + details {
-  margin-top: 12px;
-}
-
-.request-view summary {
-  cursor: pointer;
-  color: #4a596d;
-  font-size: 0.72rem;
-  font-weight: 750;
-}
-
-.request-section {
-  margin-top: 12px;
-}
-
-.request-section h5 {
-  margin: 0 0 5px;
-  color: #647185;
-  font-size: 0.64rem;
-}
-
-.request-section h5 span {
-  color: #9a652a;
-}
-
-.request-view pre {
+.request-preview pre {
   overflow: auto;
-  max-height: 280px;
+  max-height: 520px;
   margin: 0;
   padding: 10px;
   border-radius: 7px;
@@ -1082,12 +1044,7 @@ textarea:disabled {
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-}
-
-.request-view .raw-request {
-  max-height: 520px;
-  margin-top: 9px;
-  white-space: pre;
+  word-break: break-word;
 }
 
 .request-empty,
@@ -1300,10 +1257,6 @@ textarea:disabled {
   }
 
   .message-fields {
-    grid-template-columns: 1fr;
-  }
-
-  .request-view-grid {
     grid-template-columns: 1fr;
   }
 
