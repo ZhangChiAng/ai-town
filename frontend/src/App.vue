@@ -7,8 +7,10 @@ import {
 } from "vue";
 
 import {
+  composeSystemPrompt,
   createScene,
   generateMessageDraft,
+  getModelRequestPreview,
   getScene,
   listScenes,
   saveScene,
@@ -18,6 +20,7 @@ import {
   AGENT_IDS,
   type AgentId,
   type MessageDraftUsage,
+  type ModelRequest,
   type Scene,
   type SceneSummary,
   type SceneUpdate,
@@ -29,6 +32,7 @@ interface MessageDraft {
   recipientId: AgentId | "";
   content: string;
   usage: MessageDraftUsage | null;
+  requestSnapshot: ModelRequest | null;
 }
 
 const sceneSummaries = ref<SceneSummary[]>([]);
@@ -53,6 +57,12 @@ const messageErrors = ref<Record<AgentId, string>>(
 );
 const sendingAgentId = ref<AgentId | null>(null);
 const generatingAgentId = ref<AgentId | null>(null);
+const composingAgentId = ref<AgentId | null>(null);
+const requestPreviews = ref<Record<AgentId, ModelRequest | null>>(
+  emptyRequestPreviews(),
+);
+const previewErrors = ref<Record<AgentId, string>>(emptyMessageErrors());
+const previewingAgentId = ref<AgentId | null>(null);
 
 let listRequestToken = 0;
 let summaryMutationVersion = 0;
@@ -63,14 +73,33 @@ function cloneScene(scene: Scene): Scene {
 
 function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
   return {
-    A: { recipientId: "", content: "", usage: null },
-    B: { recipientId: "", content: "", usage: null },
-    C: { recipientId: "", content: "", usage: null },
+    A: {
+      recipientId: "",
+      content: "",
+      usage: null,
+      requestSnapshot: null,
+    },
+    B: {
+      recipientId: "",
+      content: "",
+      usage: null,
+      requestSnapshot: null,
+    },
+    C: {
+      recipientId: "",
+      content: "",
+      usage: null,
+      requestSnapshot: null,
+    },
   };
 }
 
 function emptyMessageErrors(): Record<AgentId, string> {
   return { A: "", B: "", C: "" };
+}
+
+function emptyRequestPreviews(): Record<AgentId, ModelRequest | null> {
+  return { A: null, B: null, C: null };
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -137,11 +166,26 @@ const activeDraftHasContent = computed(() => {
   return draft.recipientId !== "" || draft.content !== "";
 });
 
+const observableRequests = computed(() => [
+  {
+    key: "preview",
+    title: "下一次请求预览",
+    request: requestPreviews.value[activeAgentId.value],
+  },
+  {
+    key: "snapshot",
+    title: "当前草稿实际请求",
+    request: activeMessageDraft.value.requestSnapshot,
+  },
+]);
+
 const editorLocked = computed(
   () =>
     saveState.value === "saving" ||
     sendingAgentId.value !== null ||
     generatingAgentId.value !== null ||
+    composingAgentId.value !== null ||
+    previewingAgentId.value !== null ||
     isCreating.value ||
     openingSceneId.value !== null,
 );
@@ -174,6 +218,8 @@ function installScene(
     messageDrafts.value = emptyMessageDrafts();
     messageErrors.value = emptyMessageErrors();
   }
+  requestPreviews.value = emptyRequestPreviews();
+  previewErrors.value = emptyMessageErrors();
   saveState.value = "idle";
   saveError.value = "";
   actionError.value = "";
@@ -306,13 +352,14 @@ function sceneUpdate(scene: Scene): SceneUpdate {
   return {
     name: scene.name,
     agents: scene.agents.map(
-      ({ id, name, persona, desire, fear, memory }) => ({
+      ({ id, name, persona, desire, fear, memory, system_prompt }) => ({
         id,
         name,
         persona,
         desire,
         fear,
         memory,
+        system_prompt,
       }),
     ),
   };
@@ -336,6 +383,11 @@ async function saveCurrentScene(): Promise<void> {
   ) {
     saveState.value = "error";
     saveError.value = "场景名称和三个 Agent 的显示名均不能为空。";
+    return;
+  }
+  if (scene.agents.some((agent) => !agent.system_prompt.trim())) {
+    saveState.value = "error";
+    saveError.value = "三个 Agent 的最终系统提示词均不能为空。";
     return;
   }
 
@@ -377,6 +429,7 @@ async function generateDraft(): Promise<void> {
       recipientId: generated.recipient_id,
       content: generated.content,
       usage: generated.usage,
+      requestSnapshot: generated.request_snapshot,
     };
   } catch (error) {
     messageErrors.value[senderId] = errorMessage(
@@ -416,6 +469,7 @@ async function confirmMessage(): Promise<void> {
       recipientId: "",
       content: "",
       usage: null,
+      requestSnapshot: null,
     };
   } catch (error) {
     messageErrors.value[senderId] = errorMessage(
@@ -425,6 +479,130 @@ async function confirmMessage(): Promise<void> {
   } finally {
     sendingAgentId.value = null;
   }
+}
+
+async function recomposeActiveSystemPrompt(): Promise<void> {
+  const agent = activeAgent.value;
+  if (agent === undefined || editorLocked.value) {
+    return;
+  }
+  if (
+    !window.confirm(
+      "这会用四个拼接素材覆盖当前最终系统提示词。确定继续吗？",
+    )
+  ) {
+    return;
+  }
+
+  composingAgentId.value = agent.id;
+  saveError.value = "";
+  try {
+    const candidate = await composeSystemPrompt({
+      persona: agent.persona,
+      desire: agent.desire,
+      fear: agent.fear,
+      memory: agent.memory,
+    });
+    agent.system_prompt = candidate;
+    markEdited();
+  } catch (error) {
+    saveState.value = "error";
+    saveError.value = errorMessage(error, "系统提示词拼接失败。");
+  } finally {
+    composingAgentId.value = null;
+  }
+}
+
+async function loadRequestPreview(): Promise<void> {
+  const scene = currentScene.value;
+  const agentId = activeAgentId.value;
+  if (scene === null || previewingAgentId.value !== null) {
+    return;
+  }
+
+  previewingAgentId.value = agentId;
+  previewErrors.value[agentId] = "";
+  try {
+    requestPreviews.value[agentId] = await getModelRequestPreview(
+      scene.id,
+      agentId,
+    );
+  } catch (error) {
+    previewErrors.value[agentId] = errorMessage(
+      error,
+      "无法加载请求预览。",
+    );
+  } finally {
+    previewingAgentId.value = null;
+  }
+}
+
+function discardActiveDraft(): void {
+  const agentId = activeAgentId.value;
+  messageDrafts.value[agentId] = {
+    recipientId: "",
+    content: "",
+    usage: null,
+    requestSnapshot: null,
+  };
+  messageErrors.value[agentId] = "";
+}
+
+function prettyJson(value: unknown): string {
+  return JSON.stringify(value, null, 2);
+}
+
+function requestSystemText(request: ModelRequest): string {
+  const system = request.system;
+  if (!Array.isArray(system) || typeof system[0] !== "object") {
+    return "";
+  }
+  const block = system[0] as Record<string, unknown>;
+  return typeof block.text === "string" ? block.text : "";
+}
+
+function requestSystemHasCacheControl(request: ModelRequest): boolean {
+  const system = request.system;
+  if (!Array.isArray(system) || typeof system[0] !== "object") {
+    return false;
+  }
+  const block = system[0] as Record<string, unknown>;
+  return typeof block.cache_control === "object";
+}
+
+function requestTimelineMessages(
+  request: ModelRequest,
+): { role: string; text: string; cacheControl: boolean }[] {
+  const messages = request.messages;
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+  return messages.flatMap((message) => {
+    if (typeof message !== "object" || message === null) {
+      return [];
+    }
+    const record = message as Record<string, unknown>;
+    const content = record.content;
+    if (!Array.isArray(content)) {
+      return [];
+    }
+    const blocks = content.filter(
+      (block): block is Record<string, unknown> =>
+        typeof block === "object" && block !== null,
+    );
+    return [
+      {
+        role: typeof record.role === "string" ? record.role : "",
+        text: blocks
+          .map((block) => block.text)
+          .filter((text): text is string => typeof text === "string")
+          .join(""),
+        cacheControl: blocks.some(
+          (block) => typeof block.cache_control === "object",
+        ),
+      },
+    ];
+  });
 }
 
 function handleBeforeUnload(event: BeforeUnloadEvent): void {
@@ -697,57 +875,100 @@ onBeforeUnmount(() => {
                 />
               </label>
 
-              <label class="field field--wide" for="agent-persona">
-                <span>人设</span>
-                <small>身份、经历与相对稳定的性格描述</small>
+              <label
+                class="field field--wide system-prompt-field"
+                for="agent-system-prompt"
+              >
+                <span>最终系统提示词</span>
+                <small>
+                  权威角色提示；保存值会逐字成为 Anthropic 请求中唯一的
+                  system 文本
+                </small>
                 <textarea
-                  id="agent-persona"
-                  v-model="activeAgent.persona"
-                  rows="5"
+                  id="agent-system-prompt"
+                  v-model="activeAgent.system_prompt"
+                  rows="15"
                   :disabled="editorLocked"
-                  placeholder="暂时可以留空"
+                  required
                   @input="markEdited"
                 ></textarea>
               </label>
 
-              <label class="field" for="agent-desire">
-                <span>欲望</span>
-                <small>用自然语言描述 Agent 想要什么</small>
-                <textarea
-                  id="agent-desire"
-                  v-model="activeAgent.desire"
-                  rows="7"
-                  :disabled="editorLocked"
-                  placeholder="暂时可以留空"
-                  @input="markEdited"
-                ></textarea>
-              </label>
+              <details class="slot-materials field--wide">
+                <summary>
+                  <span>
+                    <strong>拼接素材</strong>
+                    <small>
+                      人设、欲望、恐惧与记忆不会随修改自动覆盖上方文本
+                    </small>
+                  </span>
+                </summary>
+                <div class="field-grid slot-material-grid">
+                  <label class="field field--wide" for="agent-persona">
+                    <span>人设</span>
+                    <small>身份、经历与相对稳定的性格描述</small>
+                    <textarea
+                      id="agent-persona"
+                      v-model="activeAgent.persona"
+                      rows="5"
+                      :disabled="editorLocked"
+                      placeholder="暂时可以留空"
+                      @input="markEdited"
+                    ></textarea>
+                  </label>
 
-              <label class="field" for="agent-fear">
-                <span>恐惧</span>
-                <small>用自然语言描述 Agent 害怕什么</small>
-                <textarea
-                  id="agent-fear"
-                  v-model="activeAgent.fear"
-                  rows="7"
-                  :disabled="editorLocked"
-                  placeholder="暂时可以留空"
-                  @input="markEdited"
-                ></textarea>
-              </label>
+                  <label class="field" for="agent-desire">
+                    <span>欲望</span>
+                    <small>用自然语言描述 Agent 想要什么</small>
+                    <textarea
+                      id="agent-desire"
+                      v-model="activeAgent.desire"
+                      rows="7"
+                      :disabled="editorLocked"
+                      placeholder="暂时可以留空"
+                      @input="markEdited"
+                    ></textarea>
+                  </label>
 
-              <label class="field field--wide" for="agent-memory">
-                <span>当前压缩记忆</span>
-                <small>仅供人工编辑；本阶段不会自动更新</small>
-                <textarea
-                  id="agent-memory"
-                  v-model="activeAgent.memory"
-                  rows="7"
+                  <label class="field" for="agent-fear">
+                    <span>恐惧</span>
+                    <small>用自然语言描述 Agent 害怕什么</small>
+                    <textarea
+                      id="agent-fear"
+                      v-model="activeAgent.fear"
+                      rows="7"
+                      :disabled="editorLocked"
+                      placeholder="暂时可以留空"
+                      @input="markEdited"
+                    ></textarea>
+                  </label>
+
+                  <label class="field field--wide" for="agent-memory">
+                    <span>当前压缩记忆</span>
+                    <small>仅供人工编辑；本阶段不会自动更新</small>
+                    <textarea
+                      id="agent-memory"
+                      v-model="activeAgent.memory"
+                      rows="7"
+                      :disabled="editorLocked"
+                      placeholder="暂时可以留空"
+                      @input="markEdited"
+                    ></textarea>
+                  </label>
+                </div>
+                <button
+                  class="secondary-button recompose-button"
+                  type="button"
                   :disabled="editorLocked"
-                  placeholder="暂时可以留空"
-                  @input="markEdited"
-                ></textarea>
-              </label>
+                  @click="recomposeActiveSystemPrompt"
+                >
+                  {{
+                    composingAgentId === activeAgent.id
+                      ? "拼接中…"
+                      : "从槽位重新拼接"
+                  }}
+                </button>
+              </details>
             </div>
 
             <section
@@ -851,6 +1072,15 @@ onBeforeUnmount(() => {
                 </p>
                 <div class="message-action-buttons">
                   <button
+                    v-if="activeDraftHasContent"
+                    class="text-button discard-draft-button"
+                    type="button"
+                    :disabled="editorLocked"
+                    @click="discardActiveDraft"
+                  >
+                    放弃草稿
+                  </button>
+                  <button
                     class="secondary-button message-generate-button"
                     type="button"
                     :disabled="!canGenerateMessageDraft"
@@ -878,6 +1108,110 @@ onBeforeUnmount(() => {
                   </button>
                 </div>
               </div>
+            </section>
+
+            <section
+              class="observability-card"
+              aria-labelledby="observability-title"
+            >
+              <div class="message-card-heading">
+                <div>
+                  <p class="eyebrow">MODEL INPUT</p>
+                  <h3 id="observability-title">完整模型输入</h3>
+                </div>
+                <button
+                  class="secondary-button preview-button"
+                  type="button"
+                  :disabled="previewingAgentId !== null"
+                  @click="loadRequestPreview"
+                >
+                  {{
+                    previewingAgentId === activeAgent.id
+                      ? "加载中…"
+                      : requestPreviews[activeAgent.id]
+                        ? "刷新预览"
+                        : "加载预览"
+                  }}
+                </button>
+              </div>
+              <p v-if="isDirty" class="stale-preview-notice">
+                场景有未保存修改；下一次请求预览基于已保存版本，当前显示为旧版本。
+                请先保存再刷新。
+              </p>
+              <p
+                v-if="previewErrors[activeAgent.id]"
+                class="form-error"
+                role="alert"
+              >
+                {{ previewErrors[activeAgent.id] }}
+              </p>
+
+              <div class="request-view-grid">
+                <article
+                  v-for="view in observableRequests"
+                  :key="view.key"
+                  class="request-view"
+                >
+                  <h4>{{ view.title }}</h4>
+                  <p v-if="view.request === null" class="request-empty">
+                    {{
+                      view.key === "preview"
+                        ? "尚未加载已保存场景的下一次请求。"
+                        : "尚无模型生成草稿，或草稿已被确认/放弃。"
+                    }}
+                  </p>
+                  <template v-else>
+                    <details open>
+                      <summary>分段可读视图</summary>
+                      <div class="request-section">
+                        <h5>
+                          System（唯一角色提示）
+                          <span
+                            v-if="requestSystemHasCacheControl(view.request)"
+                          >
+                            · 缓存断点
+                          </span>
+                        </h5>
+                        <pre>{{ requestSystemText(view.request) }}</pre>
+                      </div>
+                      <div
+                        v-for="(message, index) in requestTimelineMessages(
+                          view.request,
+                        )"
+                        :key="index"
+                        class="request-section"
+                      >
+                        <h5>
+                          {{ message.role }}
+                          <span v-if="message.cacheControl">
+                            · 缓存断点
+                          </span>
+                        </h5>
+                        <pre>{{ message.text }}</pre>
+                      </div>
+                      <div class="request-section">
+                        <h5>工具输出约束与强制选择</h5>
+                        <pre>{{
+                          prettyJson({
+                            tools: view.request.tools,
+                            tool_choice: view.request.tool_choice,
+                          })
+                        }}</pre>
+                      </div>
+                    </details>
+                    <details>
+                      <summary>完整原始请求 JSON</summary>
+                      <pre class="raw-request">{{
+                        prettyJson(view.request)
+                      }}</pre>
+                    </details>
+                  </template>
+                </article>
+              </div>
+              <p class="observability-note">
+                此处展示传给 Anthropic Messages API 的完整载荷，不含 API
+                Key、Base URL 或第三方响应。
+              </p>
             </section>
 
             <section class="timeline-card" aria-labelledby="timeline-title">

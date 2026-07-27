@@ -17,13 +17,17 @@ from app.drafting import (
 )
 from app.models import (
     AgentId,
+    ComposeSystemPromptRequest,
+    ComposeSystemPromptResponse,
     CreateMessageRequest,
     CreateSceneRequest,
     MessageDraftResponse,
+    ModelRequestPreviewResponse,
     Scene,
     SceneSummary,
     UpdateSceneRequest,
     add_message,
+    compose_system_prompt,
     create_scene,
     update_scene,
 )
@@ -128,6 +132,19 @@ def create_app(
     async def list_scenes(request: Request) -> list[SceneSummary]:
         return storage(request).list_scenes()
 
+    @application.post("/api/system-prompts/compose")
+    async def post_composed_system_prompt(
+        payload: ComposeSystemPromptRequest,
+    ) -> ComposeSystemPromptResponse:
+        return ComposeSystemPromptResponse(
+            system_prompt=compose_system_prompt(
+                payload.persona,
+                payload.desire,
+                payload.fear,
+                payload.memory,
+            )
+        )
+
     @application.post(
         "/api/scenes",
         status_code=status.HTTP_201_CREATED,
@@ -174,6 +191,19 @@ def create_app(
     ) -> MessageDraftResponse:
         current_scene = storage(request).get(scene_id)
         return drafts(request).generate(current_scene, agent_id)
+
+    @application.get(
+        "/api/scenes/{scene_id}/agents/{agent_id}/model-request-preview"
+    )
+    async def get_model_request_preview(
+        scene_id: UUID,
+        agent_id: AgentId,
+        request: Request,
+    ) -> ModelRequestPreviewResponse:
+        current_scene = storage(request).get(scene_id)
+        return ModelRequestPreviewResponse(
+            request=drafts(request).preview(current_scene, agent_id)
+        )
 
     return application
 

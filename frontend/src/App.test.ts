@@ -23,6 +23,7 @@ function makeAgent(id: AgentId, name = `居民 ${id}`): Agent {
     desire: `${id} 的欲望`,
     fear: `${id} 的恐惧`,
     memory: `${id} 的记忆`,
+    system_prompt: `Agent ${id} 的最终系统提示词`,
     timeline: [],
   };
 }
@@ -32,7 +33,7 @@ function makeScene(
   name = "雨夜港口",
 ): Scene {
   return {
-    schema_version: 1,
+    schema_version: 2,
     id,
     name,
     agents: [
@@ -64,6 +65,13 @@ function makeDraftResponse(
       output_tokens: 48 + seed,
       cache_creation_input_tokens: 17 + seed,
       cache_read_input_tokens: 91 + seed,
+    },
+    request_snapshot: {
+      model: "test-model",
+      system: [{ type: "text", text: `Agent ${recipientId}` }],
+      messages: [],
+      tools: [],
+      tool_choice: {},
     },
   };
 }
@@ -508,13 +516,14 @@ describe("App", () => {
     expect(putBody).toEqual({
       name: "清晨港口",
       agents: scene.agents.map(
-        ({ id, name, persona, desire, fear, memory }) => ({
+        ({ id, name, persona, desire, fear, memory, system_prompt }) => ({
           id,
           name,
           persona,
           desire: id === "A" ? "找到失踪的船" : desire,
           fear,
           memory,
+          system_prompt,
         }),
       ),
     });
@@ -1314,5 +1323,169 @@ describe("App", () => {
       )?.value,
     ).toBe("B 的模型草稿");
     expect(container.querySelector(".usage-metrics")).not.toBeNull();
+  });
+
+  it("recomposes only after confirmation and preserves manual prompt edits", async () => {
+    const scene = makeScene();
+    const confirmMock = vi
+      .spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (
+          input === "/api/system-prompts/compose" &&
+          options?.method === "POST"
+        ) {
+          return jsonResponse({
+            system_prompt: "后端模板拼接结果",
+          });
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setFieldValue("#agent-persona", "修改后的拼接素材");
+
+    findButton("从槽位重新拼接").click();
+    await nextTick();
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#agent-system-prompt",
+      )?.value,
+    ).toBe("Agent A 的最终系统提示词");
+
+    findButton("从槽位重新拼接").click();
+    await flushAsyncUpdates();
+    expect(confirmMock).toHaveBeenCalledTimes(2);
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#agent-system-prompt",
+      )?.value,
+    ).toBe("后端模板拼接结果");
+
+    await setFieldValue("#agent-system-prompt", "用户逐字手工版本");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#agent-system-prompt",
+      )?.value,
+    ).toBe("用户逐字手工版本");
+  });
+
+  it("rejects an empty final system prompt before saving", async () => {
+    const scene = makeScene();
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setFieldValue("#agent-system-prompt", " \n ");
+    findButton("保存场景").click();
+    await nextTick();
+
+    expect(container.textContent).toContain(
+      "三个 Agent 的最终系统提示词均不能为空",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("marks saved-scene previews stale and renders readable and raw input", async () => {
+    const scene = makeScene();
+    const request = {
+      model: "observable-model",
+      max_tokens: 512,
+      system: [
+        {
+          type: "text",
+          text: "PREVIEW_SYSTEM_TEXT",
+          cache_control: { type: "ephemeral", ttl: "5m" },
+        },
+      ],
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "From B: 你今晚有空吗？" },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "text",
+              text: "To B: 有空，灯塔见。",
+              cache_control: { type: "ephemeral", ttl: "5m" },
+            },
+          ],
+        },
+      ],
+      tools: [{ name: "compose_message", strict: true }],
+      tool_choice: { type: "tool", name: "compose_message" },
+    };
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (String(input).endsWith("/model-request-preview")) {
+          return jsonResponse({ request });
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setFieldValue("#agent-desire", "尚未保存的修改");
+    findButton("加载预览").click();
+    await flushAsyncUpdates();
+
+    expect(container.textContent).toContain("当前显示为旧版本");
+    expect(container.textContent).toContain("PREVIEW_SYSTEM_TEXT");
+    expect(container.textContent).toContain("observable-model");
+    expect(container.textContent).toContain("user");
+    expect(container.textContent).toContain("From B: 你今晚有空吗？");
+    expect(container.textContent).toContain("assistant");
+    expect(container.textContent).toContain("To B: 有空，灯塔见。");
+    expect(container.textContent).toContain("工具输出约束与强制选择");
+    expect(container.textContent).toContain("缓存断点");
+    expect(container.textContent).not.toContain("当前 Agent\nID:");
+    expect(container.textContent).not.toContain("候选接收人");
+    expect(container.textContent).not.toContain("个人时间线 1");
   });
 });

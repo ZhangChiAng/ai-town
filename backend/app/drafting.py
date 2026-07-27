@@ -18,12 +18,6 @@ from app.models import (
 LOGGER = logging.getLogger(__name__)
 COMPOSE_MESSAGE_TOOL = "compose_message"
 CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
-SYSTEM_RULES = """\
-You write exactly one in-character private message for the selected Agent.
-Use only the supplied Agent context and confirmed personal timeline.
-Choose exactly one of the listed candidate recipients.
-You must call compose_message once. Do not stay silent, explain the choice,
-or invent knowledge that is absent from the supplied context."""
 
 
 class MessagesResource(Protocol):
@@ -78,6 +72,10 @@ class MessageDraftService:
         self._client = client
         self._model = model
 
+    def preview(self, scene: Scene, agent_id: AgentId) -> dict[str, Any]:
+        """Build the exact next provider payload without calling the model."""
+        return build_message_request(scene, agent_id, self._model)
+
     def generate(
         self,
         scene: Scene,
@@ -96,16 +94,16 @@ class MessageDraftService:
             DraftGenerationError: If the upstream request fails or returns an
                 invalid tool result.
         """
-        request = build_message_request(scene, agent_id, self._model)
+        model_request = build_message_request(scene, agent_id, self._model)
 
         try:
-            response = self._client.messages.create(**request)
+            response = self._client.messages.create(**model_request)
         except Exception as error:
             # Do not propagate provider response bodies or credentials.
             raise DraftGenerationError("Model request failed.") from error
 
         try:
-            draft = _parse_response(response, agent_id)
+            draft = _parse_response(response, agent_id, model_request)
         except (AttributeError, TypeError, ValueError, KeyError) as error:
             raise DraftGenerationError(
                 "Model returned an invalid message draft."
@@ -123,9 +121,10 @@ def build_message_request(
     """Build a deterministic, explicitly cached Anthropic request."""
     agent = next(agent for agent in scene.agents if agent.id == agent_id)
     recipients = [agent for agent in scene.agents if agent.id != agent_id]
-    context_blocks = _build_context_blocks(agent, recipients)
-    # The rolling breakpoint follows the final immutable context block.
-    context_blocks[-1]["cache_control"] = dict(CACHE_CONTROL)
+    messages = _build_timeline_messages(agent)
+    if messages:
+        # The rolling breakpoint follows the final immutable timeline record.
+        messages[-1]["content"][-1]["cache_control"] = dict(CACHE_CONTROL)
 
     return {
         "model": model,
@@ -133,7 +132,7 @@ def build_message_request(
         "system": [
             {
                 "type": "text",
-                "text": SYSTEM_RULES,
+                "text": agent.system_prompt,
                 "cache_control": dict(CACHE_CONTROL),
             }
         ],
@@ -143,7 +142,7 @@ def build_message_request(
             "name": COMPOSE_MESSAGE_TOOL,
             "disable_parallel_tool_use": True,
         },
-        "messages": [{"role": "user", "content": context_blocks}],
+        "messages": messages,
     }
 
 
@@ -178,57 +177,34 @@ def _compose_message_tool(recipients: list[Agent]) -> dict[str, Any]:
     }
 
 
-def _build_context_blocks(
-    agent: Agent,
-    recipients: list[Agent],
-) -> list[dict[str, Any]]:
-    """Build stable blocks containing only the permitted private context."""
-    profile = "\n".join(
-        (
-            "当前 Agent",
-            f"ID: {agent.id}",
-            f"姓名: {agent.name}",
-            f"人设: {agent.persona}",
-            f"欲望: {agent.desire}",
-            f"恐惧: {agent.fear}",
-            f"当前压缩记忆: {agent.memory}",
-        )
-    )
-    candidates = "\n".join(
-        [
-            "候选接收人",
-            *(
-                f"ID: {recipient.id}; 姓名: {recipient.name}"
-                for recipient in recipients
-            ),
-        ]
-    )
-    blocks: list[dict[str, Any]] = [
-        {"type": "text", "text": profile},
-        {"type": "text", "text": candidates},
-    ]
-
-    for index, record in enumerate(agent.timeline, start=1):
-        direction = "发送给" if record.direction == "sent" else "收到来自"
-        blocks.append(
+def _build_timeline_messages(agent: Agent) -> list[dict[str, Any]]:
+    """Map the private timeline directly to native Messages API turns."""
+    messages: list[dict[str, Any]] = []
+    for record in agent.timeline:
+        is_received = record.direction == "received"
+        role = "user" if is_received else "assistant"
+        prefix = "From" if is_received else "To"
+        messages.append(
             {
-                "type": "text",
-                "text": "\n".join(
-                    (
-                        f"已确认时间线记录 {index}",
-                        f"{direction}: {record.counterpart_id}",
-                        f"正文: {record.content}",
-                    )
-                ),
+                "role": role,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"{prefix} {record.counterpart_id}: "
+                            f"{record.content}"
+                        ),
+                    }
+                ],
             }
         )
-
-    return blocks
+    return messages
 
 
 def _parse_response(
     response: Any,
     agent_id: AgentId,
+    request_snapshot: dict[str, Any],
 ) -> MessageDraftResponse:
     """Require exactly one valid compose_message tool-use block."""
     content = response.content
@@ -269,6 +245,7 @@ def _parse_response(
             cache_creation_input_tokens=usage.cache_creation_input_tokens,
             cache_read_input_tokens=usage.cache_read_input_tokens,
         ),
+        request_snapshot=request_snapshot,
     )
 
 

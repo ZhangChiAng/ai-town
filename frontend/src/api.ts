@@ -4,6 +4,7 @@ import type {
   MessageCreate,
   MessageDraftResponse,
   MessageDraftUsage,
+  ModelRequest,
   Scene,
   SceneSummary,
   SceneUpdate,
@@ -38,6 +39,8 @@ function isAgent(value: unknown): value is Agent {
     typeof value.desire === "string" &&
     typeof value.fear === "string" &&
     typeof value.memory === "string" &&
+    typeof value.system_prompt === "string" &&
+    value.system_prompt.trim() !== "" &&
     Array.isArray(value.timeline) &&
     value.timeline.every(isTimelineRecord)
   );
@@ -56,7 +59,7 @@ function isTimelineRecord(value: unknown): boolean {
 function isScene(value: unknown): value is Scene {
   return (
     isRecord(value) &&
-    value.schema_version === 1 &&
+    value.schema_version === 2 &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     Array.isArray(value.agents) &&
@@ -98,7 +101,8 @@ function isMessageDraftResponse(
     isAgentId(value.recipient_id) &&
     typeof value.content === "string" &&
     value.content.trim() !== "" &&
-    isMessageDraftUsage(value.usage)
+    isMessageDraftUsage(value.usage) &&
+    isRecord(value.request_snapshot)
   );
 }
 
@@ -241,4 +245,38 @@ export async function generateMessageDraft(
     throw new ApiError("后端返回了无法识别的消息草稿。");
   }
   return body;
+}
+
+export async function composeSystemPrompt(
+  slots: Pick<Agent, "persona" | "desire" | "fear" | "memory">,
+): Promise<string> {
+  const body = await requestJson("/api/system-prompts/compose", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(slots),
+  });
+  if (
+    !isRecord(body) ||
+    typeof body.system_prompt !== "string" ||
+    body.system_prompt.trim() === ""
+  ) {
+    throw new ApiError("后端返回了无法识别的系统提示词。");
+  }
+  return body.system_prompt;
+}
+
+export async function getModelRequestPreview(
+  sceneId: string,
+  agentId: AgentId,
+): Promise<ModelRequest> {
+  const body = await requestJson(
+    `/api/scenes/${encodeURIComponent(sceneId)}/agents/${agentId}/model-request-preview`,
+  );
+  if (
+    !isRecord(body) ||
+    !isRecord(body.request)
+  ) {
+    throw new ApiError("后端返回了无法识别的请求预览。");
+  }
+  return body.request;
 }

@@ -95,6 +95,7 @@ def private_scene() -> Scene:
                     "desire": f"PRIVATE_DESIRE_{agent.id}",
                     "fear": f"PRIVATE_FEAR_{agent.id}",
                     "memory": f"PRIVATE_MEMORY_{agent.id}",
+                    "system_prompt": f"AUTHORITATIVE_SYSTEM_{agent.id}",
                 }
             )
         )
@@ -152,7 +153,8 @@ def test_draft_endpoint_preserves_information_boundaries_and_disk(
     response = client.post(f"/api/scenes/{scene.id}/agents/A/message-drafts")
 
     assert response.status_code == 200
-    assert response.json() == {
+    body = response.json()
+    assert {key: body[key] for key in ("recipient_id", "content", "usage")} == {
         "recipient_id": "B",
         "content": "今晚去灯塔。",
         "usage": {
@@ -162,6 +164,7 @@ def test_draft_endpoint_preserves_information_boundaries_and_disk(
             "cache_read_input_tokens": 91,
         },
     }
+    assert body["request_snapshot"] == fake.messages.requests[0]
     request_text = json.dumps(
         fake.messages.requests[0],
         ensure_ascii=False,
@@ -172,24 +175,79 @@ def test_draft_endpoint_preserves_information_boundaries_and_disk(
     assert "PRIVATE_FEAR_C" not in request_text
     assert "PRIVATE_MEMORY_C" not in request_text
     assert "PRIVATE_BC_TIMELINE" not in request_text
-    assert "PRIVATE_PERSONA_A" in request_text
-    assert "PRIVATE_DESIRE_A" in request_text
-    assert "PRIVATE_FEAR_A" in request_text
-    assert "PRIVATE_MEMORY_A" in request_text
+    assert "PRIVATE_PERSONA_A" not in request_text
+    assert "PRIVATE_DESIRE_A" not in request_text
+    assert "PRIVATE_FEAR_A" not in request_text
+    assert "PRIVATE_MEMORY_A" not in request_text
+    assert "AUTHORITATIVE_SYSTEM_A" in request_text
     assert "VISIBLE_A_TIMELINE" in request_text
-    assert "NAME_B" in request_text
-    assert "NAME_C" in request_text
+    assert "NAME_A" not in request_text
+    assert "NAME_B" not in request_text
+    assert "NAME_C" not in request_text
+    assert "当前 Agent" not in request_text
+    assert "候选接收人" not in request_text
+    assert "已确认时间线记录" not in request_text
+    assert "正文:" not in request_text
     assert (scene_directory / f"{scene.id}.json").read_bytes() == original_bytes
+
+
+def test_preview_matches_actual_request_without_calling_model_or_writing(
+    draft_client: tuple[TestClient, FakeAnthropic, Path],
+) -> None:
+    """Preview and generation share one exact, side-effect-free payload."""
+    client, fake, scene_directory = draft_client
+    scene = private_scene()
+    original_bytes = persist_scene(client, scene_directory, scene)
+
+    preview = client.get(
+        f"/api/scenes/{scene.id}/agents/A/model-request-preview"
+    )
+
+    assert preview.status_code == 200
+    assert fake.messages.requests == []
+    assert (scene_directory / f"{scene.id}.json").read_bytes() == original_bytes
+
+    draft = client.post(f"/api/scenes/{scene.id}/agents/A/message-drafts")
+
+    assert draft.status_code == 200
+    assert preview.json()["request"] == fake.messages.requests[0]
+    assert draft.json()["request_snapshot"] == preview.json()["request"]
+
+
+def test_compose_prompt_endpoint_uses_canonical_template() -> None:
+    """The no-side-effect endpoint is the sole template implementation."""
+    client = TestClient(create_app(SceneStorage(Path("/tmp/unused-scenes"))))
+
+    response = client.post(
+        "/api/system-prompts/compose",
+        json={
+            "persona": "人设正文",
+            "desire": "欲望正文",
+            "fear": "恐惧正文",
+            "memory": "记忆正文",
+        },
+    )
+
+    assert response.status_code == 200
+    prompt = response.json()["system_prompt"]
+    assert "像真人一样说话" in prompt
+    assert "一个人最本质的东西是他的欲望和恐惧" in prompt
+    assert prompt.endswith("【记忆】\n记忆正文")
 
 
 def test_request_forces_strict_tool_and_has_two_explicit_5m_breakpoints() -> (
     None
 ):
-    """Tool output and both cache layers are explicit and deterministic."""
-    request = build_message_request(private_scene(), "A", MODEL)
+    """Tool output and both non-empty cache layers are deterministic."""
+    scene = private_scene()
+    expected_prompt = next(
+        agent.system_prompt for agent in scene.agents if agent.id == "A"
+    )
+    request = build_message_request(scene, "A", MODEL)
 
     assert request["max_tokens"] == 512
     assert request["model"] == MODEL
+    assert request["system"][0]["text"] == expected_prompt
     assert request["tool_choice"] == {
         "type": "tool",
         "name": COMPOSE_MESSAGE_TOOL,
@@ -215,14 +273,88 @@ def test_request_forces_strict_tool_and_has_two_explicit_5m_breakpoints() -> (
         "additionalProperties": False,
     }
     assert request["system"][0]["cache_control"] == CACHE_CONTROL
-    blocks = request["messages"][0]["content"]
-    assert blocks[-1]["cache_control"] == CACHE_CONTROL
+    last_block = request["messages"][-1]["content"][-1]
+    assert last_block["cache_control"] == CACHE_CONTROL
     serialized = json.dumps(request)
     assert serialized.count('"cache_control"') == 2
 
 
+def test_timeline_maps_to_independent_native_messages_in_exact_order() -> None:
+    """Received and sent records become prefixed user and assistant turns."""
+    scene = create_scene("原生消息映射")
+    for sender_id, recipient_id, content in (
+        ("B", "A", "第一条收到"),
+        ("A", "C", "第一条发出"),
+        ("A", "B", "连续发出"),
+        ("C", "A", "最后收到"),
+    ):
+        scene = add_message(
+            scene,
+            CreateMessageRequest(
+                sender_id=sender_id,
+                recipient_id=recipient_id,
+                content=content,
+            ),
+        )
+
+    request = build_message_request(scene, "A", MODEL)
+
+    assert request["messages"] == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": "From B: 第一条收到"}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "To C: 第一条发出"}],
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "To B: 连续发出"}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "From C: 最后收到",
+                    "cache_control": CACHE_CONTROL,
+                }
+            ],
+        },
+    ]
+
+
+def test_empty_timeline_has_empty_messages_and_only_system_cache() -> None:
+    """No runtime user turn or rolling breakpoint is added to an empty log."""
+    request = build_message_request(create_scene("空时间线"), "A", MODEL)
+
+    assert request["messages"] == []
+    assert request["system"][0]["cache_control"] == CACHE_CONTROL
+    assert json.dumps(request).count('"cache_control"') == 1
+
+
+def test_timeline_ending_in_sent_keeps_assistant_as_final_role() -> None:
+    """The request is not padded after an outgoing timeline record."""
+    scene = add_message(
+        create_scene("发出结尾"),
+        CreateMessageRequest(
+            sender_id="A",
+            recipient_id="B",
+            content="由 assistant 结尾",
+        ),
+    )
+
+    request = build_message_request(scene, "A", MODEL)
+
+    assert request["messages"][-1]["role"] == "assistant"
+    assert request["messages"][-1]["content"][0]["text"] == (
+        "To B: 由 assistant 结尾"
+    )
+
+
 def test_context_order_and_cache_prefix_are_stable_as_timeline_grows() -> None:
-    """Repeat requests match and appended records preserve prior block text."""
+    """Repeat requests match and appended records preserve prior messages."""
     scene = private_scene()
     first = build_message_request(scene, "A", MODEL)
     repeated = build_message_request(scene, "A", MODEL)
@@ -237,17 +369,27 @@ def test_context_order_and_cache_prefix_are_stable_as_timeline_grows() -> None:
         ),
     )
     grown = build_message_request(grown_scene, "A", MODEL)
-    old_blocks = first["messages"][0]["content"]
-    grown_blocks = grown["messages"][0]["content"]
+    old_messages = first["messages"]
+    grown_messages = grown["messages"]
 
-    # Cache marker placement moves, but immutable prefix text stays byte-equal.
+    # Cache marker placement moves, but immutable role and text stay byte-equal.
     assert [
-        {"type": block["type"], "text": block["text"]}
-        for block in grown_blocks[: len(old_blocks)]
+        {
+            "role": message["role"],
+            "text": message["content"][0]["text"],
+        }
+        for message in grown_messages[: len(old_messages)]
     ] == [
-        {"type": block["type"], "text": block["text"]} for block in old_blocks
+        {
+            "role": message["role"],
+            "text": message["content"][0]["text"],
+        }
+        for message in old_messages
     ]
-    assert "APPENDED_TIMELINE" in grown_blocks[-1]["text"]
+    assert grown_messages[-1]["content"][0]["text"] == (
+        "To B: APPENDED_TIMELINE"
+    )
+    assert grown_messages[-1]["content"][0]["cache_control"] == CACHE_CONTROL
 
 
 @pytest.mark.parametrize(

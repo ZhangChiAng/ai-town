@@ -16,11 +16,12 @@ export interface Agent {
   desire: string;
   fear: string;
   memory: string;
+  system_prompt: string;
   timeline: TimelineRecord[];
 }
 
 export interface Scene {
-  schema_version: 1;
+  schema_version: 2;
   id: string;
   name: string;
   agents: Agent[];
@@ -38,6 +39,7 @@ export interface AgentUpdate {
   desire: string;
   fear: string;
   memory: string;
+  system_prompt: string;
 }
 
 export interface SceneUpdate {
@@ -62,4 +64,11 @@ export interface MessageDraftResponse {
   recipient_id: AgentId;
   content: string;
   usage: MessageDraftUsage;
+  request_snapshot: ModelRequest;
+}
+
+export type ModelRequest = Record<string, unknown>;
+
+export interface ModelRequestPreviewResponse {
+  request: ModelRequest;
 }

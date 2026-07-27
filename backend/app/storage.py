@@ -1,6 +1,7 @@
 """JSON-file persistence layer for scene data."""
 
 import contextlib
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -8,7 +9,12 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from app.models import Scene, SceneSummary
+from app.models import (
+    SCHEMA_VERSION,
+    Scene,
+    SceneSummary,
+    compose_system_prompt,
+)
 
 
 class SceneStorageError(RuntimeError):
@@ -132,8 +138,9 @@ class SceneStorage:
             ) from error
 
         try:
-            scene = Scene.model_validate_json(contents)
-        except ValidationError as error:
+            raw_scene = json.loads(contents)
+            scene = Scene.model_validate(_upgrade_v1_scene(raw_scene))
+        except (json.JSONDecodeError, TypeError, ValidationError) as error:
             raise SceneReadError(
                 f"Scene file '{path.name}' is invalid or corrupted."
             ) from error
@@ -196,3 +203,32 @@ class SceneStorage:
                 # Clean up the temp file if the replace failed.
                 with contextlib.suppress(OSError):
                     temporary_path.unlink(missing_ok=True)
+
+
+def _upgrade_v1_scene(raw_scene: object) -> object:
+    """Return an in-memory v2 representation of a valid-looking v1 scene."""
+    if not isinstance(raw_scene, dict) or raw_scene.get("schema_version") != 1:
+        return raw_scene
+
+    upgraded = dict(raw_scene)
+    agents = upgraded.get("agents")
+    if not isinstance(agents, list):
+        return upgraded
+
+    upgraded_agents = []
+    for raw_agent in agents:
+        if not isinstance(raw_agent, dict):
+            upgraded_agents.append(raw_agent)
+            continue
+        agent = dict(raw_agent)
+        agent["system_prompt"] = compose_system_prompt(
+            agent.get("persona", ""),
+            agent.get("desire", ""),
+            agent.get("fear", ""),
+            agent.get("memory", ""),
+        )
+        upgraded_agents.append(agent)
+
+    upgraded["agents"] = upgraded_agents
+    upgraded["schema_version"] = SCHEMA_VERSION
+    return upgraded

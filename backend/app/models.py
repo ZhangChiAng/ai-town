@@ -1,6 +1,6 @@
 """Domain models and request/response schemas for scenes and agents."""
 
-from typing import Literal, Self
+from typing import Any, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -11,8 +11,23 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 AGENT_IDS = ("A", "B", "C")
+DEFAULT_SYSTEM_PROMPT_TEMPLATE = """\
+【规则】
+像真人一样说话，你不必全盘托出，可以推诿和回避甚至撒谎。不要输出括号包裹的动作，只输出说的话。不要有换行，所有话一口气说完。记住，一个人最本质的东西是他的欲望和恐惧。
+
+【人设】
+{persona}
+
+【欲望】
+{desire}
+
+【恐惧】
+{fear}
+
+【记忆】
+{memory}"""
 
 AgentId = Literal["A", "B", "C"]
 MessageDirection = Literal["sent", "received"]
@@ -40,6 +55,28 @@ def _strip_non_blank_content(value: str) -> str:
     return stripped
 
 
+def _require_non_blank_system_prompt(value: str) -> str:
+    """Require a non-blank prompt without changing its exact text."""
+    if not value.strip():
+        raise ValueError("system_prompt must not be blank")
+    return value
+
+
+def compose_system_prompt(
+    persona: str,
+    desire: str,
+    fear: str,
+    memory: str,
+) -> str:
+    """Compose the canonical editable system prompt from four source slots."""
+    return DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(
+        persona=persona,
+        desire=desire,
+        fear=fear,
+        memory=memory,
+    )
+
+
 class TimelineRecord(ApiModel):
     """One confirmed message as seen from an individual agent."""
 
@@ -60,9 +97,13 @@ class Agent(ApiModel):
     desire: str = ""
     fear: str = ""
     memory: str = ""
+    system_prompt: str
     timeline: list[TimelineRecord] = Field(default_factory=list)
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
+    _validate_system_prompt = field_validator("system_prompt")(
+        _require_non_blank_system_prompt
+    )
 
 
 class AgentUpdate(ApiModel):
@@ -74,14 +115,18 @@ class AgentUpdate(ApiModel):
     desire: str
     fear: str
     memory: str
+    system_prompt: str
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
+    _validate_system_prompt = field_validator("system_prompt")(
+        _require_non_blank_system_prompt
+    )
 
 
 class Scene(ApiModel):
     """A named scene containing exactly three agents (A, B, C)."""
 
-    schema_version: Literal[1] = SCHEMA_VERSION
+    schema_version: Literal[2] = SCHEMA_VERSION
     id: UUID
     name: str
     agents: list[Agent] = Field(min_length=3, max_length=3)
@@ -161,8 +206,30 @@ class MessageDraftResponse(ApiModel):
     recipient_id: AgentId
     content: str
     usage: MessageDraftUsage
+    request_snapshot: dict[str, Any]
 
     _validate_content = field_validator("content")(_strip_non_blank_content)
+
+
+class ComposeSystemPromptRequest(ApiModel):
+    """Four editable slots used to compose a prompt candidate."""
+
+    persona: str
+    desire: str
+    fear: str
+    memory: str
+
+
+class ComposeSystemPromptResponse(ApiModel):
+    """Canonical prompt candidate returned without persistence."""
+
+    system_prompt: str
+
+
+class ModelRequestPreviewResponse(ApiModel):
+    """Exact saved-scene payload for the selected Agent's next request."""
+
+    request: dict[str, Any]
 
 
 def create_scene(name: str) -> Scene:
@@ -177,7 +244,14 @@ def create_scene(name: str) -> Scene:
     return Scene(
         id=uuid4(),
         name=name,
-        agents=[Agent(id=agent_id, name=agent_id) for agent_id in AGENT_IDS],
+        agents=[
+            Agent(
+                id=agent_id,
+                name=agent_id,
+                system_prompt=compose_system_prompt("", "", "", ""),
+            )
+            for agent_id in AGENT_IDS
+        ],
     )
 
 
@@ -246,6 +320,7 @@ def update_scene(scene: Scene, update: UpdateSceneRequest) -> Scene:
                 desire=updated_agent.desire,
                 fear=updated_agent.fear,
                 memory=updated_agent.memory,
+                system_prompt=updated_agent.system_prompt,
                 timeline=existing_agent.timeline,
             )
             for existing_agent, updated_agent in zip(

@@ -10,6 +10,7 @@ import pytest
 
 import app.storage as storage_module
 from app.main import create_app
+from app.models import DEFAULT_SYSTEM_PROMPT_TEMPLATE
 from app.storage import SceneStorage
 from tests.client import TestClient
 
@@ -45,6 +46,7 @@ def update_payload(name: str = "雨夜港口") -> dict[str, Any]:
                 "desire": f"{agent_id} 的欲望",
                 "fear": f"{agent_id} 的恐惧",
                 "memory": f"{agent_id} 的当前压缩记忆",
+                "system_prompt": f"{agent_id} 的最终系统提示词",
             }
             for agent_id in ("A", "B", "C")
         ],
@@ -78,7 +80,7 @@ def test_create_scene_writes_one_utf8_json_file(
     """Creating a scene persists a single UTF-8 JSON file on disk."""
     scene = create_scene(client, "  海边小镇  ")
 
-    assert scene["schema_version"] == 1
+    assert scene["schema_version"] == 2
     assert scene["name"] == "海边小镇"
     UUID(scene["id"])
     assert [
@@ -89,6 +91,7 @@ def test_create_scene_writes_one_utf8_json_file(
             "desire": agent["desire"],
             "fear": agent["fear"],
             "memory": agent["memory"],
+            "system_prompt": agent["system_prompt"],
             "timeline": agent["timeline"],
         }
         for agent in scene["agents"]
@@ -100,6 +103,12 @@ def test_create_scene_writes_one_utf8_json_file(
             "desire": "",
             "fear": "",
             "memory": "",
+            "system_prompt": DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(
+                persona="",
+                desire="",
+                fear="",
+                memory="",
+            ),
             "timeline": [],
         }
         for agent_id in ("A", "B", "C")
@@ -209,7 +218,15 @@ def test_update_replaces_only_editable_fields(
     assert [
         {
             key: agent[key]
-            for key in ("id", "name", "persona", "desire", "fear", "memory")
+            for key in (
+                "id",
+                "name",
+                "persona",
+                "desire",
+                "fear",
+                "memory",
+                "system_prompt",
+            )
         }
         for agent in updated["agents"]
     ] == payload["agents"]
@@ -485,6 +502,88 @@ def test_missing_scene_returns_404(client: TestClient) -> None:
 
     assert response.status_code == 404
     assert "does not exist" in response.json()["detail"]
+
+
+def test_v1_scene_is_upgraded_in_memory_and_written_only_after_save(
+    client: TestClient,
+    scene_directory: Path,
+) -> None:
+    """Reading v1 is non-mutating; explicit save persists v2 unchanged."""
+    scene_id = uuid4()
+    timeline = [
+        {
+            "message_id": str(uuid4()),
+            "direction": "sent",
+            "counterpart_id": "B",
+            "content": "旧场景消息",
+        }
+    ]
+    v1_scene = {
+        "schema_version": 1,
+        "id": str(scene_id),
+        "name": "旧场景",
+        "agents": [
+            {
+                "id": agent_id,
+                "name": f"旧居民 {agent_id}",
+                "persona": f"人设 {agent_id}",
+                "desire": f"欲望 {agent_id}",
+                "fear": f"恐惧 {agent_id}",
+                "memory": f"记忆 {agent_id}",
+                "timeline": timeline if agent_id == "A" else [],
+            }
+            for agent_id in ("A", "B", "C")
+        ],
+    }
+    scene_directory.mkdir(parents=True)
+    scene_path = scene_directory / f"{scene_id}.json"
+    original = json.dumps(v1_scene, ensure_ascii=False).encode()
+    scene_path.write_bytes(original)
+
+    opened = client.get(f"/api/scenes/{scene_id}")
+
+    assert opened.status_code == 200
+    upgraded = opened.json()
+    assert upgraded["schema_version"] == 2
+    assert upgraded["agents"][0]["timeline"] == timeline
+    assert "人设 A" in upgraded["agents"][0]["system_prompt"]
+    assert scene_path.read_bytes() == original
+
+    payload = {
+        "name": upgraded["name"],
+        "agents": [
+            {
+                key: agent[key]
+                for key in (
+                    "id",
+                    "name",
+                    "persona",
+                    "desire",
+                    "fear",
+                    "memory",
+                    "system_prompt",
+                )
+            }
+            for agent in upgraded["agents"]
+        ],
+    }
+    saved = client.put(f"/api/scenes/{scene_id}", json=payload)
+
+    assert saved.status_code == 200
+    persisted = json.loads(scene_path.read_text(encoding="utf-8"))
+    assert persisted["schema_version"] == 2
+    assert persisted["agents"][0]["timeline"] == timeline
+
+
+def test_system_prompt_must_not_be_blank(client: TestClient) -> None:
+    """Whitespace-only final prompts are rejected without changing disk."""
+    scene = create_scene(client)
+    payload = update_payload()
+    payload["agents"][0]["system_prompt"] = " \n\t "
+
+    response = client.put(f"/api/scenes/{scene['id']}", json=payload)
+
+    assert response.status_code == 422
 
 
 def test_corrupted_json_is_reported_instead_of_ignored(
