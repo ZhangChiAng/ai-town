@@ -15,6 +15,18 @@ from app.storage import SceneStorage
 from tests.client import TestClient
 
 
+def _assert_all_timelines_empty(response_dict: dict[str, Any]) -> None:
+    """Assert all three agents have empty timelines."""
+    assert [agent["timeline"] for agent in response_dict["agents"]] == [[], [], []]
+
+
+def _read_scene_file(scene_directory: Path, scene_id: str) -> dict[str, Any]:
+    """Read a scene JSON file from disk."""
+    return json.loads(
+        (scene_directory / f"{scene_id}.json").read_text(encoding="utf-8")
+    )
+
+
 @pytest.fixture
 def scene_directory(tmp_path: Path) -> Path:
     """A temporary scene storage directory inside *tmp_path*."""
@@ -232,9 +244,7 @@ def test_update_replaces_only_editable_fields(
     ] == payload["agents"]
     assert [agent["timeline"] for agent in updated["agents"]] == [[], [], []]
 
-    saved = json.loads(
-        (scene_directory / f"{original['id']}.json").read_text(encoding="utf-8")
-    )
+    saved = _read_scene_file(scene_directory, original["id"])
     assert saved == updated
 
 
@@ -337,11 +347,7 @@ def test_message_rejects_invalid_payloads(
 
     assert response.status_code == 422
     reopened = client.get(f"/api/scenes/{scene['id']}")
-    assert [agent["timeline"] for agent in reopened.json()["agents"]] == [
-        [],
-        [],
-        [],
-    ]
+    _assert_all_timelines_empty(reopened.json())
 
 
 def test_message_for_missing_scene_returns_404(client: TestClient) -> None:
@@ -408,9 +414,7 @@ def test_failed_message_write_leaves_no_single_sided_record(
     assert response.status_code == 500
     assert scene_path.read_bytes() == original_contents
     assert list(scene_directory.glob("*.tmp")) == []
-    assert [
-        agent["timeline"] for agent in json.loads(original_contents)["agents"]
-    ] == [[], [], []]
+    _assert_all_timelines_empty(json.loads(original_contents))
 
 
 @pytest.mark.parametrize(

@@ -5,7 +5,7 @@ import logging
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, NamedTuple
 
 import pytest
 
@@ -26,6 +26,14 @@ from app.storage import SceneStorage
 from tests.client import TestClient
 
 MODEL = "anthropic/claude-haiku-4.5"
+
+
+class DraftFixture(NamedTuple):
+    """Collapsed draft_client fixture values."""
+
+    client: TestClient
+    fake: "FakeAnthropic"
+    scene_directory: Path
 
 
 class FakeMessages:
@@ -121,13 +129,13 @@ def private_scene() -> Scene:
 @pytest.fixture
 def draft_client(
     tmp_path: Path,
-) -> tuple[TestClient, FakeAnthropic, Path]:
+) -> DraftFixture:
     """Provide an API client with a successful fake Anthropic service."""
     scene_directory = tmp_path / "scenes"
     fake = FakeAnthropic(model_response())
     service = MessageDraftService(fake, MODEL)
     application = create_app(SceneStorage(scene_directory), service)
-    return TestClient(application), fake, scene_directory
+    return DraftFixture(TestClient(application), fake, scene_directory)
 
 
 def persist_scene(
@@ -143,7 +151,7 @@ def persist_scene(
 
 
 def test_draft_endpoint_preserves_information_boundaries_and_disk(
-    draft_client: tuple[TestClient, FakeAnthropic, Path],
+    draft_client: DraftFixture,
 ) -> None:
     """Only the selected Agent's permitted context reaches the model."""
     client, fake, scene_directory = draft_client
@@ -169,30 +177,33 @@ def test_draft_endpoint_preserves_information_boundaries_and_disk(
         fake.messages.requests[0],
         ensure_ascii=False,
     )
-    assert "SECRET_SCENE_NAME" not in request_text
-    assert "PRIVATE_PERSONA_B" not in request_text
-    assert "PRIVATE_DESIRE_B" not in request_text
-    assert "PRIVATE_FEAR_C" not in request_text
-    assert "PRIVATE_MEMORY_C" not in request_text
-    assert "PRIVATE_BC_TIMELINE" not in request_text
-    assert "PRIVATE_PERSONA_A" not in request_text
-    assert "PRIVATE_DESIRE_A" not in request_text
-    assert "PRIVATE_FEAR_A" not in request_text
-    assert "PRIVATE_MEMORY_A" not in request_text
-    assert "AUTHORITATIVE_SYSTEM_A" in request_text
-    assert "VISIBLE_A_TIMELINE" in request_text
-    assert "NAME_A" not in request_text
-    assert "NAME_B" not in request_text
-    assert "NAME_C" not in request_text
-    assert "当前 Agent" not in request_text
-    assert "候选接收人" not in request_text
-    assert "已确认时间线记录" not in request_text
-    assert "正文:" not in request_text
+    for excluded in (
+        "SECRET_SCENE_NAME",
+        "PRIVATE_PERSONA_B",
+        "PRIVATE_DESIRE_B",
+        "PRIVATE_FEAR_C",
+        "PRIVATE_MEMORY_C",
+        "PRIVATE_BC_TIMELINE",
+        "PRIVATE_PERSONA_A",
+        "PRIVATE_DESIRE_A",
+        "PRIVATE_FEAR_A",
+        "PRIVATE_MEMORY_A",
+        "NAME_A",
+        "NAME_B",
+        "NAME_C",
+        "当前 Agent",
+        "候选接收人",
+        "已确认时间线记录",
+        "正文:",
+    ):
+        assert excluded not in request_text
+    for included in ("AUTHORITATIVE_SYSTEM_A", "VISIBLE_A_TIMELINE"):
+        assert included in request_text
     assert (scene_directory / f"{scene.id}.json").read_bytes() == original_bytes
 
 
 def test_preview_matches_actual_request_without_calling_model_or_writing(
-    draft_client: tuple[TestClient, FakeAnthropic, Path],
+    draft_client: DraftFixture,
 ) -> None:
     """Preview and generation share one exact, side-effect-free payload."""
     client, fake, scene_directory = draft_client
@@ -468,7 +479,7 @@ def test_upstream_failure_is_sanitized_and_not_retried(tmp_path: Path) -> None:
 
 
 def test_usage_is_logged_without_prompt_or_draft(
-    draft_client: tuple[TestClient, FakeAnthropic, Path],
+    draft_client: DraftFixture,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Successful generation logs IDs, model, and all four usage fields."""
@@ -500,7 +511,7 @@ def test_usage_is_logged_without_prompt_or_draft(
 
 
 def test_invalid_agent_and_missing_scene_have_expected_statuses(
-    draft_client: tuple[TestClient, FakeAnthropic, Path],
+    draft_client: DraftFixture,
 ) -> None:
     """Path validation remains distinct from storage lookup failures."""
     client, fake, scene_directory = draft_client
