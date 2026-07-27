@@ -2,7 +2,12 @@ import { createApp, nextTick } from "vue";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import App from "./App.vue";
-import type { Agent, AgentId, Scene } from "./types";
+import type {
+  Agent,
+  AgentId,
+  MessageDraftResponse,
+  Scene,
+} from "./types";
 
 const FIRST_ID = "11111111-1111-4111-8111-111111111111";
 const SECOND_ID = "22222222-2222-4222-8222-222222222222";
@@ -44,6 +49,23 @@ function jsonResponse(body: unknown, status = 200): Response {
     status,
     json: vi.fn().mockResolvedValue(body),
   } as unknown as Response;
+}
+
+function makeDraftResponse(
+  recipientId: AgentId,
+  content: string,
+  seed = 0,
+): MessageDraftResponse {
+  return {
+    recipient_id: recipientId,
+    content,
+    usage: {
+      input_tokens: 120 + seed,
+      output_tokens: 48 + seed,
+      cache_creation_input_tokens: 17 + seed,
+      cache_read_input_tokens: 91 + seed,
+    },
+  };
 }
 
 function mountApp(): void {
@@ -999,5 +1021,298 @@ describe("App", () => {
       "Scene storage is unreadable",
     );
     expect(findButton("重新加载")).toBeTruthy();
+  });
+
+  it("generates and replaces an editable draft while showing cache usage", async () => {
+    const scene = makeScene();
+    const generated = makeDraftResponse(
+      "C",
+      "模型选择发给迟夏的消息",
+    );
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (
+          input ===
+            `/api/scenes/${scene.id}/agents/A/message-drafts` &&
+          options?.method === "POST"
+        ) {
+          return jsonResponse(generated);
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+
+    expect(findButton("生成草稿")).toBeTruthy();
+    findButton("生成草稿").click();
+    await flushAsyncUpdates();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `/api/scenes/${scene.id}/agents/A/message-drafts`,
+      { method: "POST" },
+    );
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("C");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("模型选择发给迟夏的消息");
+    expect(findButton("重新生成")).toBeTruthy();
+    expect(
+      Array.from(
+        container.querySelectorAll<HTMLElement>(".usage-metrics dd"),
+      ).map((element) => element.textContent?.trim()),
+    ).toEqual(["17", "91", "120", "48"]);
+
+    await setSelectValue("#message-recipient", "B");
+    await setFieldValue("#message-content", "人工编辑后的正文");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("人工编辑后的正文");
+    expect(findButton("确认发送").disabled).toBe(false);
+  });
+
+  it("requires saved scene state before generating a draft", async () => {
+    const scene = makeScene();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(
+        jsonResponse([{ id: scene.id, name: scene.name }]),
+      )
+      .mockResolvedValueOnce(jsonResponse(scene));
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setFieldValue("#agent-memory", "尚未保存的记忆");
+
+    expect(container.textContent).toContain(
+      "请先保存场景，再生成或确认发送。",
+    );
+    expect(findButton("生成草稿").disabled).toBe(true);
+    findButton("生成草稿").click();
+    await flushAsyncUpdates();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("locks conflicting editor actions while generation is pending", async () => {
+    const scene = makeScene();
+    let resolveDraft!: (response: Response) => void;
+    const pendingDraft = new Promise<Response>((resolve) => {
+      resolveDraft = resolve;
+    });
+    const fetchMock = vi.fn(
+      (
+        input: RequestInfo | URL,
+        options?: RequestInit,
+      ): Promise<Response> => {
+        if (input === "/api/scenes" && options === undefined) {
+          return Promise.resolve(
+            jsonResponse([{ id: scene.id, name: scene.name }]),
+          );
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return Promise.resolve(jsonResponse(scene));
+        }
+        if (options?.method === "POST") {
+          return pendingDraft;
+        }
+        return Promise.reject(
+          new Error(`Unexpected request: ${String(input)}`),
+        );
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    findButton("生成草稿").click();
+    await nextTick();
+
+    expect(findButton("生成中…").disabled).toBe(true);
+    expect(findButton("确认发送").disabled).toBe(true);
+    expect(findButton("Agent B").disabled).toBe(true);
+    expect(
+      container.querySelector<HTMLInputElement>("#scene-name")
+        ?.disabled,
+    ).toBe(true);
+    expect(
+      container.querySelector<HTMLTextAreaElement>("#agent-persona")
+        ?.disabled,
+    ).toBe(true);
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.disabled,
+    ).toBe(true);
+    expect(
+      container.querySelector<HTMLButtonElement>(
+        ".scene-list-button",
+      )?.disabled,
+    ).toBe(true);
+
+    resolveDraft(jsonResponse(makeDraftResponse("B", "等待后生成")));
+    await flushAsyncUpdates();
+
+    expect(findButton("重新生成").disabled).toBe(false);
+    expect(
+      container.querySelector<HTMLInputElement>("#scene-name")
+        ?.disabled,
+    ).toBe(false);
+  });
+
+  it("keeps the prior edited draft and usage when regeneration fails", async () => {
+    const scene = makeScene();
+    let generationCount = 0;
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (options?.method === "POST") {
+          generationCount += 1;
+          return generationCount === 1
+            ? jsonResponse(makeDraftResponse("B", "第一次草稿"))
+            : jsonResponse({ detail: "模型暂时不可用" }, 502);
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    findButton("生成草稿").click();
+    await flushAsyncUpdates();
+    await setFieldValue("#message-content", "保留人工编辑");
+
+    findButton("重新生成").click();
+    await flushAsyncUpdates();
+
+    expect(
+      container.querySelector<HTMLSelectElement>(
+        "#message-recipient",
+      )?.value,
+    ).toBe("B");
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("保留人工编辑");
+    expect(container.textContent).toContain("模型暂时不可用");
+    expect(
+      Array.from(
+        container.querySelectorAll<HTMLElement>(".usage-metrics dd"),
+      ).map((element) => element.textContent?.trim()),
+    ).toEqual(["17", "91", "120", "48"]);
+  });
+
+  it("isolates generated drafts per Agent and clears usage after confirmation", async () => {
+    const scene = makeScene();
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL, options?: RequestInit) => {
+        if (input === "/api/scenes" && options === undefined) {
+          return jsonResponse([{ id: scene.id, name: scene.name }]);
+        }
+        if (
+          input === `/api/scenes/${scene.id}` &&
+          options === undefined
+        ) {
+          return jsonResponse(scene);
+        }
+        if (String(input).endsWith("/agents/A/message-drafts")) {
+          return jsonResponse(makeDraftResponse("B", "A 的模型草稿"));
+        }
+        if (String(input).endsWith("/agents/B/message-drafts")) {
+          return jsonResponse(
+            makeDraftResponse("C", "B 的模型草稿", 100),
+          );
+        }
+        if (
+          input === `/api/scenes/${scene.id}/messages` &&
+          options?.method === "POST"
+        ) {
+          return jsonResponse(scene, 201);
+        }
+        throw new Error(`Unexpected request: ${String(input)}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    findButton("生成草稿").click();
+    await flushAsyncUpdates();
+
+    findButton("Agent B").click();
+    await nextTick();
+    findButton("生成草稿").click();
+    await flushAsyncUpdates();
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("B 的模型草稿");
+    expect(container.textContent).toContain("117");
+
+    findButton("Agent A").click();
+    await nextTick();
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("A 的模型草稿");
+    expect(container.textContent).not.toContain("117");
+
+    findButton("确认发送").click();
+    await flushAsyncUpdates();
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("");
+    expect(container.querySelector(".usage-metrics")).toBeNull();
+
+    findButton("Agent B").click();
+    await nextTick();
+    expect(
+      container.querySelector<HTMLTextAreaElement>(
+        "#message-content",
+      )?.value,
+    ).toBe("B 的模型草稿");
+    expect(container.querySelector(".usage-metrics")).not.toBeNull();
   });
 });

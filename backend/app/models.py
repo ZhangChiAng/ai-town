@@ -146,6 +146,25 @@ class CreateMessageRequest(ApiModel):
         return self
 
 
+class MessageDraftUsage(ApiModel):
+    """Anthropic token usage returned for one draft generation."""
+
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    cache_creation_input_tokens: int = Field(ge=0)
+    cache_read_input_tokens: int = Field(ge=0)
+
+
+class MessageDraftResponse(ApiModel):
+    """Editable model-generated message draft."""
+
+    recipient_id: AgentId
+    content: str
+    usage: MessageDraftUsage
+
+    _validate_content = field_validator("content")(_strip_non_blank_content)
+
+
 def create_scene(name: str) -> Scene:
     """Create a new scene with default agents.
 

@@ -7,11 +7,11 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
-from fastapi.testclient import TestClient
 
 import app.storage as storage_module
 from app.main import create_app
 from app.storage import SceneStorage
+from tests.client import TestClient
 
 
 @pytest.fixture

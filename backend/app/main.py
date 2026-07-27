@@ -1,5 +1,7 @@
 """FastAPI application factory and route definitions for the AI Town API."""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
@@ -7,9 +9,17 @@ from uuid import UUID
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
+from app.config import load_model_settings
+from app.drafting import (
+    DraftGenerationError,
+    MessageDraftService,
+    create_anthropic_client,
+)
 from app.models import (
+    AgentId,
     CreateMessageRequest,
     CreateSceneRequest,
+    MessageDraftResponse,
     Scene,
     SceneSummary,
     UpdateSceneRequest,
@@ -35,24 +45,53 @@ DEFAULT_SCENE_DIRECTORY = (
 )
 
 
-def create_app(scene_storage: SceneStorage | None = None) -> FastAPI:
+def create_app(
+    scene_storage: SceneStorage | None = None,
+    message_draft_service: MessageDraftService | None = None,
+) -> FastAPI:
     """Build and configure a FastAPI application instance.
 
     Args:
-        scene_storage: Pre-configured SceneStorage instance. When omitted,
-            a default storage pointed at ``data/scenes/`` is used.
+        scene_storage: Pre-configured SceneStorage instance. When omitted, a
+            default storage pointed at ``data/scenes/`` is used.
+        message_draft_service: Injectable draft service for tests. When
+            omitted, startup loads model settings and creates an Anthropic
+            client.
 
     Returns:
         A fully configured FastAPI application with routes and exception
         handlers registered.
     """
-    application = FastAPI(title="AI Town API")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        client = None
+        if message_draft_service is None:
+            settings = load_model_settings()
+            client = create_anthropic_client(settings)
+            app.state.message_draft_service = MessageDraftService(
+                client,
+                settings.model,
+            )
+
+        try:
+            yield
+        finally:
+            if client is not None:
+                client.close()
+
+    application = FastAPI(title="AI Town API", lifespan=lifespan)
     application.state.scene_storage = scene_storage or SceneStorage(
         DEFAULT_SCENE_DIRECTORY
     )
+    if message_draft_service is not None:
+        application.state.message_draft_service = message_draft_service
 
     def storage(request: Request) -> SceneStorage:
         return request.app.state.scene_storage
+
+    def drafts(request: Request) -> MessageDraftService:
+        return request.app.state.message_draft_service
 
     @application.exception_handler(SceneNotFoundError)
     async def handle_scene_not_found(
@@ -72,29 +111,38 @@ def create_app(scene_storage: SceneStorage | None = None) -> FastAPI:
             content={"detail": str(error)},
         )
 
+    @application.exception_handler(DraftGenerationError)
+    async def handle_draft_generation_error(
+        _request: Request, error: DraftGenerationError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={"detail": str(error)},
+        )
+
     @application.get("/api/health")
-    def health() -> HealthResponse:
+    async def health() -> HealthResponse:
         return {"status": "ok"}
 
     @application.get("/api/scenes")
-    def list_scenes(request: Request) -> list[SceneSummary]:
+    async def list_scenes(request: Request) -> list[SceneSummary]:
         return storage(request).list_scenes()
 
     @application.post(
         "/api/scenes",
         status_code=status.HTTP_201_CREATED,
     )
-    def add_scene(payload: CreateSceneRequest, request: Request) -> Scene:
+    async def add_scene(payload: CreateSceneRequest, request: Request) -> Scene:
         scene = create_scene(payload.name)
         storage(request).create(scene)
         return scene
 
     @application.get("/api/scenes/{scene_id}")
-    def get_scene(scene_id: UUID, request: Request) -> Scene:
+    async def get_scene(scene_id: UUID, request: Request) -> Scene:
         return storage(request).get(scene_id)
 
     @application.put("/api/scenes/{scene_id}")
-    def put_scene(
+    async def put_scene(
         scene_id: UUID,
         payload: UpdateSceneRequest,
         request: Request,
@@ -108,7 +156,7 @@ def create_app(scene_storage: SceneStorage | None = None) -> FastAPI:
         "/api/scenes/{scene_id}/messages",
         status_code=status.HTTP_201_CREATED,
     )
-    def post_message(
+    async def post_message(
         scene_id: UUID,
         payload: CreateMessageRequest,
         request: Request,
@@ -117,6 +165,15 @@ def create_app(scene_storage: SceneStorage | None = None) -> FastAPI:
         updated_scene = add_message(current_scene, payload)
         storage(request).save(updated_scene)
         return updated_scene
+
+    @application.post("/api/scenes/{scene_id}/agents/{agent_id}/message-drafts")
+    async def post_message_draft(
+        scene_id: UUID,
+        agent_id: AgentId,
+        request: Request,
+    ) -> MessageDraftResponse:
+        current_scene = storage(request).get(scene_id)
+        return drafts(request).generate(current_scene, agent_id)
 
     return application
 

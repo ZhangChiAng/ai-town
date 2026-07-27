@@ -260,6 +260,29 @@ textarea:disabled {
   transform: translateY(0);
 }
 
+.secondary-button {
+  border: 1px solid rgb(41 74 53 / 24%);
+  border-radius: 9px;
+  color: #294a35;
+  background: rgb(255 255 255 / 72%);
+  cursor: pointer;
+  font-weight: 700;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    transform 140ms ease;
+}
+
+.secondary-button:not(:disabled):hover {
+  border-color: rgb(41 74 53 / 45%);
+  background: #fff;
+  transform: translateY(-1px);
+}
+
+.secondary-button:not(:disabled):active {
+  transform: translateY(0);
+}
+
 .create-button {
   flex: 0 0 auto;
   padding: 0 15px;
@@ -859,6 +882,38 @@ textarea:disabled {
   resize: vertical;
 }
 
+.usage-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 16px 0 0;
+}
+
+.usage-metrics > div {
+  min-width: 0;
+  padding: 10px 11px;
+  border: 1px solid rgb(41 74 53 / 12%);
+  border-radius: 9px;
+  background: rgb(255 255 255 / 52%);
+}
+
+.usage-metrics dt {
+  overflow: hidden;
+  color: #758178;
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-metrics dd {
+  margin: 4px 0 0;
+  color: #294a35;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.82rem;
+  font-weight: 750;
+}
+
 .message-actions {
   margin-top: 16px;
 }
@@ -874,7 +929,14 @@ textarea:disabled {
   color: #727f77;
 }
 
-.message-send-button {
+.message-action-buttons {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 8px;
+}
+
+.message-send-button,
+.message-generate-button {
   min-width: 104px;
   height: 40px;
   flex: 0 0 auto;
@@ -1053,6 +1115,10 @@ textarea:disabled {
 
   .message-fields {
     grid-template-columns: 1fr;
+  }
+
+  .usage-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
   .timeline-card {

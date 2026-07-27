@@ -8,6 +8,7 @@ import {
 
 import {
   createScene,
+  generateMessageDraft,
   getScene,
   listScenes,
   saveScene,
@@ -16,6 +17,7 @@ import {
 import {
   AGENT_IDS,
   type AgentId,
+  type MessageDraftUsage,
   type Scene,
   type SceneSummary,
   type SceneUpdate,
@@ -26,6 +28,7 @@ type SaveState = "idle" | "saving" | "success" | "error";
 interface MessageDraft {
   recipientId: AgentId | "";
   content: string;
+  usage: MessageDraftUsage | null;
 }
 
 const sceneSummaries = ref<SceneSummary[]>([]);
@@ -49,6 +52,7 @@ const messageErrors = ref<Record<AgentId, string>>(
   emptyMessageErrors(),
 );
 const sendingAgentId = ref<AgentId | null>(null);
+const generatingAgentId = ref<AgentId | null>(null);
 
 let listRequestToken = 0;
 let summaryMutationVersion = 0;
@@ -59,9 +63,9 @@ function cloneScene(scene: Scene): Scene {
 
 function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
   return {
-    A: { recipientId: "", content: "" },
-    B: { recipientId: "", content: "" },
-    C: { recipientId: "", content: "" },
+    A: { recipientId: "", content: "", usage: null },
+    B: { recipientId: "", content: "", usage: null },
+    C: { recipientId: "", content: "", usage: null },
   };
 }
 
@@ -128,10 +132,16 @@ const hasMessageDrafts = computed(() =>
   }),
 );
 
+const activeDraftHasContent = computed(() => {
+  const draft = activeMessageDraft.value;
+  return draft.recipientId !== "" || draft.content !== "";
+});
+
 const editorLocked = computed(
   () =>
     saveState.value === "saving" ||
     sendingAgentId.value !== null ||
+    generatingAgentId.value !== null ||
     isCreating.value ||
     openingSceneId.value !== null,
 );
@@ -143,6 +153,13 @@ const canSendMessage = computed(
     !editorLocked.value &&
     activeMessageDraft.value.recipientId !== "" &&
     activeMessageDraft.value.content.trim() !== "",
+);
+
+const canGenerateMessageDraft = computed(
+  () =>
+    currentScene.value !== null &&
+    !isDirty.value &&
+    !editorLocked.value,
 );
 
 function installScene(
@@ -223,7 +240,8 @@ async function openScene(summary: SceneSummary): Promise<void> {
     openingSceneId.value !== null ||
     isCreating.value ||
     saveState.value === "saving" ||
-    sendingAgentId.value !== null
+    sendingAgentId.value !== null ||
+    generatingAgentId.value !== null
   ) {
     return;
   }
@@ -257,6 +275,7 @@ async function submitNewScene(): Promise<void> {
     openingSceneId.value !== null ||
     saveState.value === "saving" ||
     sendingAgentId.value !== null ||
+    generatingAgentId.value !== null ||
     !confirmDiscardChanges()
   ) {
     return;
@@ -304,7 +323,8 @@ async function saveCurrentScene(): Promise<void> {
   if (
     scene === null ||
     saveState.value === "saving" ||
-    sendingAgentId.value !== null
+    sendingAgentId.value !== null ||
+    generatingAgentId.value !== null
   ) {
     return;
   }
@@ -337,6 +357,37 @@ function markMessageDraftEdited(): void {
   messageErrors.value[activeAgentId.value] = "";
 }
 
+async function generateDraft(): Promise<void> {
+  const scene = currentScene.value;
+  const senderId = activeAgentId.value;
+  if (
+    scene === null ||
+    isDirty.value ||
+    editorLocked.value
+  ) {
+    return;
+  }
+
+  generatingAgentId.value = senderId;
+  messageErrors.value[senderId] = "";
+
+  try {
+    const generated = await generateMessageDraft(scene.id, senderId);
+    messageDrafts.value[senderId] = {
+      recipientId: generated.recipient_id,
+      content: generated.content,
+      usage: generated.usage,
+    };
+  } catch (error) {
+    messageErrors.value[senderId] = errorMessage(
+      error,
+      "草稿生成失败，请重试。",
+    );
+  } finally {
+    generatingAgentId.value = null;
+  }
+}
+
 async function confirmMessage(): Promise<void> {
   const scene = currentScene.value;
   const senderId = activeAgentId.value;
@@ -344,7 +395,7 @@ async function confirmMessage(): Promise<void> {
   if (
     scene === null ||
     isDirty.value ||
-    sendingAgentId.value !== null ||
+    editorLocked.value ||
     draft.recipientId === "" ||
     draft.content.trim() === ""
   ) {
@@ -364,6 +415,7 @@ async function confirmMessage(): Promise<void> {
     messageDrafts.value[senderId] = {
       recipientId: "",
       content: "",
+      usage: null,
     };
   } catch (error) {
     messageErrors.value[senderId] = errorMessage(
@@ -405,7 +457,7 @@ onBeforeUnmount(() => {
       </a>
       <p class="milestone">
         <span aria-hidden="true"></span>
-        手工消息 · 显式确认
+        模型草稿 · 人工确认
       </p>
     </header>
 
@@ -704,8 +756,8 @@ onBeforeUnmount(() => {
             >
               <div class="message-card-heading">
                 <div>
-                  <p class="eyebrow">MANUAL MESSAGE</p>
-                  <h3 id="message-draft-title">手工消息草稿</h3>
+                  <p class="eyebrow">ONE-STEP TURN</p>
+                  <h3 id="message-draft-title">消息草稿</h3>
                 </div>
                 <p>
                   发送者
@@ -751,9 +803,41 @@ onBeforeUnmount(() => {
                 </label>
               </div>
 
+              <dl
+                v-if="activeMessageDraft.usage"
+                class="usage-metrics"
+                aria-label="本次草稿生成 token 用量"
+              >
+                <div>
+                  <dt>5 分钟缓存写入</dt>
+                  <dd>
+                    {{
+                      activeMessageDraft.usage
+                        .cache_creation_input_tokens
+                    }}
+                  </dd>
+                </div>
+                <div>
+                  <dt>缓存读取</dt>
+                  <dd>
+                    {{
+                      activeMessageDraft.usage.cache_read_input_tokens
+                    }}
+                  </dd>
+                </div>
+                <div>
+                  <dt>未缓存输入</dt>
+                  <dd>{{ activeMessageDraft.usage.input_tokens }}</dd>
+                </div>
+                <div>
+                  <dt>输出</dt>
+                  <dd>{{ activeMessageDraft.usage.output_tokens }}</dd>
+                </div>
+              </dl>
+
               <div class="message-actions">
                 <p v-if="isDirty" class="message-hint">
-                  请先保存场景，再确认发送。
+                  请先保存场景，再生成或确认发送。
                 </p>
                 <p
                   v-else-if="messageErrors[activeAgent.id]"
@@ -765,18 +849,34 @@ onBeforeUnmount(() => {
                 <p v-else class="message-hint">
                   只有确认后的消息才会进入双方个人时间线。
                 </p>
-                <button
-                  class="primary-button message-send-button"
-                  type="button"
-                  :disabled="!canSendMessage"
-                  @click="confirmMessage"
-                >
-                  {{
-                    sendingAgentId === activeAgent.id
-                      ? "发送中…"
-                      : "确认发送"
-                  }}
-                </button>
+                <div class="message-action-buttons">
+                  <button
+                    class="secondary-button message-generate-button"
+                    type="button"
+                    :disabled="!canGenerateMessageDraft"
+                    @click="generateDraft"
+                  >
+                    {{
+                      generatingAgentId === activeAgent.id
+                        ? "生成中…"
+                        : activeDraftHasContent
+                          ? "重新生成"
+                          : "生成草稿"
+                    }}
+                  </button>
+                  <button
+                    class="primary-button message-send-button"
+                    type="button"
+                    :disabled="!canSendMessage"
+                    @click="confirmMessage"
+                  >
+                    {{
+                      sendingAgentId === activeAgent.id
+                        ? "发送中…"
+                        : "确认发送"
+                    }}
+                  </button>
+                </div>
               </div>
             </section>
 

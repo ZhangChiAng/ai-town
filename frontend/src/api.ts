@@ -2,6 +2,8 @@ import type {
   Agent,
   AgentId,
   MessageCreate,
+  MessageDraftResponse,
+  MessageDraftUsage,
   Scene,
   SceneSummary,
   SceneUpdate,
@@ -69,6 +71,34 @@ function isSceneSummary(value: unknown): value is SceneSummary {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.name === "string"
+  );
+}
+
+function isTokenCount(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 0;
+}
+
+function isMessageDraftUsage(
+  value: unknown,
+): value is MessageDraftUsage {
+  return (
+    isRecord(value) &&
+    isTokenCount(value.input_tokens) &&
+    isTokenCount(value.output_tokens) &&
+    isTokenCount(value.cache_creation_input_tokens) &&
+    isTokenCount(value.cache_read_input_tokens)
+  );
+}
+
+function isMessageDraftResponse(
+  value: unknown,
+): value is MessageDraftResponse {
+  return (
+    isRecord(value) &&
+    isAgentId(value.recipient_id) &&
+    typeof value.content === "string" &&
+    value.content.trim() !== "" &&
+    isMessageDraftUsage(value.usage)
   );
 }
 
@@ -195,6 +225,20 @@ export async function sendMessage(
   );
   if (!isScene(body)) {
     throw new ApiError("后端返回了无法识别的场景数据。");
+  }
+  return body;
+}
+
+export async function generateMessageDraft(
+  sceneId: string,
+  agentId: AgentId,
+): Promise<MessageDraftResponse> {
+  const body = await requestJson(
+    `/api/scenes/${encodeURIComponent(sceneId)}/agents/${agentId}/message-drafts`,
+    { method: "POST" },
+  );
+  if (!isMessageDraftResponse(body)) {
+    throw new ApiError("后端返回了无法识别的消息草稿。");
   }
   return body;
 }

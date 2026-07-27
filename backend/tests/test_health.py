@@ -1,8 +1,7 @@
 """Smoke test for the API health endpoint."""
 
-from fastapi.testclient import TestClient
-
 from app.main import app
+from tests.client import TestClient
 
 client = TestClient(app)
 
