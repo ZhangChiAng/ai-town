@@ -233,6 +233,20 @@ export async function sendMessage(
   return body;
 }
 
+export async function deleteMessage(
+  sceneId: string,
+  messageId: string,
+): Promise<Scene> {
+  const body = await requestJson(
+    `/api/scenes/${encodeURIComponent(sceneId)}/messages/${encodeURIComponent(messageId)}`,
+    { method: "DELETE" },
+  );
+  if (!isScene(body)) {
+    throw new ApiError("后端返回了无法识别的场景数据。");
+  }
+  return body;
+}
+
 export async function generateMessageDraft(
   sceneId: string,
   agentId: AgentId,

@@ -1148,9 +1148,38 @@ textarea:disabled {
   overflow-wrap: anywhere;
 }
 
+.timeline-record {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.timeline-record p {
+  min-width: 0;
+  margin: 0;
+}
+
 .timeline-direction {
   color: #294a35;
   font-weight: 750;
+}
+
+.timeline-delete-button {
+  flex: 0 0 auto;
+  padding: 2px 0;
+  border: 0;
+  color: #a13e36;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.69rem;
+  font-weight: 750;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.timeline-delete-button:not(:disabled):hover {
+  color: #792a25;
 }
 
 @keyframes spin {

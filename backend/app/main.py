@@ -21,7 +21,9 @@ from app.models import (
     ComposeSystemPromptResponse,
     CreateMessageRequest,
     CreateSceneRequest,
+    MessageDeletionConflictError,
     MessageDraftResponse,
+    MessageNotFoundError,
     ModelRequestPreviewResponse,
     Scene,
     SceneSummary,
@@ -29,6 +31,7 @@ from app.models import (
     add_message,
     compose_system_prompt,
     create_scene,
+    delete_message,
     update_scene,
 )
 from app.storage import (
@@ -115,6 +118,24 @@ def create_app(
             content={"detail": str(error)},
         )
 
+    @application.exception_handler(MessageNotFoundError)
+    async def handle_message_not_found(
+        _request: Request, error: MessageNotFoundError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(error)},
+        )
+
+    @application.exception_handler(MessageDeletionConflictError)
+    async def handle_message_deletion_conflict(
+        _request: Request, error: MessageDeletionConflictError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(error)},
+        )
+
     @application.exception_handler(DraftGenerationError)
     async def handle_draft_generation_error(
         _request: Request, error: DraftGenerationError
@@ -180,6 +201,17 @@ def create_app(
     ) -> Scene:
         current_scene = storage(request).get(scene_id)
         updated_scene = add_message(current_scene, payload)
+        storage(request).save(updated_scene)
+        return updated_scene
+
+    @application.delete("/api/scenes/{scene_id}/messages/{message_id}")
+    async def remove_message(
+        scene_id: UUID,
+        message_id: UUID,
+        request: Request,
+    ) -> Scene:
+        current_scene = storage(request).get(scene_id)
+        updated_scene = delete_message(current_scene, message_id)
         storage(request).save(updated_scene)
         return updated_scene
 

@@ -232,6 +232,14 @@ class ModelRequestPreviewResponse(ApiModel):
     request: dict[str, Any]
 
 
+class MessageNotFoundError(LookupError):
+    """Raised when a scene does not contain the requested message."""
+
+
+class MessageDeletionConflictError(RuntimeError):
+    """Raised when a message cannot be safely removed from both timelines."""
+
+
 def create_scene(name: str) -> Scene:
     """Create a new scene with default agents.
 
@@ -291,6 +299,78 @@ def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
 
         agents.append(agent.model_copy(update={"timeline": timeline}))
 
+    return scene.model_copy(update={"agents": agents})
+
+
+def delete_message(scene: Scene, message_id: UUID) -> Scene:
+    """Remove a paired message at both participants' timeline tops.
+
+    Args:
+        scene: The scene containing the confirmed message.
+        message_id: Shared ID of the two timeline records to remove.
+
+    Returns:
+        A new Scene without either participant's matching record.
+
+    Raises:
+        MessageNotFoundError: If no timeline contains the message ID.
+        MessageDeletionConflictError: If the records are not a consistent
+            sent/received pair or are not both at their timeline tops.
+    """
+    matches = [
+        (agent, index, record)
+        for agent in scene.agents
+        for index, record in enumerate(agent.timeline)
+        if record.message_id == message_id
+    ]
+    if not matches:
+        raise MessageNotFoundError(
+            f"Message '{message_id}' does not exist in this scene."
+        )
+    if len(matches) != 2:
+        raise MessageDeletionConflictError(
+            f"Message '{message_id}' does not have exactly two records."
+        )
+
+    sent_matches = [match for match in matches if match[2].direction == "sent"]
+    received_matches = [
+        match for match in matches if match[2].direction == "received"
+    ]
+    if len(sent_matches) != 1 or len(received_matches) != 1:
+        raise MessageDeletionConflictError(
+            f"Message '{message_id}' is not a sent/received pair."
+        )
+
+    sender, sender_index, sent_record = sent_matches[0]
+    recipient, recipient_index, received_record = received_matches[0]
+    records_are_consistent = (
+        sender.id == received_record.counterpart_id
+        and recipient.id == sent_record.counterpart_id
+        and sender.id != recipient.id
+        and sent_record.content == received_record.content
+    )
+    if not records_are_consistent:
+        raise MessageDeletionConflictError(
+            f"Message '{message_id}' has inconsistent participant records."
+        )
+
+    # Both records must be absolute timeline tops, including unrelated messages.
+    records_are_timeline_tops = (
+        sender_index == len(sender.timeline) - 1
+        and recipient_index == len(recipient.timeline) - 1
+    )
+    if not records_are_timeline_tops:
+        raise MessageDeletionConflictError(
+            f"Message '{message_id}' is not last in both timelines."
+        )
+
+    participant_ids = {sender.id, recipient.id}
+    agents = [
+        agent.model_copy(update={"timeline": agent.timeline[:-1]})
+        if agent.id in participant_ids
+        else agent
+        for agent in scene.agents
+    ]
     return scene.model_copy(update={"agents": agents})
 
 

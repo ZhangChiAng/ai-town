@@ -9,6 +9,7 @@ import {
 import {
   composeSystemPrompt,
   createScene,
+  deleteMessage,
   generateMessageDraft,
   getModelRequestPreview,
   getScene,
@@ -24,6 +25,7 @@ import {
   type Scene,
   type SceneSummary,
   type SceneUpdate,
+  type TimelineRecord,
 } from "./types";
 
 type ListState = "loading" | "ready" | "error";
@@ -56,6 +58,7 @@ const messageErrors = ref<Record<AgentId, string>>(
   emptyMessageErrors(),
 );
 const sendingAgentId = ref<AgentId | null>(null);
+const deletingMessageId = ref<string | null>(null);
 const generatingAgentId = ref<AgentId | null>(null);
 const composingAgentId = ref<AgentId | null>(null);
 const requestPreviews = ref<Record<AgentId, ModelRequest | null>>(
@@ -179,10 +182,66 @@ const observableRequests = computed(() => [
   },
 ]);
 
+const deletableMessageIds = computed(() => {
+  const scene = currentScene.value;
+  const deletableIds = new Set<string>();
+  if (scene === null) {
+    return deletableIds;
+  }
+
+  const recordsByMessageId = new Map<
+    string,
+    { agentId: AgentId; index: number; record: TimelineRecord }[]
+  >();
+  for (const agent of scene.agents) {
+    agent.timeline.forEach((record, index) => {
+      const matches = recordsByMessageId.get(record.message_id) ?? [];
+      matches.push({ agentId: agent.id, index, record });
+      recordsByMessageId.set(record.message_id, matches);
+    });
+  }
+
+  for (const [messageId, matches] of recordsByMessageId) {
+    if (matches.length !== 2) {
+      continue;
+    }
+    const sent = matches.find(
+      ({ record }) => record.direction === "sent",
+    );
+    const received = matches.find(
+      ({ record }) => record.direction === "received",
+    );
+    if (sent === undefined || received === undefined) {
+      continue;
+    }
+    const sender = scene.agents.find(
+      (agent) => agent.id === sent.agentId,
+    );
+    const recipient = scene.agents.find(
+      (agent) => agent.id === received.agentId,
+    );
+    if (
+      sender === undefined ||
+      recipient === undefined ||
+      sent.agentId === received.agentId ||
+      sent.record.counterpart_id !== received.agentId ||
+      received.record.counterpart_id !== sent.agentId ||
+      sent.record.content !== received.record.content ||
+      sent.index !== sender.timeline.length - 1 ||
+      received.index !== recipient.timeline.length - 1
+    ) {
+      continue;
+    }
+    deletableIds.add(messageId);
+  }
+  return deletableIds;
+});
+
 const editorLocked = computed(
   () =>
     saveState.value === "saving" ||
     sendingAgentId.value !== null ||
+    deletingMessageId.value !== null ||
     generatingAgentId.value !== null ||
     composingAgentId.value !== null ||
     previewingAgentId.value !== null ||
@@ -481,6 +540,58 @@ async function confirmMessage(): Promise<void> {
   }
 }
 
+async function confirmDeleteMessage(
+  record: TimelineRecord,
+): Promise<void> {
+  const scene = currentScene.value;
+  const viewingAgentId = activeAgentId.value;
+  if (
+    scene === null ||
+    isDirty.value ||
+    editorLocked.value ||
+    !deletableMessageIds.value.has(record.message_id)
+  ) {
+    return;
+  }
+
+  const senderId =
+    record.direction === "sent"
+      ? viewingAgentId
+      : record.counterpart_id;
+  const recipientId =
+    record.direction === "sent"
+      ? record.counterpart_id
+      : viewingAgentId;
+  const sender = scene.agents.find((agent) => agent.id === senderId);
+  const recipient = scene.agents.find(
+    (agent) => agent.id === recipientId,
+  );
+  const confirmed = window.confirm(
+    [
+      "确定永久删除这条已确认消息吗？",
+      "",
+      `${sender?.name ?? senderId}（Agent ${senderId}） → ${recipient?.name ?? recipientId}（Agent ${recipientId}）`,
+      record.content,
+      "",
+      "删除不可撤销，且本次只删除这一条。",
+    ].join("\n"),
+  );
+  if (!confirmed) {
+    return;
+  }
+
+  deletingMessageId.value = record.message_id;
+  actionError.value = "";
+  try {
+    const updated = await deleteMessage(scene.id, record.message_id);
+    installScene(updated, viewingAgentId, true);
+  } catch (error) {
+    actionError.value = errorMessage(error, "消息删除失败，请重试。");
+  } finally {
+    deletingMessageId.value = null;
+  }
+}
+
 async function recomposeActiveSystemPrompt(): Promise<void> {
   const agent = activeAgent.value;
   if (agent === undefined || editorLocked.value) {
@@ -516,7 +627,7 @@ async function recomposeActiveSystemPrompt(): Promise<void> {
 async function loadRequestPreview(): Promise<void> {
   const scene = currentScene.value;
   const agentId = activeAgentId.value;
-  if (scene === null || previewingAgentId.value !== null) {
+  if (scene === null || editorLocked.value) {
     return;
   }
 
@@ -742,7 +853,7 @@ onBeforeUnmount(() => {
         </div>
 
         <p class="storage-note">
-          每个场景独立保存为本机 JSON 文件。本阶段不提供删除。
+          每个场景独立保存为本机 JSON 文件。已确认消息仅可从双方时间线栈顶逐条删除。
         </p>
       </aside>
 
@@ -1122,7 +1233,7 @@ onBeforeUnmount(() => {
                 <button
                   class="secondary-button preview-button"
                   type="button"
-                  :disabled="previewingAgentId !== null"
+                  :disabled="editorLocked"
                   @click="loadRequestPreview"
                 >
                   {{
@@ -1231,14 +1342,31 @@ onBeforeUnmount(() => {
                   v-for="record in activeAgent.timeline"
                   :key="`${record.message_id}-${record.direction}`"
                 >
-                  <span class="timeline-direction">
-                    {{
-                      record.direction === "sent"
-                        ? `发送给 ${record.counterpart_id}：`
-                        : `${record.counterpart_id}：`
-                    }}
-                  </span>
-                  <span>{{ record.content }}</span>
+                  <div class="timeline-record">
+                    <p>
+                      <span class="timeline-direction">
+                        {{
+                          record.direction === "sent"
+                            ? `发送给 ${record.counterpart_id}：`
+                            : `${record.counterpart_id}：`
+                        }}
+                      </span>
+                      <span>{{ record.content }}</span>
+                    </p>
+                    <button
+                      v-if="deletableMessageIds.has(record.message_id)"
+                      class="timeline-delete-button"
+                      type="button"
+                      :disabled="isDirty || editorLocked"
+                      @click="confirmDeleteMessage(record)"
+                    >
+                      {{
+                        deletingMessageId === record.message_id
+                          ? "删除中…"
+                          : "删除"
+                      }}
+                    </button>
+                  </div>
                 </li>
               </ol>
             </section>

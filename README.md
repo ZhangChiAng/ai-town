@@ -115,6 +115,14 @@ Messages API，最长等待 60 秒，SDK 自动重试已关闭。模型通过严
 完全手写。只有点击“确认发送”才会沿用消息接口，把匹配记录原子写入发送者和
 接收者的时间线。
 
+已确认消息可以手动删除，但必须同时是发送者和接收者各自完整个人时间线的
+绝对末条；夹在任一方后续消息之前的记录都不可删除。界面会在符合条件的双方
+记录上显示“删除”，每次点击都展示参与者和正文并要求确认。一次确认只删除
+一条，不会自动连锁删除；成功后会重新计算新的可删除消息。后端按共享
+`message_id` 权威复核一发一收、参与者、正文和双方栈顶位置，再同步移除两条
+记录并原子保存，未参与的第三位 Agent 不受影响。消息不存在返回 `404`，配对
+异常或不在双方栈顶返回 `409`，失败不会改写场景。
+
 上游请求失败或返回无效工具结果时，接口返回不包含密钥及提供商响应正文的
 `502`，并保留现有草稿与 usage。成功生成会以 INFO 级别记录场景 ID、Agent
 ID、模型名和四项 token usage，不记录提示词、正文或 API Key。
@@ -208,6 +216,7 @@ API Key、Base URL 或第三方响应。提示词和快照不会写入日志。
 - `GET /api/scenes/{id}`
 - `PUT /api/scenes/{id}`
 - `POST /api/scenes/{id}/messages`
+- `DELETE /api/scenes/{id}/messages/{message_id}`
 - `POST /api/scenes/{id}/agents/{agent_id}/message-drafts`
 - `GET /api/scenes/{id}/agents/{agent_id}/model-request-preview`
 
