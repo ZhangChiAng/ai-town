@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+
+set -u
+
+readonly PROJECT_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+BACKEND_PID=""
+FRONTEND_PID=""
+
+require_command() {
+  local command_name="$1"
+
+  if ! command -v "${command_name}" >/dev/null 2>&1; then
+    echo "缺少命令：${command_name}。请先按 README.md 安装项目运行环境。" >&2
+    exit 1
+  fi
+}
+
+stop_process_group() {
+  local pid="$1"
+
+  if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+    kill -TERM -- "-${pid}" 2>/dev/null || true
+  fi
+}
+
+cleanup() {
+  trap - EXIT INT TERM
+  stop_process_group "${BACKEND_PID}"
+  stop_process_group "${FRONTEND_PID}"
+
+  # Reap both process-group leaders so shutdown does not leave zombies.
+  [[ -n "${BACKEND_PID}" ]] && wait "${BACKEND_PID}" 2>/dev/null || true
+  [[ -n "${FRONTEND_PID}" ]] && wait "${FRONTEND_PID}" 2>/dev/null || true
+}
+
+require_command uv
+require_command npm
+require_command setsid
+
+if [[ ! -f "${PROJECT_ROOT}/.env" ]]; then
+  echo "缺少 ${PROJECT_ROOT}/.env，请先复制 .env.example 并填写模型配置。" >&2
+  exit 1
+fi
+
+if [[ ! -d "${PROJECT_ROOT}/frontend/node_modules" ]]; then
+  echo "前端依赖尚未安装，请先运行：npm ci --prefix frontend" >&2
+  exit 1
+fi
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "正在启动后端：http://127.0.0.1:8000"
+setsid uv run \
+  --project "${PROJECT_ROOT}/backend" \
+  uvicorn app.main:app \
+  --app-dir "${PROJECT_ROOT}/backend" \
+  --reload \
+  --reload-dir "${PROJECT_ROOT}/backend" \
+  --host 127.0.0.1 \
+  --port 8000 &
+BACKEND_PID=$!
+
+echo "正在启动前端：http://127.0.0.1:5173"
+setsid npm run dev --prefix "${PROJECT_ROOT}/frontend" &
+FRONTEND_PID=$!
+
+echo "前后端已启动，按 Ctrl+C 同时停止。"
+
+# If either server exits, return its status and stop the other server.
+wait -n "${BACKEND_PID}" "${FRONTEND_PID}"
+exit $?

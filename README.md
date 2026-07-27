@@ -55,19 +55,12 @@ frontend`，并提交相应锁文件。以上命令在 Windows PowerShell 中写
 
 ### Linux Bash
 
-终端 1：
-
 ```bash
-cd backend
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+./start
 ```
 
-终端 2：
-
-```bash
-cd frontend
-npm run dev
-```
+脚本会同时启动前后端；任一服务退出时会停止另一服务，按 `Ctrl+C` 也会统一
+清理两个进程。脚本可以从任意工作目录调用。
 
 ### Windows PowerShell
 
