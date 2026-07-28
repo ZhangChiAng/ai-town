@@ -11,7 +11,7 @@ import pytest
 
 from app.drafting import (
     CACHE_CONTROL,
-    COMPOSE_MESSAGE_TOOL,
+    RUNTIME_TURN_PROMPT,
     MessageDraftService,
     build_message_request,
 )
@@ -62,25 +62,25 @@ class DraftFixture(NamedTuple):
 
 def model_response(
     *,
-    recipient_id: str = "B",
     content: str = "今晚去灯塔。",
+    include_thinking: bool = False,
     input_tokens: int = 120,
     output_tokens: int = 48,
     cache_creation_input_tokens: int = 17,
     cache_read_input_tokens: int = 91,
 ) -> SimpleNamespace:
     """Build a fake successful Anthropic response."""
+    blocks = []
+    if include_thinking:
+        blocks.append(SimpleNamespace(type="thinking", thinking="PRIVATE"))
+    blocks.append(
+        SimpleNamespace(
+            type="text",
+            text=content,
+        )
+    )
     return SimpleNamespace(
-        content=[
-            SimpleNamespace(
-                type="tool_use",
-                name=COMPOSE_MESSAGE_TOOL,
-                input={
-                    "recipient_id": recipient_id,
-                    "content": content,
-                },
-            )
-        ],
+        content=blocks,
         usage=SimpleNamespace(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -88,6 +88,21 @@ def model_response(
             cache_read_input_tokens=cache_read_input_tokens,
         ),
     )
+
+
+def test_response_allows_thinking_before_the_visible_text() -> None:
+    """Provider reasoning blocks do not invalidate a plain-text draft."""
+    service = MessageDraftService(
+        FakeAnthropic(model_response(include_thinking=True)),
+        MODEL,
+    )
+    scene = private_scene()
+
+    result = service.generate(scene, "A")
+
+    assert result.recipient_id is None
+    assert result.content == "今晚去灯塔。"
+    assert result.request_snapshot["model"] == MODEL
 
 
 def private_scene() -> Scene:
@@ -163,7 +178,7 @@ def test_draft_endpoint_preserves_information_boundaries_and_disk(
     assert response.status_code == 200
     body = response.json()
     assert {key: body[key] for key in ("recipient_id", "content", "usage")} == {
-        "recipient_id": "B",
+        "recipient_id": None,
         "content": "今晚去灯塔。",
         "usage": {
             "input_tokens": 120,
@@ -246,10 +261,8 @@ def test_compose_prompt_endpoint_uses_canonical_template() -> None:
     assert prompt.endswith("【记忆】\n记忆正文")
 
 
-def test_request_forces_strict_tool_and_has_two_explicit_5m_breakpoints() -> (
-    None
-):
-    """Tool output and both non-empty cache layers are deterministic."""
+def test_request_has_no_tools_and_two_explicit_5m_breakpoints() -> None:
+    """Keep plain-text generation and both cache layers deterministic."""
     scene = private_scene()
     expected_prompt = next(
         agent.system_prompt for agent in scene.agents if agent.id == "A"
@@ -259,30 +272,8 @@ def test_request_forces_strict_tool_and_has_two_explicit_5m_breakpoints() -> (
     assert request["max_tokens"] == 512
     assert request["model"] == MODEL
     assert request["system"][0]["text"] == expected_prompt
-    assert request["tool_choice"] == {
-        "type": "tool",
-        "name": COMPOSE_MESSAGE_TOOL,
-        "disable_parallel_tool_use": True,
-    }
-    tool = request["tools"][0]
-    assert tool["strict"] is True
-    assert tool["input_schema"] == {
-        "type": "object",
-        "properties": {
-            "recipient_id": {
-                "type": "string",
-                "enum": ["B", "C"],
-                "description": "ID of the Agent receiving the message.",
-            },
-            "content": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Non-empty private message body.",
-            },
-        },
-        "required": ["recipient_id", "content"],
-        "additionalProperties": False,
-    }
+    assert "tools" not in request
+    assert "tool_choice" not in request
     assert request["system"][0]["cache_control"] == CACHE_CONTROL
     last_block = request["messages"][-1]["content"][-1]
     assert last_block["cache_control"] == CACHE_CONTROL
@@ -314,22 +305,22 @@ def test_timeline_maps_to_alternating_native_messages_in_exact_order() -> None:
     assert request["messages"] == [
         {
             "role": "user",
-            "content": [{"type": "text", "text": "From B: 第一条收到"}],
+            "content": [{"type": "text", "text": "B：第一条收到"}],
         },
         {
             "role": "assistant",
             "content": [
-                {"type": "text", "text": "To C: 第一条发出"},
-                {"type": "text", "text": "To B: 连续发出"},
+                {"type": "text", "text": "第一条发出"},
+                {"type": "text", "text": "连续发出"},
             ],
         },
         {
             "role": "user",
             "content": [
-                {"type": "text", "text": "From B: 连续收到之一"},
+                {"type": "text", "text": "B：连续收到之一"},
                 {
                     "type": "text",
-                    "text": "From C: 最后收到",
+                    "text": "C：最后收到",
                     "cache_control": CACHE_CONTROL,
                 },
             ],
@@ -343,17 +334,22 @@ def test_timeline_maps_to_alternating_native_messages_in_exact_order() -> None:
     )
 
 
-def test_empty_timeline_has_empty_messages_and_only_system_cache() -> None:
-    """No runtime user turn or rolling breakpoint is added to an empty log."""
+def test_empty_timeline_adds_uncached_runtime_user_turn() -> None:
+    """An empty log gets one runtime turn and no rolling breakpoint."""
     request = build_message_request(create_scene("空时间线"), "A", MODEL)
 
-    assert request["messages"] == []
+    assert request["messages"] == [
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": RUNTIME_TURN_PROMPT}],
+        }
+    ]
     assert request["system"][0]["cache_control"] == CACHE_CONTROL
     assert json.dumps(request).count('"cache_control"') == 1
 
 
-def test_timeline_ending_in_sent_keeps_assistant_as_final_role() -> None:
-    """The request is not padded after an outgoing timeline record."""
+def test_timeline_ending_in_sent_adds_uncached_runtime_user_turn() -> None:
+    """An outgoing final record is cached before a runtime user turn."""
     scene = add_message(
         create_scene("发出结尾"),
         CreateMessageRequest(
@@ -365,10 +361,33 @@ def test_timeline_ending_in_sent_keeps_assistant_as_final_role() -> None:
 
     request = build_message_request(scene, "A", MODEL)
 
-    assert request["messages"][-1]["role"] == "assistant"
-    assert request["messages"][-1]["content"][0]["text"] == (
-        "To B: 由 assistant 结尾"
+    assert request["messages"][-2]["role"] == "assistant"
+    assert request["messages"][-2]["content"][0]["text"] == "由 assistant 结尾"
+    assert request["messages"][-2]["content"][0]["cache_control"] == (
+        CACHE_CONTROL
     )
+    assert request["messages"][-1] == {
+        "role": "user",
+        "content": [{"type": "text", "text": RUNTIME_TURN_PROMPT}],
+    }
+
+
+def test_timeline_ending_in_user_does_not_add_runtime_turn() -> None:
+    """A received message already provides the user turn to continue."""
+    scene = add_message(
+        create_scene("收到结尾"),
+        CreateMessageRequest(
+            sender_id="B",
+            recipient_id="A",
+            content="由 user 结尾",
+        ),
+    )
+
+    request = build_message_request(scene, "A", MODEL)
+
+    assert len(request["messages"]) == 1
+    assert request["messages"][0]["role"] == "user"
+    assert request["messages"][0]["content"][0]["text"] == "B：由 user 结尾"
 
 
 def test_context_order_and_cache_prefix_are_stable_as_timeline_grows() -> None:
@@ -404,10 +423,9 @@ def test_context_order_and_cache_prefix_are_stable_as_timeline_grows() -> None:
         }
         for message in old_messages
     ]
-    assert grown_messages[-1]["content"][0]["text"] == (
-        "To B: APPENDED_TIMELINE"
-    )
-    assert grown_messages[-1]["content"][0]["cache_control"] == CACHE_CONTROL
+    assert grown_messages[-2]["content"][0]["text"] == "APPENDED_TIMELINE"
+    assert grown_messages[-2]["content"][0]["cache_control"] == CACHE_CONTROL
+    assert grown_messages[-1]["content"][0]["text"] == RUNTIME_TURN_PROMPT
 
 
 @pytest.mark.parametrize(
@@ -418,7 +436,7 @@ def test_context_order_and_cache_prefix_are_stable_as_timeline_grows() -> None:
             content=[
                 SimpleNamespace(
                     type="tool_use",
-                    name="wrong_tool",
+                    name="compose_message",
                     input={"recipient_id": "B", "content": "正文"},
                 )
             ],
@@ -426,28 +444,23 @@ def test_context_order_and_cache_prefix_are_stable_as_timeline_grows() -> None:
         ),
         SimpleNamespace(
             content=[
-                SimpleNamespace(
-                    type="tool_use",
-                    name=COMPOSE_MESSAGE_TOOL,
-                    input={"recipient_id": "B", "content": "正文"},
-                ),
-                SimpleNamespace(
-                    type="tool_use",
-                    name=COMPOSE_MESSAGE_TOOL,
-                    input={"recipient_id": "C", "content": "第二条"},
-                ),
+                SimpleNamespace(type="text", text="正文"),
+                SimpleNamespace(type="text", text="第二条"),
             ],
             usage=SimpleNamespace(),
         ),
-        model_response(recipient_id="A"),
         model_response(content=" \t "),
+        SimpleNamespace(
+            content=[SimpleNamespace(type="image", source={})],
+            usage=SimpleNamespace(),
+        ),
     ],
 )
 def test_invalid_model_outputs_return_one_sanitized_502(
     tmp_path: Path,
     response: SimpleNamespace,
 ) -> None:
-    """Invalid tools, recipients, or content fail without a repair request."""
+    """Invalid blocks or content fail without a repair request."""
     fake = FakeAnthropic(response)
     service = MessageDraftService(fake, MODEL)
     storage = SceneStorage(tmp_path / "scenes")

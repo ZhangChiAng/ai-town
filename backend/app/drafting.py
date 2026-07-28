@@ -16,8 +16,8 @@ from app.models import (
 )
 
 LOGGER = logging.getLogger(__name__)
-COMPOSE_MESSAGE_TOOL = "compose_message"
 CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
+RUNTIME_TURN_PROMPT = "现在轮到你说话。"
 
 
 class MessagesResource(Protocol):
@@ -61,7 +61,7 @@ def create_anthropic_client(
 
 
 class MessageDraftService:
-    """Generate structured message drafts without mutating scene state."""
+    """Generate plain-text message drafts without mutating scene state."""
 
     def __init__(
         self,
@@ -88,11 +88,11 @@ class MessageDraftService:
             agent_id: Agent whose next private message should be drafted.
 
         Returns:
-            A validated structured draft and the upstream usage metrics.
+            A validated text draft and the upstream usage metrics.
 
         Raises:
             DraftGenerationError: If the upstream request fails or returns an
-                invalid tool result.
+                invalid response.
         """
         model_request = build_message_request(scene, agent_id, self._model)
 
@@ -103,7 +103,7 @@ class MessageDraftService:
             raise DraftGenerationError("Model request failed.") from error
 
         try:
-            draft = _parse_response(response, agent_id, model_request)
+            draft = _parse_response(response, model_request)
         except (AttributeError, TypeError, ValueError, KeyError) as error:
             raise DraftGenerationError(
                 "Model returned an invalid message draft."
@@ -120,11 +120,19 @@ def build_message_request(
 ) -> dict[str, Any]:
     """Build a deterministic, explicitly cached Anthropic request."""
     agent = next(agent for agent in scene.agents if agent.id == agent_id)
-    recipients = [agent for agent in scene.agents if agent.id != agent_id]
     messages = _build_timeline_messages(agent)
     if messages:
         # The rolling breakpoint follows the final immutable timeline record.
         messages[-1]["content"][-1]["cache_control"] = dict(CACHE_CONTROL)
+    if not messages or messages[-1]["role"] == "assistant":
+        # Avoid empty requests and assistant prefills without persisting or
+        # caching this runtime-only turn.
+        messages.append(
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": RUNTIME_TURN_PROMPT}],
+            }
+        )
 
     return {
         "model": model,
@@ -136,44 +144,7 @@ def build_message_request(
                 "cache_control": dict(CACHE_CONTROL),
             }
         ],
-        "tools": [_compose_message_tool(recipients)],
-        "tool_choice": {
-            "type": "tool",
-            "name": COMPOSE_MESSAGE_TOOL,
-            "disable_parallel_tool_use": True,
-        },
         "messages": messages,
-    }
-
-
-def _compose_message_tool(recipients: list[Agent]) -> dict[str, Any]:
-    """Return the strict tool schema limited to the other two agents."""
-    recipient_ids = [agent.id for agent in recipients]
-    return {
-        "name": COMPOSE_MESSAGE_TOOL,
-        "description": (
-            "Submit the one private message this Agent chooses to send now. "
-            "Choose one available recipient and provide non-empty message "
-            "content written from the selected Agent's perspective."
-        ),
-        "strict": True,
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "recipient_id": {
-                    "type": "string",
-                    "enum": recipient_ids,
-                    "description": "ID of the Agent receiving the message.",
-                },
-                "content": {
-                    "type": "string",
-                    "minLength": 1,
-                    "description": "Non-empty private message body.",
-                },
-            },
-            "required": ["recipient_id", "content"],
-            "additionalProperties": False,
-        },
     }
 
 
@@ -187,8 +158,11 @@ def _build_timeline_messages(agent: Agent) -> list[dict[str, Any]]:
         else:
             is_received = record.direction == "received"
             role = "user" if is_received else "assistant"
-            prefix = "From" if is_received else "To"
-            text = f"{prefix} {record.counterpart_id}: {record.content}"
+            text = (
+                f"{record.counterpart_id}：{record.content}"
+                if is_received
+                else record.content
+            )
 
         block = {"type": "text", "text": text}
         if messages and messages[-1]["role"] == role:
@@ -202,41 +176,35 @@ def _build_timeline_messages(agent: Agent) -> list[dict[str, Any]]:
 
 def _parse_response(
     response: Any,
-    agent_id: AgentId,
     request_snapshot: dict[str, Any],
 ) -> MessageDraftResponse:
-    """Require exactly one valid compose_message tool-use block."""
+    """Extract one text draft while allowing provider thinking blocks."""
     content = response.content
-    if not isinstance(content, list) or len(content) != 1:
-        raise ValueError("expected exactly one response block")
+    if not isinstance(content, list) or not content:
+        raise ValueError("expected response blocks")
 
-    block = content[0]
-    if (
-        getattr(block, "type", None) != "tool_use"
-        or getattr(block, "name", None) != COMPOSE_MESSAGE_TOOL
+    allowed_block_types = {"text", "thinking", "redacted_thinking"}
+    if any(
+        getattr(block, "type", None) not in allowed_block_types
+        for block in content
     ):
-        raise ValueError("expected compose_message tool use")
+        raise ValueError("unexpected response block")
 
-    tool_input = block.input
-    if not isinstance(tool_input, dict) or set(tool_input) != {
-        "recipient_id",
-        "content",
-    }:
-        raise ValueError("invalid tool input")
+    # Extended-thinking models may put private reasoning before the sole
+    # user-visible text block; only that visible block becomes the draft.
+    text_blocks = [
+        block for block in content if getattr(block, "type", None) == "text"
+    ]
+    if len(text_blocks) != 1:
+        raise ValueError("expected exactly one text response")
 
-    recipient_id = tool_input["recipient_id"]
-    content_value = tool_input["content"]
-    if (
-        recipient_id not in {"A", "B", "C"}
-        or recipient_id == agent_id
-        or not isinstance(content_value, str)
-        or not content_value.strip()
-    ):
+    content_value = text_blocks[0].text
+    if not isinstance(content_value, str) or not content_value.strip():
         raise ValueError("invalid message draft")
 
     usage = response.usage
     return MessageDraftResponse(
-        recipient_id=recipient_id,
+        recipient_id=None,
         content=content_value.strip(),
         usage=MessageDraftUsage(
             input_tokens=usage.input_tokens,

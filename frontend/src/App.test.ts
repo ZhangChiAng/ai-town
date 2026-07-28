@@ -62,7 +62,7 @@ function makeDraftResponse(
   seed = 0,
 ): MessageDraftResponse {
   return {
-    recipient_id: recipientId,
+    recipient_id: null,
     content,
     usage: {
       input_tokens: 120 + seed,
@@ -74,8 +74,6 @@ function makeDraftResponse(
       model: "test-model",
       system: [{ type: "text", text: `Agent ${recipientId}` }],
       messages: [],
-      tools: [],
-      tool_choice: {},
     },
   };
 }
@@ -1147,7 +1145,7 @@ describe("App", () => {
 
   it("generates and replaces an editable draft while showing cache usage", async () => {
     const scene = makeScene();
-    const generated = makeDraftResponse("C", "模型选择发给迟夏的消息");
+    const generated = makeDraftResponse("C", "模型生成的消息正文");
     const fetchMock = stubFetch({
       "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
       [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
@@ -1167,8 +1165,9 @@ describe("App", () => {
       `/api/scenes/${scene.id}/agents/A/message-drafts`,
       { method: "POST" },
     );
-    expectValue("#message-recipient", "C");
-    expectValue("#message-content", "模型选择发给迟夏的消息");
+    expectValue("#message-recipient", "");
+    expectValue("#message-content", "模型生成的消息正文");
+    expectButtonDisabled("确认发送");
     expect(findButton("重新生成")).toBeTruthy();
     expect(
       Array.from(
@@ -1180,6 +1179,12 @@ describe("App", () => {
     await setFieldValue("#message-content", "人工编辑后的正文");
     expectValue("#message-content", "人工编辑后的正文");
     expectButtonEnabled("确认发送");
+
+    findButton("重新生成").click();
+    await flushAsyncUpdates();
+    expectValue("#message-recipient", "");
+    expectValue("#message-content", "模型生成的消息正文");
+    expectButtonDisabled("确认发送");
   });
 
   it("requires saved scene state before generating a draft", async () => {
@@ -1253,6 +1258,7 @@ describe("App", () => {
     await openFirstScene();
     findButton("生成草稿").click();
     await flushAsyncUpdates();
+    await setSelectValue("#message-recipient", "B");
     await setFieldValue("#message-content", "保留人工编辑");
 
     findButton("重新生成").click();
@@ -1300,6 +1306,7 @@ describe("App", () => {
     expectValue("#message-content", "A 的模型草稿");
     expectNoText("117");
 
+    await setSelectValue("#message-recipient", "B");
     findButton("确认发送").click();
     await flushAsyncUpdates();
     expectValue("#message-content", "");
@@ -1377,7 +1384,7 @@ describe("App", () => {
         {
           role: "user",
           content: [
-            { type: "text", text: "From B: 你今晚有空吗？" },
+            { type: "text", text: "B：你今晚有空吗？" },
           ],
         },
         {
@@ -1385,14 +1392,12 @@ describe("App", () => {
           content: [
             {
               type: "text",
-              text: "To B: 有空，灯塔见。",
+              text: "有空，灯塔见。",
               cache_control: { type: "ephemeral", ttl: "5m" },
             },
           ],
         },
       ],
-      tools: [{ name: "compose_message", strict: true }],
-      tool_choice: { type: "tool", name: "compose_message" },
     };
     stubFetch({
       "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
@@ -1415,9 +1420,9 @@ describe("App", () => {
     expectText("PREVIEW_SYSTEM_TEXT");
     expectText("observable-model");
     expectText("user");
-    expectText("From B: 你今晚有空吗？");
+    expectText("B：你今晚有空吗？");
     expectText("assistant");
-    expectText("To B: 有空，灯塔见。");
+    expectText("有空，灯塔见。");
     expectNoText("完整模型输入");
     expectNoText("分段可读视图");
     expectNoText("当前草稿实际请求");

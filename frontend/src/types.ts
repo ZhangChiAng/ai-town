@@ -72,7 +72,7 @@ export interface MessageDraftUsage {
 }
 
 export interface MessageDraftResponse {
-  recipient_id: AgentId;
+  recipient_id: AgentId | null;
   content: string;
   usage: MessageDraftUsage;
   request_snapshot: ModelRequest;

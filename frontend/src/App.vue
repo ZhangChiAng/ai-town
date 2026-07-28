@@ -599,7 +599,7 @@ async function generateDraft(): Promise<void> {
   try {
     const generated = await generateMessageDraft(scene.id, senderId);
     messageDrafts.value[senderId] = {
-      recipientId: generated.recipient_id,
+      recipientId: generated.recipient_id ?? "",
       content: generated.content,
       usage: generated.usage,
     };

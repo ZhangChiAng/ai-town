@@ -104,7 +104,7 @@ function isMessageDraftResponse(
 ): value is MessageDraftResponse {
   return (
     isRecord(value) &&
-    isAgentId(value.recipient_id) &&
+    (value.recipient_id === null || isAgentId(value.recipient_id)) &&
     typeof value.content === "string" &&
     value.content.trim() !== "" &&
     isMessageDraftUsage(value.usage) &&

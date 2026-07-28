@@ -228,7 +228,7 @@ class MessageDraftUsage(ApiModel):
 class MessageDraftResponse(ApiModel):
     """Editable model-generated message draft."""
 
-    recipient_id: AgentId
+    recipient_id: AgentId | None
     content: str
     usage: MessageDraftUsage
     request_snapshot: dict[str, Any]
