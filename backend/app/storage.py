@@ -3,6 +3,7 @@
 import contextlib
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from uuid import UUID
@@ -35,6 +36,10 @@ class SceneReadError(SceneStorageError):
 
 class SceneWriteError(SceneStorageError):
     """Raised when a scene file cannot be written."""
+
+
+class UnsupportedTimelineRecordError(ValueError):
+    """Raised when legacy data contains a removed timeline record type."""
 
 
 class SceneStorage:
@@ -140,6 +145,11 @@ class SceneStorage:
         try:
             raw_scene = json.loads(contents)
             scene = Scene.model_validate(_upgrade_scene(raw_scene))
+        except UnsupportedTimelineRecordError as error:
+            raise SceneReadError(
+                f"Scene file '{path.name}' contains the removed "
+                "'inner_voice' record type."
+            ) from error
         except (json.JSONDecodeError, TypeError, ValidationError) as error:
             raise SceneReadError(
                 f"Scene file '{path.name}' is invalid or corrupted."
@@ -206,10 +216,10 @@ class SceneStorage:
 
 
 def _upgrade_scene(raw_scene: object) -> object:
-    """Return an in-memory v3 representation of a v1 or v2 scene."""
+    """Return an in-memory v4 representation of a v1, v2, or v3 scene."""
     if not isinstance(raw_scene, dict) or raw_scene.get(
         "schema_version"
-    ) not in (1, 2):
+    ) not in (1, 2, 3):
         return raw_scene
 
     upgraded = dict(raw_scene)
@@ -232,14 +242,47 @@ def _upgrade_scene(raw_scene: object) -> object:
             )
         timeline = agent.get("timeline")
         if isinstance(timeline, list):
-            agent["timeline"] = [
-                {"type": "message", **record}
-                if isinstance(record, dict) and "type" not in record
-                else record
-                for record in timeline
-            ]
+            upgraded_timeline = []
+            for raw_record in timeline:
+                if (
+                    isinstance(raw_record, dict)
+                    and raw_record.get("type") == "inner_voice"
+                ):
+                    raise UnsupportedTimelineRecordError
+                if not isinstance(raw_record, dict):
+                    upgraded_timeline.append(raw_record)
+                    continue
+                record = {"type": "message", **raw_record}
+                record["content"] = _upgrade_message_content(record)
+                upgraded_timeline.append(record)
+            agent["timeline"] = upgraded_timeline
         upgraded_agents.append(agent)
 
     upgraded["agents"] = upgraded_agents
     upgraded["schema_version"] = SCHEMA_VERSION
     return upgraded
+
+
+def _upgrade_message_content(record: dict) -> object:
+    """Add the v4 perspective prefix to one legacy message."""
+    content = record.get("content")
+    counterpart_id = record.get("counterpart_id")
+    direction = record.get("direction")
+    if not isinstance(content, str) or counterpart_id not in ("A", "B", "C"):
+        return content
+
+    if direction == "sent":
+        expected = re.compile(rf"\ATo\s+{counterpart_id}\s*[:：]\s*\S")
+        return (
+            content
+            if expected.match(content)
+            else f"To {counterpart_id}: {content}"
+        )
+    if direction == "received":
+        expected = re.compile(rf"\AFrom\s+{counterpart_id}\s*[:：]\s*\S")
+        return (
+            content
+            if expected.match(content)
+            else f"From {counterpart_id}: {content}"
+        )
+    return content

@@ -50,9 +50,6 @@ function isTimelineRecord(value: unknown): boolean {
   if (!isRecord(value) || typeof value.content !== "string") {
     return false;
   }
-  if (value.type === "inner_voice") {
-    return typeof value.inner_voice_id === "string";
-  }
   return (
     value.type === "message" &&
     typeof value.message_id === "string" &&
@@ -65,7 +62,7 @@ function isTimelineRecord(value: unknown): boolean {
 function isScene(value: unknown): value is Scene {
   return (
     isRecord(value) &&
-    value.schema_version === 3 &&
+    value.schema_version === 4 &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     Array.isArray(value.agents) &&
@@ -104,7 +101,6 @@ function isMessageDraftResponse(
 ): value is MessageDraftResponse {
   return (
     isRecord(value) &&
-    (value.recipient_id === null || isAgentId(value.recipient_id)) &&
     typeof value.content === "string" &&
     value.content.trim() !== "" &&
     isMessageDraftUsage(value.usage) &&
@@ -245,40 +241,6 @@ export async function deleteMessage(
 ): Promise<Scene> {
   const body = await requestJson(
     `/api/scenes/${encodeURIComponent(sceneId)}/messages/${encodeURIComponent(messageId)}`,
-    { method: "DELETE" },
-  );
-  if (!isScene(body)) {
-    throw new ApiError("后端返回了无法识别的场景数据。");
-  }
-  return body;
-}
-
-export async function writeInnerVoice(
-  sceneId: string,
-  agentId: AgentId,
-  content: string,
-): Promise<Scene> {
-  const body = await requestJson(
-    `/api/scenes/${encodeURIComponent(sceneId)}/agents/${agentId}/inner-voices`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content }),
-    },
-  );
-  if (!isScene(body)) {
-    throw new ApiError("后端返回了无法识别的场景数据。");
-  }
-  return body;
-}
-
-export async function deleteInnerVoice(
-  sceneId: string,
-  agentId: AgentId,
-  innerVoiceId: string,
-): Promise<Scene> {
-  const body = await requestJson(
-    `/api/scenes/${encodeURIComponent(sceneId)}/agents/${agentId}/inner-voices/${encodeURIComponent(innerVoiceId)}`,
     { method: "DELETE" },
   );
   if (!isScene(body)) {

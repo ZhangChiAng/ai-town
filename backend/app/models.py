@@ -1,6 +1,7 @@
 """Domain models and request/response schemas for scenes and agents."""
 
-from typing import Annotated, Any, Literal, Self
+import re
+from typing import Any, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -11,7 +12,7 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 AGENT_IDS = ("A", "B", "C")
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = """\
 【规则】
@@ -89,22 +90,6 @@ class MessageTimelineRecord(ApiModel):
     _validate_content = field_validator("content")(_strip_non_blank_content)
 
 
-class InnerVoiceTimelineRecord(ApiModel):
-    """One user-authored private prompt in an individual agent's timeline."""
-
-    type: Literal["inner_voice"] = "inner_voice"
-    inner_voice_id: UUID
-    content: str
-
-    _validate_content = field_validator("content")(_strip_non_blank_content)
-
-
-TimelineRecord = Annotated[
-    MessageTimelineRecord | InnerVoiceTimelineRecord,
-    Field(discriminator="type"),
-]
-
-
 class Agent(ApiModel):
     """An agent in a scene with identity, personality traits, and a timeline."""
 
@@ -115,7 +100,7 @@ class Agent(ApiModel):
     fear: str = ""
     memory: str = ""
     system_prompt: str
-    timeline: list[TimelineRecord] = Field(default_factory=list)
+    timeline: list[MessageTimelineRecord] = Field(default_factory=list)
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
     _validate_system_prompt = field_validator("system_prompt")(
@@ -143,7 +128,7 @@ class AgentUpdate(ApiModel):
 class Scene(ApiModel):
     """A named scene containing exactly three agents (A, B, C)."""
 
-    schema_version: Literal[3] = SCHEMA_VERSION
+    schema_version: Literal[4] = SCHEMA_VERSION
     id: UUID
     name: str
     agents: list[Agent] = Field(min_length=3, max_length=3)
@@ -195,25 +180,13 @@ class CreateMessageRequest(ApiModel):
     """Payload for confirming a manually authored message."""
 
     sender_id: AgentId
-    recipient_id: AgentId
     content: str
-
-    _validate_content = field_validator("content")(_strip_non_blank_content)
 
     @model_validator(mode="after")
-    def validate_distinct_participants(self) -> Self:
-        """Require two different agents to participate in the message."""
-        if self.sender_id == self.recipient_id:
-            raise ValueError("sender_id and recipient_id must be different")
+    def validate_addressed_content(self) -> Self:
+        """Require one valid, non-self recipient in the visible text."""
+        parse_addressed_message(self.content, self.sender_id)
         return self
-
-
-class CreateInnerVoiceRequest(ApiModel):
-    """Payload for appending a private inner voice to one Agent."""
-
-    content: str
-
-    _validate_content = field_validator("content")(_strip_non_blank_content)
 
 
 class MessageDraftUsage(ApiModel):
@@ -228,7 +201,6 @@ class MessageDraftUsage(ApiModel):
 class MessageDraftResponse(ApiModel):
     """Editable model-generated message draft."""
 
-    recipient_id: AgentId | None
     content: str
     usage: MessageDraftUsage
     request_snapshot: dict[str, Any]
@@ -265,12 +237,42 @@ class MessageDeletionConflictError(RuntimeError):
     """Raised when a message cannot be safely removed from both timelines."""
 
 
-class InnerVoiceNotFoundError(LookupError):
-    """Raised when an Agent timeline does not contain an inner voice."""
+_ADDRESSED_MESSAGE_PATTERN = re.compile(
+    r"\ATo\s+([A-C])\s*[:：]\s*(\S(?:[^\r\n]*\S)?)\s*\Z"
+)
+_RECEIVED_MESSAGE_PATTERN = re.compile(
+    r"\AFrom\s+([A-C])\s*[:：]\s*(\S(?:[^\r\n]*\S)?)\s*\Z"
+)
 
 
-class InnerVoiceDeletionConflictError(RuntimeError):
-    """Raised when an inner voice is not the Agent timeline's final record."""
+def parse_addressed_message(
+    content: str,
+    sender_id: AgentId | None = None,
+) -> tuple[AgentId, str]:
+    """Parse one visible ``To <AgentId>: <body>`` message.
+
+    Extra spaces and a Chinese colon are accepted at the API boundary. The
+    returned pieces are used to create canonical timeline text.
+    """
+    if "\n" in content or "\r" in content:
+        raise ValueError("content must contain exactly one line")
+    match = _ADDRESSED_MESSAGE_PATTERN.fullmatch(content)
+    if match is None:
+        raise ValueError(
+            "content must be one line in the form 'To B: message body'"
+        )
+    recipient_id = match.group(1)
+    if sender_id == recipient_id:
+        raise ValueError("message recipient must be different from sender_id")
+    return recipient_id, match.group(2)
+
+
+def _parse_received_message(content: str) -> tuple[AgentId, str]:
+    """Parse one authoritative ``From <AgentId>: <body>`` record."""
+    match = _RECEIVED_MESSAGE_PATTERN.fullmatch(content)
+    if match is None:
+        raise ValueError("invalid received timeline content")
+    return match.group(1), match.group(2)
 
 
 def create_scene(name: str) -> Scene:
@@ -306,6 +308,11 @@ def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
     Returns:
         A new Scene with one record appended to each participant's timeline.
     """
+    recipient_id, body = parse_addressed_message(
+        message.content, message.sender_id
+    )
+    sent_content = f"To {recipient_id}: {body}"
+    received_content = f"From {message.sender_id}: {body}"
     message_id = uuid4()
     agents: list[Agent] = []
 
@@ -316,79 +323,22 @@ def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
                 MessageTimelineRecord(
                     message_id=message_id,
                     direction="sent",
-                    counterpart_id=message.recipient_id,
-                    content=message.content,
+                    counterpart_id=recipient_id,
+                    content=sent_content,
                 )
             )
-        elif agent.id == message.recipient_id:
+        elif agent.id == recipient_id:
             timeline.append(
                 MessageTimelineRecord(
                     message_id=message_id,
                     direction="received",
                     counterpart_id=message.sender_id,
-                    content=message.content,
+                    content=received_content,
                 )
             )
 
         agents.append(agent.model_copy(update={"timeline": timeline}))
 
-    return scene.model_copy(update={"agents": agents})
-
-
-def add_inner_voice(
-    scene: Scene,
-    agent_id: AgentId,
-    request: CreateInnerVoiceRequest,
-) -> Scene:
-    """Append a private inner voice only to the target Agent's timeline."""
-    agents = []
-    for agent in scene.agents:
-        if agent.id != agent_id:
-            agents.append(agent)
-            continue
-        timeline = [
-            *agent.timeline,
-            InnerVoiceTimelineRecord(
-                inner_voice_id=uuid4(),
-                content=request.content,
-            ),
-        ]
-        agents.append(agent.model_copy(update={"timeline": timeline}))
-    return scene.model_copy(update={"agents": agents})
-
-
-def delete_inner_voice(
-    scene: Scene,
-    agent_id: AgentId,
-    inner_voice_id: UUID,
-) -> Scene:
-    """Delete an inner voice only when it is the target timeline's top."""
-    agent = next(agent for agent in scene.agents if agent.id == agent_id)
-    matching_indexes = [
-        index
-        for index, record in enumerate(agent.timeline)
-        if (
-            record.type == "inner_voice"
-            and record.inner_voice_id == inner_voice_id
-        )
-    ]
-    if not matching_indexes:
-        raise InnerVoiceNotFoundError(
-            f"Inner voice '{inner_voice_id}' does not exist for Agent "
-            f"'{agent_id}'."
-        )
-    if matching_indexes[-1] != len(agent.timeline) - 1:
-        raise InnerVoiceDeletionConflictError(
-            f"Inner voice '{inner_voice_id}' is not last in Agent "
-            f"'{agent_id}' timeline."
-        )
-
-    agents = [
-        current.model_copy(update={"timeline": current.timeline[:-1]})
-        if current.id == agent_id
-        else current
-        for current in scene.agents
-    ]
     return scene.model_copy(update={"agents": agents})
 
 
@@ -411,7 +361,7 @@ def delete_message(scene: Scene, message_id: UUID) -> Scene:
         (agent, index, record)
         for agent in scene.agents
         for index, record in enumerate(agent.timeline)
-        if record.type == "message" and record.message_id == message_id
+        if record.message_id == message_id
     ]
     if not matches:
         raise MessageNotFoundError(
@@ -433,11 +383,26 @@ def delete_message(scene: Scene, message_id: UUID) -> Scene:
 
     sender, sender_index, sent_record = sent_matches[0]
     recipient, recipient_index, received_record = received_matches[0]
+    try:
+        sent_recipient, sent_body = parse_addressed_message(
+            sent_record.content, sender.id
+        )
+        received_sender, received_body = _parse_received_message(
+            received_record.content
+        )
+    except ValueError:
+        sent_recipient = None
+        sent_body = None
+        received_sender = None
+        received_body = None
     records_are_consistent = (
         sender.id == received_record.counterpart_id
         and recipient.id == sent_record.counterpart_id
         and sender.id != recipient.id
-        and sent_record.content == received_record.content
+        and sent_recipient == recipient.id
+        and received_sender == sender.id
+        and received_body == sent_body
+        and bool(received_body)
     )
     if not records_are_consistent:
         raise MessageDeletionConflictError(

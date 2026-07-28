@@ -8,16 +8,21 @@ from uuid import UUID
 
 from app.config import ModelSettings
 from app.models import (
+    AGENT_IDS,
     Agent,
     AgentId,
     MessageDraftResponse,
     MessageDraftUsage,
     Scene,
+    parse_addressed_message,
 )
 
 LOGGER = logging.getLogger(__name__)
 CACHE_CONTROL = {"type": "ephemeral", "ttl": "5m"}
-RUNTIME_TURN_PROMPT = "现在轮到你说话。"
+RUNTIME_TURN_PROMPT = (
+    "现在轮到你说话。请从另外两位 Agent（{recipient_ids}）中选择一位接收人，"
+    "只输出一行 `To X: 消息正文`，其中 X 必须替换为所选接收人的 Agent ID。"
+)
 
 
 class MessagesResource(Protocol):
@@ -103,7 +108,7 @@ class MessageDraftService:
             raise DraftGenerationError("Model request failed.") from error
 
         try:
-            draft = _parse_response(response, model_request)
+            draft = _parse_response(response, model_request, agent_id)
         except (AttributeError, TypeError, ValueError, KeyError) as error:
             raise DraftGenerationError(
                 "Model returned an invalid message draft."
@@ -124,13 +129,22 @@ def build_message_request(
     if messages:
         # The rolling breakpoint follows the final immutable timeline record.
         messages[-1]["content"][-1]["cache_control"] = dict(CACHE_CONTROL)
-    if not messages or messages[-1]["role"] == "assistant":
-        # Avoid empty requests and assistant prefills without persisting or
-        # caching this runtime-only turn.
+    recipient_ids = "、".join(
+        candidate for candidate in AGENT_IDS if candidate != agent_id
+    )
+    runtime_block = {
+        "type": "text",
+        "text": RUNTIME_TURN_PROMPT.format(recipient_ids=recipient_ids),
+    }
+    if messages and messages[-1]["role"] == "user":
+        # Keep strict role alternation while preserving the runtime instruction
+        # as its own visible text block.
+        messages[-1]["content"].append(runtime_block)
+    else:
         messages.append(
             {
                 "role": "user",
-                "content": [{"type": "text", "text": RUNTIME_TURN_PROMPT}],
+                "content": [runtime_block],
             }
         )
 
@@ -152,19 +166,9 @@ def _build_timeline_messages(agent: Agent) -> list[dict[str, Any]]:
     """Map the private timeline to alternating native Messages API turns."""
     messages: list[dict[str, Any]] = []
     for record in agent.timeline:
-        if record.type == "inner_voice":
-            role = "user"
-            text = f"内心的声音：{record.content}"
-        else:
-            is_received = record.direction == "received"
-            role = "user" if is_received else "assistant"
-            text = (
-                f"{record.counterpart_id}：{record.content}"
-                if is_received
-                else record.content
-            )
+        role = "user" if record.direction == "received" else "assistant"
 
-        block = {"type": "text", "text": text}
+        block = {"type": "text", "text": record.content}
         if messages and messages[-1]["role"] == role:
             # Some compatible gateways require strict role alternation even
             # though Anthropic itself combines adjacent same-role messages.
@@ -177,6 +181,7 @@ def _build_timeline_messages(agent: Agent) -> list[dict[str, Any]]:
 def _parse_response(
     response: Any,
     request_snapshot: dict[str, Any],
+    sender_id: AgentId,
 ) -> MessageDraftResponse:
     """Extract one text draft while allowing provider thinking blocks."""
     content = response.content
@@ -201,11 +206,16 @@ def _parse_response(
     content_value = text_blocks[0].text
     if not isinstance(content_value, str) or not content_value.strip():
         raise ValueError("invalid message draft")
+    if "\n" in content_value or "\r" in content_value:
+        raise ValueError("message draft must be one line")
+    visible_content = content_value.strip()
+    recipient_id, _body = parse_addressed_message(visible_content, sender_id)
+    if recipient_id not in AGENT_IDS:
+        raise ValueError("invalid message recipient")
 
     usage = response.usage
     return MessageDraftResponse(
-        recipient_id=None,
-        content=content_value.strip(),
+        content=visible_content,
         usage=MessageDraftUsage(
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,

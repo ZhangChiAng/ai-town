@@ -11,7 +11,6 @@ import {
 import {
   composeSystemPrompt,
   createScene,
-  deleteInnerVoice,
   deleteMessage,
   generateMessageDraft,
   getModelRequestPreview,
@@ -19,12 +18,10 @@ import {
   listScenes,
   saveScene,
   sendMessage,
-  writeInnerVoice,
 } from "./api";
 import {
   AGENT_IDS,
   type AgentId,
-  type InnerVoiceTimelineRecord,
   type MessageTimelineRecord,
   type MessageDraftUsage,
   type ModelRequest,
@@ -36,10 +33,10 @@ import {
 type ListState = "loading" | "ready" | "error";
 type SaveState = "idle" | "saving" | "success" | "error";
 interface MessageDraft {
-  recipientId: AgentId | "";
   content: string;
   usage: MessageDraftUsage | null;
 }
+type PreviewMode = "readable" | "json";
 
 const sceneSummaries = ref<SceneSummary[]>([]);
 const currentScene = ref<Scene | null>(null);
@@ -61,10 +58,6 @@ const messageDrafts = ref<Record<AgentId, MessageDraft>>(
 const messageErrors = ref<Record<AgentId, string>>(
   emptyMessageErrors(),
 );
-const innerVoiceDrafts = ref<Record<AgentId, string>>(emptyAgentStrings());
-const innerVoiceErrors = ref<Record<AgentId, string>>(emptyAgentStrings());
-const writingInnerVoiceAgentId = ref<AgentId | null>(null);
-const deletingInnerVoiceId = ref<string | null>(null);
 const sendingAgentId = ref<AgentId | null>(null);
 const deletingMessageId = ref<string | null>(null);
 const generatingAgentId = ref<AgentId | null>(null);
@@ -74,14 +67,10 @@ const requestPreviews = ref<Record<AgentId, ModelRequest | null>>(
 );
 const previewErrors = ref<Record<AgentId, string>>(emptyMessageErrors());
 const previewingAgentId = ref<AgentId | null>(null);
+const previewMode = ref<PreviewMode>("readable");
 const timelineScroller = ref<HTMLElement | null>(null);
 const isTimelinePinned = ref(true);
 const hasNewTimelineUpdate = ref(false);
-const isInnerVoiceDialogOpen = ref(false);
-const innerVoiceDialogAgentId = ref<AgentId | null>(null);
-const innerVoiceDialog = ref<HTMLElement | null>(null);
-const innerVoiceTextarea = ref<HTMLTextAreaElement | null>(null);
-const innerVoiceTrigger = ref<HTMLButtonElement | null>(null);
 
 let listRequestToken = 0;
 let summaryMutationVersion = 0;
@@ -94,17 +83,14 @@ function cloneScene(scene: Scene): Scene {
 function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
   return {
     A: {
-      recipientId: "",
       content: "",
       usage: null,
     },
     B: {
-      recipientId: "",
       content: "",
       usage: null,
     },
     C: {
-      recipientId: "",
       content: "",
       usage: null,
     },
@@ -112,10 +98,6 @@ function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
 }
 
 function emptyMessageErrors(): Record<AgentId, string> {
-  return { A: "", B: "", C: "" };
-}
-
-function emptyAgentStrings(): Record<AgentId, string> {
   return { A: "", B: "", C: "" };
 }
 
@@ -167,36 +149,19 @@ const activeAgent = computed(() =>
   ),
 );
 
-const innerVoiceDialogAgent = computed(() =>
-  currentScene.value?.agents.find(
-    (agent) => agent.id === innerVoiceDialogAgentId.value,
-  ),
-);
-
 const activeMessageDraft = computed(
   () => messageDrafts.value[activeAgentId.value],
-);
-
-const recipientOptions = computed(() =>
-  AGENT_IDS.filter((agentId) => agentId !== activeAgentId.value),
 );
 
 const hasMessageDrafts = computed(() =>
   AGENT_IDS.some((agentId) => {
     const draft = messageDrafts.value[agentId];
-    return draft.recipientId !== "" || draft.content !== "";
+    return draft.content !== "";
   }),
 );
 
-const hasInnerVoiceDrafts = computed(() =>
-  AGENT_IDS.some(
-    (agentId) => innerVoiceDrafts.value[agentId] !== "",
-  ),
-);
-
 const activeDraftHasContent = computed(() => {
-  const draft = activeMessageDraft.value;
-  return draft.recipientId !== "" || draft.content !== "";
+  return activeMessageDraft.value.content !== "";
 });
 
 const deletableMessageIds = computed(() => {
@@ -250,7 +215,12 @@ const deletableMessageIds = computed(() => {
       sent.agentId === received.agentId ||
       sent.record.counterpart_id !== received.agentId ||
       received.record.counterpart_id !== sent.agentId ||
-      sent.record.content !== received.record.content ||
+      !messagePairContentMatches(
+        sent.record.content,
+        received.record.content,
+        sent.agentId,
+        received.agentId,
+      ) ||
       sent.index !== sender.timeline.length - 1 ||
       received.index !== recipient.timeline.length - 1
     ) {
@@ -266,8 +236,6 @@ const editorLocked = computed(
     saveState.value === "saving" ||
     sendingAgentId.value !== null ||
     deletingMessageId.value !== null ||
-    writingInnerVoiceAgentId.value !== null ||
-    deletingInnerVoiceId.value !== null ||
     generatingAgentId.value !== null ||
     composingAgentId.value !== null ||
     previewingAgentId.value !== null ||
@@ -280,7 +248,6 @@ const canSendMessage = computed(
     currentScene.value !== null &&
     !isDirty.value &&
     !editorLocked.value &&
-    activeMessageDraft.value.recipientId !== "" &&
     activeMessageDraft.value.content.trim() !== "",
 );
 
@@ -291,15 +258,6 @@ const canGenerateMessageDraft = computed(
     !editorLocked.value,
 );
 
-const canWriteInnerVoice = computed(
-  () =>
-    currentScene.value !== null &&
-    innerVoiceDialogAgentId.value !== null &&
-    !isDirty.value &&
-    !editorLocked.value &&
-    innerVoiceDrafts.value[innerVoiceDialogAgentId.value].trim() !== "",
-);
-
 const activeTimelineSnapshot = computed(() => ({
   identity: currentScene.value
     ? `${currentScene.value.id}:${activeAgentId.value}`
@@ -308,17 +266,31 @@ const activeTimelineSnapshot = computed(() => ({
     activeAgent.value?.timeline
       .map(
         (record) =>
-          record.type === "message"
-            ? `message:${record.message_id}:${record.direction}:${record.content}`
-            : `inner_voice:${record.inner_voice_id}:${record.content}`,
+          `message:${record.message_id}:${record.direction}:${record.content}`,
       )
       .join("\u0000") ?? "",
 }));
 
-function counterpartName(agentId: AgentId): string {
+function messagePairContentMatches(
+  sentContent: string,
+  receivedContent: string,
+  senderId: AgentId,
+  recipientId: AgentId,
+): boolean {
+  const sent = sentContent.match(
+    new RegExp(
+      `^To\\s+${recipientId}\\s*[:：]\\s*(\\S(?:[^\\r\\n]*\\S)?)\\s*$`,
+    ),
+  );
+  const received = receivedContent.match(
+    new RegExp(
+      `^From\\s+${senderId}\\s*[:：]\\s*(\\S(?:[^\\r\\n]*\\S)?)\\s*$`,
+    ),
+  );
   return (
-    currentScene.value?.agents.find((agent) => agent.id === agentId)
-      ?.name ?? agentId
+    sent !== null &&
+    received !== null &&
+    sent[1] === received[1]
   );
 }
 
@@ -384,8 +356,6 @@ function installScene(
   if (!preserveMessageDrafts) {
     messageDrafts.value = emptyMessageDrafts();
     messageErrors.value = emptyMessageErrors();
-    innerVoiceDrafts.value = emptyAgentStrings();
-    innerVoiceErrors.value = emptyAgentStrings();
   }
   requestPreviews.value = emptyRequestPreviews();
   previewErrors.value = emptyMessageErrors();
@@ -408,13 +378,12 @@ function upsertSummary(scene: Scene): void {
 function confirmDiscardChanges(): boolean {
   if (
     !isDirty.value &&
-    !hasMessageDrafts.value &&
-    !hasInnerVoiceDrafts.value
+    !hasMessageDrafts.value
   ) {
     return true;
   }
   return window.confirm(
-    "当前场景有未保存的更改、消息草稿或内心声音草稿。确定要放弃吗？",
+    "当前场景有未保存的更改或消息草稿。确定要放弃吗？",
   );
 }
 
@@ -599,7 +568,6 @@ async function generateDraft(): Promise<void> {
   try {
     const generated = await generateMessageDraft(scene.id, senderId);
     messageDrafts.value[senderId] = {
-      recipientId: generated.recipient_id ?? "",
       content: generated.content,
       usage: generated.usage,
     };
@@ -621,7 +589,6 @@ async function confirmMessage(): Promise<void> {
     scene === null ||
     isDirty.value ||
     editorLocked.value ||
-    draft.recipientId === "" ||
     draft.content.trim() === ""
   ) {
     return;
@@ -633,12 +600,10 @@ async function confirmMessage(): Promise<void> {
   try {
     const updated = await sendMessage(scene.id, {
       sender_id: senderId,
-      recipient_id: draft.recipientId,
-      content: draft.content.trim(),
+      content: draft.content,
     });
     installScene(updated, senderId, true);
     messageDrafts.value[senderId] = {
-      recipientId: "",
       content: "",
       usage: null,
     };
@@ -649,100 +614,6 @@ async function confirmMessage(): Promise<void> {
     );
   } finally {
     sendingAgentId.value = null;
-  }
-}
-
-async function submitInnerVoice(): Promise<void> {
-  const scene = currentScene.value;
-  const agentId = innerVoiceDialogAgentId.value;
-  if (agentId === null) {
-    return;
-  }
-  const content = innerVoiceDrafts.value[agentId].trim();
-  if (
-    scene === null ||
-    isDirty.value ||
-    editorLocked.value ||
-    content === ""
-  ) {
-    return;
-  }
-
-  writingInnerVoiceAgentId.value = agentId;
-  innerVoiceErrors.value[agentId] = "";
-  let didWrite = false;
-  try {
-    const updated = await writeInnerVoice(scene.id, agentId, content);
-    installScene(updated, agentId, true);
-    innerVoiceDrafts.value[agentId] = "";
-    didWrite = true;
-  } catch (error) {
-    innerVoiceErrors.value[agentId] = errorMessage(
-      error,
-      "内心的声音写入失败，请重试。",
-    );
-  } finally {
-    writingInnerVoiceAgentId.value = null;
-    if (didWrite) {
-      closeInnerVoiceDialog();
-    }
-  }
-}
-
-async function openInnerVoiceDialog(): Promise<void> {
-  if (
-    currentScene.value === null ||
-    isDirty.value ||
-    editorLocked.value
-  ) {
-    return;
-  }
-  innerVoiceDialogAgentId.value = activeAgentId.value;
-  isInnerVoiceDialogOpen.value = true;
-  document.body.classList.add("modal-open");
-  await nextTick();
-  innerVoiceTextarea.value?.focus();
-}
-
-function closeInnerVoiceDialog(): void {
-  if (
-    !isInnerVoiceDialogOpen.value ||
-    writingInnerVoiceAgentId.value !== null
-  ) {
-    return;
-  }
-  isInnerVoiceDialogOpen.value = false;
-  innerVoiceDialogAgentId.value = null;
-  document.body.classList.remove("modal-open");
-  void nextTick(() => innerVoiceTrigger.value?.focus());
-}
-
-function handleInnerVoiceDialogKeydown(event: KeyboardEvent): void {
-  if (event.key === "Escape") {
-    event.preventDefault();
-    closeInnerVoiceDialog();
-    return;
-  }
-  if (event.key !== "Tab" || innerVoiceDialog.value === null) {
-    return;
-  }
-
-  const focusableElements = Array.from(
-    innerVoiceDialog.value.querySelectorAll<HTMLElement>(
-      "button:not(:disabled), textarea:not(:disabled)",
-    ),
-  );
-  if (focusableElements.length === 0) {
-    return;
-  }
-  const first = focusableElements[0];
-  const last = focusableElements.at(-1);
-  if (event.shiftKey && document.activeElement === first) {
-    event.preventDefault();
-    last?.focus();
-  } else if (!event.shiftKey && document.activeElement === last) {
-    event.preventDefault();
-    first.focus();
   }
 }
 
@@ -798,54 +669,6 @@ async function confirmDeleteMessage(
   }
 }
 
-async function confirmDeleteInnerVoice(
-  record: InnerVoiceTimelineRecord,
-): Promise<void> {
-  const scene = currentScene.value;
-  const agentId = activeAgentId.value;
-  const isTimelineTop =
-    activeAgent.value?.timeline.at(-1) === record;
-  if (
-    scene === null ||
-    isDirty.value ||
-    editorLocked.value ||
-    !isTimelineTop
-  ) {
-    return;
-  }
-  if (
-    !window.confirm(
-      [
-        "确定永久删除这条内心的声音吗？",
-        "",
-        record.content,
-        "",
-        "删除不可撤销，且仅允许删除时间线末条记录。",
-      ].join("\n"),
-    )
-  ) {
-    return;
-  }
-
-  deletingInnerVoiceId.value = record.inner_voice_id;
-  actionError.value = "";
-  try {
-    const updated = await deleteInnerVoice(
-      scene.id,
-      agentId,
-      record.inner_voice_id,
-    );
-    installScene(updated, agentId, true);
-  } catch (error) {
-    actionError.value = errorMessage(
-      error,
-      "内心的声音删除失败，请重试。",
-    );
-  } finally {
-    deletingInnerVoiceId.value = null;
-  }
-}
-
 async function recomposeActiveSystemPrompt(): Promise<void> {
   const agent = activeAgent.value;
   if (agent === undefined || editorLocked.value) {
@@ -892,6 +715,7 @@ async function loadRequestPreview(): Promise<void> {
       scene.id,
       agentId,
     );
+    previewMode.value = "readable";
   } catch (error) {
     previewErrors.value[agentId] = errorMessage(
       error,
@@ -905,7 +729,6 @@ async function loadRequestPreview(): Promise<void> {
 function discardActiveDraft(): void {
   const agentId = activeAgentId.value;
   messageDrafts.value[agentId] = {
-    recipientId: "",
     content: "",
     usage: null,
   };
@@ -916,11 +739,57 @@ function prettyJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
+function readableModelContext(
+  request: ModelRequest,
+): { label: string; text: string }[] {
+  const context: { label: string; text: string }[] = [];
+  const system = request.system;
+  if (Array.isArray(system)) {
+    for (const block of system) {
+      if (
+        typeof block === "object" &&
+        block !== null &&
+        "text" in block &&
+        typeof block.text === "string"
+      ) {
+        context.push({ label: "system", text: block.text });
+      }
+    }
+  }
+
+  const messages = request.messages;
+  if (!Array.isArray(messages)) {
+    return context;
+  }
+  for (const message of messages) {
+    if (
+      typeof message !== "object" ||
+      message === null ||
+      !("role" in message) ||
+      typeof message.role !== "string" ||
+      !("content" in message) ||
+      !Array.isArray(message.content)
+    ) {
+      continue;
+    }
+    for (const block of message.content) {
+      if (
+        typeof block === "object" &&
+        block !== null &&
+        "text" in block &&
+        typeof block.text === "string"
+      ) {
+        context.push({ label: message.role, text: block.text });
+      }
+    }
+  }
+  return context;
+}
+
 function handleBeforeUnload(event: BeforeUnloadEvent): void {
   if (
     !isDirty.value &&
-    !hasMessageDrafts.value &&
-    !hasInnerVoiceDrafts.value
+    !hasMessageDrafts.value
   ) {
     return;
   }
@@ -935,7 +804,6 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener("beforeunload", handleBeforeUnload);
-  document.body.classList.remove("modal-open");
 });
 </script>
 
@@ -1172,31 +1040,12 @@ onBeforeUnmount(() => {
                   <h2 id="timeline-title">
                     {{ activeAgent.name || "未命名 Agent" }}
                   </h2>
-                  <p>私人时间线 · 仅这位 Agent 可见的消息与内心声音</p>
+                  <p>私人时间线 · 仅这位 Agent 可见的已确认消息</p>
                 </div>
                 <div class="chat-heading-actions">
                   <span class="chat-agent-id">
                     固定身份 <strong>Agent {{ activeAgent.id }}</strong>
                   </span>
-                  <button
-                    ref="innerVoiceTrigger"
-                    class="inner-voice-trigger"
-                    type="button"
-                    :disabled="isDirty || editorLocked"
-                    :aria-describedby="
-                      isDirty ? 'inner-voice-disabled-reason' : undefined
-                    "
-                    @click="openInnerVoiceDialog"
-                  >
-                    写入内心声音
-                  </button>
-                  <small
-                    v-if="isDirty"
-                    id="inner-voice-disabled-reason"
-                    class="inner-voice-disabled-reason"
-                  >
-                    请先保存场景
-                  </small>
                 </div>
               </header>
 
@@ -1215,34 +1064,14 @@ onBeforeUnmount(() => {
                 <ol v-else class="chat-message-list">
                   <li
                     v-for="record in activeAgent.timeline"
-                    :key="
-                      record.type === 'message'
-                        ? `message-${record.message_id}-${record.direction}`
-                        : `inner-voice-${record.inner_voice_id}`
-                    "
+                    :key="`message-${record.message_id}-${record.direction}`"
                     class="chat-message"
-                    :class="
-                      record.type === 'message'
-                        ? `chat-message--${record.direction}`
-                        : 'chat-message--inner-voice'
-                    "
+                    :class="`chat-message--${record.direction}`"
                   >
-                    <article
-                      v-if="record.type === 'message'"
-                      class="chat-bubble"
-                    >
-                      <p class="chat-message-meta">
-                        {{
-                          record.direction === "sent"
-                            ? `发给 ${counterpartName(record.counterpart_id)} · Agent ${record.counterpart_id}`
-                            : `${counterpartName(record.counterpart_id)} · Agent ${record.counterpart_id}`
-                        }}
+                    <article class="chat-bubble">
+                      <p class="chat-message-content">
+                        {{ record.content }}
                       </p>
-                      <p class="chat-message-content">{{
-                        record.direction === "sent"
-                          ? `发送给 ${record.counterpart_id}：${record.content}`
-                          : `${record.counterpart_id}：${record.content}`
-                      }}</p>
                       <button
                         v-if="deletableMessageIds.has(record.message_id)"
                         class="timeline-delete-button"
@@ -1252,27 +1081,6 @@ onBeforeUnmount(() => {
                       >
                         {{
                           deletingMessageId === record.message_id
-                            ? "删除中…"
-                            : "删除"
-                        }}
-                      </button>
-                    </article>
-                    <article v-else class="chat-bubble inner-voice-bubble">
-                      <p class="inner-voice-label">内心的声音</p>
-                      <p class="chat-message-content">
-                        {{ record.content }}
-                      </p>
-                      <button
-                        v-if="
-                          activeAgent.timeline.at(-1) === record
-                        "
-                        class="timeline-delete-button"
-                        type="button"
-                        :disabled="isDirty || editorLocked"
-                        @click="confirmDeleteInnerVoice(record)"
-                      >
-                        {{
-                          deletingInnerVoiceId === record.inner_voice_id
                             ? "删除中…"
                             : "删除"
                         }}
@@ -1293,34 +1101,14 @@ onBeforeUnmount(() => {
 
               <footer class="chat-composer">
                 <div class="message-fields">
-                  <label class="message-recipient" for="message-recipient">
-                    <span>接收者</span>
-                    <select
-                      id="message-recipient"
-                      v-model="activeMessageDraft.recipientId"
-                      :disabled="editorLocked"
-                      @change="markMessageDraftEdited"
-                    >
-                      <option value="">请选择接收者</option>
-                      <option
-                        v-for="agentId in recipientOptions"
-                        :key="agentId"
-                        :value="agentId"
-                      >
-                        Agent {{ agentId }} ·
-                        {{ counterpartName(agentId) }}
-                      </option>
-                    </select>
-                  </label>
-
                   <label class="message-content" for="message-content">
-                    <span>消息草稿</span>
+                    <span>完整消息草稿</span>
                     <textarea
                       id="message-content"
                       v-model="activeMessageDraft.content"
                       rows="3"
                       :disabled="editorLocked"
-                      placeholder="手工填写这位 Agent 要发送的内容"
+                      placeholder="To B: 消息正文"
                       @input="markMessageDraftEdited"
                     ></textarea>
                   </label>
@@ -1524,8 +1312,8 @@ onBeforeUnmount(() => {
             <details class="secondary-panel observability-card">
               <summary>
                 <span>
-                  <strong>JSON 请求预览</strong>
-                  <small>检查下一次模型调用的完整载荷</small>
+                  <strong>模型请求预览</strong>
+                  <small>检查模型实际看到的文本与完整载荷</small>
                 </span>
               </summary>
               <div class="secondary-panel-body">
@@ -1544,6 +1332,27 @@ onBeforeUnmount(() => {
                           : "加载预览"
                     }}
                   </button>
+                  <div
+                    v-if="requestPreviews[activeAgent.id]"
+                    class="preview-mode-switch"
+                    role="group"
+                    aria-label="请求预览模式"
+                  >
+                    <button
+                      type="button"
+                      :class="{ active: previewMode === 'readable' }"
+                      @click="previewMode = 'readable'"
+                    >
+                      可读模型上下文
+                    </button>
+                    <button
+                      type="button"
+                      :class="{ active: previewMode === 'json' }"
+                      @click="previewMode = 'json'"
+                    >
+                      原始 JSON
+                    </button>
+                  </div>
                 </div>
                 <p v-if="isDirty" class="stale-preview-notice">
                   场景有未保存修改；下一次请求预览基于已保存版本，当前显示为旧版本。
@@ -1563,13 +1372,27 @@ onBeforeUnmount(() => {
                   >
                     尚未加载已保存场景的下一次请求。
                   </p>
+                  <div
+                    v-else-if="previewMode === 'readable'"
+                    class="readable-context"
+                  >
+                    <article
+                      v-for="(block, index) in readableModelContext(
+                        requestPreviews[activeAgent.id]!,
+                      )"
+                      :key="`${block.label}-${index}`"
+                    >
+                      <strong>{{ block.label }}</strong>
+                      <pre>{{ block.text }}</pre>
+                    </article>
+                  </div>
                   <pre v-else>{{
                     prettyJson(requestPreviews[activeAgent.id])
                   }}</pre>
                 </div>
                 <p class="observability-note">
-                  此处展示传给 Anthropic Messages API 的完整载荷，不含 API
-                  Key、Base URL 或第三方响应。
+                  两种视图来自同一次后端请求快照；可读视图逐字展示其中的
+                  system、role 与 text block，原始 JSON 保留传输元数据。
                 </p>
               </div>
             </details>
@@ -1578,87 +1401,5 @@ onBeforeUnmount(() => {
       </section>
     </main>
 
-    <div
-      v-if="isInnerVoiceDialogOpen && innerVoiceDialogAgent"
-      class="modal-backdrop"
-      @mousedown.self="closeInnerVoiceDialog"
-    >
-      <section
-        ref="innerVoiceDialog"
-        class="inner-voice-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="inner-voice-dialog-title"
-        aria-describedby="inner-voice-dialog-description"
-        @keydown="handleInnerVoiceDialogKeydown"
-      >
-        <header class="inner-voice-dialog-heading">
-          <div>
-            <p class="eyebrow">
-              AGENT {{ innerVoiceDialogAgent.id }} · 私人写入
-            </p>
-            <h2 id="inner-voice-dialog-title">写入内心声音</h2>
-          </div>
-          <button
-            class="modal-close-button"
-            type="button"
-            aria-label="关闭内心声音弹窗"
-            :disabled="writingInnerVoiceAgentId !== null"
-            @click="closeInnerVoiceDialog"
-          >
-            ×
-          </button>
-        </header>
-
-        <p id="inner-voice-dialog-description" class="inner-voice-target">
-          写入目标：<strong>{{ innerVoiceDialogAgent.name }}</strong>
-          <span>Agent {{ innerVoiceDialogAgent.id }}</span>
-        </p>
-
-        <form @submit.prevent="submitInnerVoice">
-          <label for="inner-voice-content">内容</label>
-          <textarea
-            id="inner-voice-content"
-            ref="innerVoiceTextarea"
-            v-model="innerVoiceDrafts[innerVoiceDialogAgent.id]"
-            rows="5"
-            :disabled="writingInnerVoiceAgentId !== null"
-            placeholder="例如：今天，B 告诉你他和 C 分手了，问问怎么回事吧"
-            @input="innerVoiceErrors[innerVoiceDialogAgent.id] = ''"
-          ></textarea>
-          <p class="inner-voice-privacy">
-            仅写入这位 Agent 的私人时间线；不会触发模型推理，也不会自动生成消息。
-          </p>
-          <p
-            v-if="innerVoiceErrors[innerVoiceDialogAgent.id]"
-            class="form-error"
-            role="alert"
-          >
-            {{ innerVoiceErrors[innerVoiceDialogAgent.id] }}
-          </p>
-          <div class="inner-voice-dialog-actions">
-            <button
-              class="secondary-button"
-              type="button"
-              :disabled="writingInnerVoiceAgentId !== null"
-              @click="closeInnerVoiceDialog"
-            >
-              取消
-            </button>
-            <button
-              class="primary-button"
-              type="submit"
-              :disabled="!canWriteInnerVoice"
-            >
-              {{
-                writingInnerVoiceAgentId === innerVoiceDialogAgent.id
-                  ? "写入中…"
-                  : "写入时间线"
-              }}
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
   </div>
 </template>

@@ -10,16 +10,6 @@ export interface MessageTimelineRecord {
   content: string;
 }
 
-export interface InnerVoiceTimelineRecord {
-  type: "inner_voice";
-  inner_voice_id: string;
-  content: string;
-}
-
-export type TimelineRecord =
-  | MessageTimelineRecord
-  | InnerVoiceTimelineRecord;
-
 export interface Agent {
   id: AgentId;
   name: string;
@@ -28,11 +18,11 @@ export interface Agent {
   fear: string;
   memory: string;
   system_prompt: string;
-  timeline: TimelineRecord[];
+  timeline: MessageTimelineRecord[];
 }
 
 export interface Scene {
-  schema_version: 3;
+  schema_version: 4;
   id: string;
   name: string;
   agents: Agent[];
@@ -60,7 +50,6 @@ export interface SceneUpdate {
 
 export interface MessageCreate {
   sender_id: AgentId;
-  recipient_id: AgentId;
   content: string;
 }
 
@@ -72,7 +61,6 @@ export interface MessageDraftUsage {
 }
 
 export interface MessageDraftResponse {
-  recipient_id: AgentId | null;
   content: string;
   usage: MessageDraftUsage;
   request_snapshot: ModelRequest;

@@ -1,350 +1,106 @@
-"""Integration tests for the scene CRUD API."""
+"""Integration tests for scene persistence and v4 messages."""
 
 import json
-from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
-import app.storage as storage_module
 from app.main import create_app
-from app.models import DEFAULT_SYSTEM_PROMPT_TEMPLATE
-from app.storage import SceneStorage
+from app.models import CreateMessageRequest, add_message, create_scene
+from app.storage import SceneReadError, SceneStorage
 from tests.client import TestClient
-
-
-def _assert_all_timelines_empty(response_dict: dict[str, Any]) -> None:
-    """Assert all three agents have empty timelines."""
-    assert [agent["timeline"] for agent in response_dict["agents"]] == [
-        [],
-        [],
-        [],
-    ]
-
-
-def _read_scene_file(scene_directory: Path, scene_id: str) -> dict[str, Any]:
-    """Read a scene JSON file from disk."""
-    return json.loads(
-        (scene_directory / f"{scene_id}.json").read_text(encoding="utf-8")
-    )
 
 
 @pytest.fixture
 def scene_directory(tmp_path: Path) -> Path:
-    """A temporary scene storage directory inside *tmp_path*."""
+    """Provide isolated JSON scene storage."""
     return tmp_path / "scenes"
 
 
 @pytest.fixture
 def client(scene_directory: Path) -> TestClient:
-    """A TestClient wired to a fresh SceneStorage in *scene_directory*."""
+    """Provide an API client backed by isolated storage."""
     return TestClient(create_app(SceneStorage(scene_directory)))
 
 
-def create_scene(client: TestClient, name: str = "港口") -> dict[str, Any]:
-    """POST a new scene and return the parsed JSON response."""
-    response = client.post("/api/scenes", json={"name": name})
+def post_scene(client: TestClient) -> dict:
+    """Create and return one scene."""
+    response = client.post("/api/scenes", json={"name": "港口"})
     assert response.status_code == 201
     return response.json()
 
 
-def update_payload(name: str = "雨夜港口") -> dict[str, Any]:
-    """Build a valid PUT payload that updates name and agent fields."""
-    return {
-        "name": name,
-        "agents": [
-            {
-                "id": agent_id,
-                "name": f"居民 {agent_id}",
-                "persona": f"{agent_id} 的人设",
-                "desire": f"{agent_id} 的欲望",
-                "fear": f"{agent_id} 的恐惧",
-                "memory": f"{agent_id} 的当前压缩记忆",
-                "system_prompt": f"{agent_id} 的最终系统提示词",
-            }
-            for agent_id in ("A", "B", "C")
-        ],
-    }
-
-
-def send_message(
+def test_new_scene_is_schema_v4_and_survives_restart(
     client: TestClient,
-    scene_id: str,
-    *,
-    sender_id: str = "A",
-    recipient_id: str = "B",
-    content: str = "你今晚会来码头吗？",
-) -> dict[str, Any]:
-    """Confirm a message and return the updated scene response."""
-    response = client.post(
-        f"/api/scenes/{scene_id}/messages",
-        json={
-            "sender_id": sender_id,
-            "recipient_id": recipient_id,
-            "content": content,
-        },
-    )
-    assert response.status_code == 201
-    return response.json()
-
-
-def test_create_scene_writes_one_utf8_json_file(
-    client: TestClient, scene_directory: Path
-) -> None:
-    """Creating a scene persists a single UTF-8 JSON file on disk."""
-    scene = create_scene(client, "  海边小镇  ")
-
-    assert scene["schema_version"] == 3
-    assert scene["name"] == "海边小镇"
-    UUID(scene["id"])
-    assert [
-        {
-            "id": agent["id"],
-            "name": agent["name"],
-            "persona": agent["persona"],
-            "desire": agent["desire"],
-            "fear": agent["fear"],
-            "memory": agent["memory"],
-            "system_prompt": agent["system_prompt"],
-            "timeline": agent["timeline"],
-        }
-        for agent in scene["agents"]
-    ] == [
-        {
-            "id": agent_id,
-            "name": agent_id,
-            "persona": "",
-            "desire": "",
-            "fear": "",
-            "memory": "",
-            "system_prompt": DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(
-                persona="",
-                desire="",
-                fear="",
-                memory="",
-            ),
-            "timeline": [],
-        }
-        for agent_id in ("A", "B", "C")
-    ]
-
-    files = list(scene_directory.glob("*.json"))
-    assert files == [scene_directory / f"{scene['id']}.json"]
-    contents = files[0].read_text(encoding="utf-8")
-    assert "海边小镇" in contents
-    assert json.loads(contents) == scene
-
-
-def test_each_scene_uses_a_separate_file(
-    client: TestClient, scene_directory: Path
-) -> None:
-    """Each scene is stored in its own JSON file."""
-    first = create_scene(client, "场景一")
-    second = create_scene(client, "场景二")
-
-    assert {path.name for path in scene_directory.glob("*.json")} == {
-        f"{first['id']}.json",
-        f"{second['id']}.json",
-    }
-
-
-def test_scene_can_be_reopened_with_a_new_app_instance(
     scene_directory: Path,
 ) -> None:
-    """A scene written by one app instance can be read by another."""
-    first_client = TestClient(create_app(SceneStorage(scene_directory)))
-    scene = create_scene(first_client, "可恢复场景")
+    """New files persist the current schema and all three Agents."""
+    scene = post_scene(client)
 
-    restarted_client = TestClient(create_app(SceneStorage(scene_directory)))
-
-    list_response = restarted_client.get("/api/scenes")
-    open_response = restarted_client.get(f"/api/scenes/{scene['id']}")
-
-    assert list_response.status_code == 200
-    assert list_response.json() == [{"id": scene["id"], "name": "可恢复场景"}]
-    assert open_response.status_code == 200
-    assert open_response.json() == scene
-
-
-def test_scene_list_has_stable_name_and_id_order(
-    client: TestClient,
-) -> None:
-    """Scene list is sorted by (name, id) for deterministic ordering."""
-    scenes = [
-        create_scene(client, name) for name in ("同名", "北岸", "同名", "南岸")
-    ]
-
-    response = client.get("/api/scenes")
-
-    expected = sorted(
-        [{"id": scene["id"], "name": scene["name"]} for scene in scenes],
-        key=lambda scene: (scene["name"], scene["id"]),
-    )
-    assert response.status_code == 200
-    assert response.json() == expected
-
-
-def test_missing_scene_directory_is_an_empty_store(
-    client: TestClient,
-) -> None:
-    """Listing scenes returns [] when the storage directory doesn't exist."""
-    response = client.get("/api/scenes")
-
-    assert response.status_code == 200
-    assert response.json() == []
-
-
-def test_scene_list_reports_when_storage_path_is_not_a_directory(
-    client: TestClient, scene_directory: Path
-) -> None:
-    """A file (not a directory) at the storage path triggers a 500 error."""
-    scene_directory.write_text("not a directory", encoding="utf-8")
-
-    response = client.get("/api/scenes")
-
-    assert response.status_code == 500
+    assert scene["schema_version"] == 4
+    assert [agent["id"] for agent in scene["agents"]] == ["A", "B", "C"]
     assert (
-        "Could not list the scene storage directory"
-        in response.json()["detail"]
+        SceneStorage(scene_directory)
+        .get(UUID(scene["id"]))
+        .model_dump(mode="json")
+        == scene
     )
 
 
-def test_update_replaces_only_editable_fields(
-    client: TestClient, scene_directory: Path
-) -> None:
-    """PUT updates name and agent fields.
-
-    Preserves server-owned fields: ID, schema_version, and timeline.
-    """
-    original = create_scene(client)
-    payload = update_payload()
-
-    response = client.put(
-        f"/api/scenes/{original['id']}",
-        json=payload,
-    )
-
-    assert response.status_code == 200
-    updated = response.json()
-    assert updated["id"] == original["id"]
-    assert updated["schema_version"] == original["schema_version"]
-    assert updated["name"] == payload["name"]
-    assert [
-        {
-            key: agent[key]
-            for key in (
-                "id",
-                "name",
-                "persona",
-                "desire",
-                "fear",
-                "memory",
-                "system_prompt",
-            )
-        }
-        for agent in updated["agents"]
-    ] == payload["agents"]
-    assert [agent["timeline"] for agent in updated["agents"]] == [[], [], []]
-
-    saved = _read_scene_file(scene_directory, original["id"])
-    assert saved == updated
-
-
-def test_message_appends_matching_records_only_to_participants(
+def test_confirmation_parses_recipient_and_writes_perspective_text(
     client: TestClient,
 ) -> None:
-    """A confirmed message gives matching records only to its participants."""
-    scene = create_scene(client)
-
-    updated = send_message(
-        client,
-        scene["id"],
-        sender_id="A",
-        recipient_id="C",
-        content="  灯塔下见。  ",
+    """The complete draft controls routing and both authoritative records."""
+    scene = post_scene(client)
+    response = client.post(
+        f"/api/scenes/{scene['id']}/messages",
+        json={"sender_id": "A", "content": "To   C ：  灯塔下见。  "},
     )
 
-    sender_record = updated["agents"][0]["timeline"][0]
-    recipient_record = updated["agents"][2]["timeline"][0]
-    UUID(sender_record["message_id"])
-    assert sender_record == {
+    assert response.status_code == 201
+    updated = response.json()
+    sent = updated["agents"][0]["timeline"][0]
+    received = updated["agents"][2]["timeline"][0]
+    assert sent == {
         "type": "message",
-        "message_id": recipient_record["message_id"],
+        "message_id": received["message_id"],
         "direction": "sent",
         "counterpart_id": "C",
-        "content": "灯塔下见。",
+        "content": "To C: 灯塔下见。",
     }
-    assert recipient_record == {
+    assert received == {
         "type": "message",
-        "message_id": sender_record["message_id"],
+        "message_id": sent["message_id"],
         "direction": "received",
         "counterpart_id": "A",
-        "content": "灯塔下见。",
+        "content": "From A: 灯塔下见。",
     }
     assert updated["agents"][1]["timeline"] == []
-
-
-def test_messages_preserve_each_agents_timeline_order(
-    client: TestClient,
-) -> None:
-    """Successive messages remain in confirmation order per agent."""
-    scene = create_scene(client)
-
-    send_message(client, scene["id"], content="第一条")
-    send_message(
-        client,
-        scene["id"],
-        sender_id="C",
-        recipient_id="A",
-        content="第二条",
-    )
-    updated = send_message(
-        client,
-        scene["id"],
-        sender_id="A",
-        recipient_id="B",
-        content="第三条",
-    )
-
-    assert [
-        (record["direction"], record["counterpart_id"], record["content"])
-        for record in updated["agents"][0]["timeline"]
-    ] == [
-        ("sent", "B", "第一条"),
-        ("received", "C", "第二条"),
-        ("sent", "B", "第三条"),
-    ]
-    assert [
-        record["content"] for record in updated["agents"][1]["timeline"]
-    ] == ["第一条", "第三条"]
-    assert [
-        record["content"] for record in updated["agents"][2]["timeline"]
-    ] == ["第二条"]
 
 
 @pytest.mark.parametrize(
     "payload",
     [
-        {"sender_id": "A", "recipient_id": "B", "content": " \t "},
-        {"sender_id": "A", "recipient_id": "A", "content": "自言自语"},
-        {"sender_id": "D", "recipient_id": "A", "content": "非法发送者"},
-        {"sender_id": "A", "recipient_id": "D", "content": "非法接收者"},
-        {
-            "sender_id": "A",
-            "recipient_id": "B",
-            "content": "正文",
-            "unexpected": True,
-        },
+        {"sender_id": "A", "content": "正文"},
+        {"sender_id": "A", "content": "To A: 自己"},
+        {"sender_id": "A", "content": "To D: 无效"},
+        {"sender_id": "A", "content": "To B:"},
+        {"sender_id": "A", "content": "To B: 第一行\n第二行"},
+        {"sender_id": "A", "content": "To B: 正文\n"},
+        {"sender_id": "A", "content": "说明\nTo B: 正文"},
+        {"sender_id": "A", "recipient_id": "B", "content": "To B: 正文"},
     ],
 )
-def test_message_rejects_invalid_payloads(
+def test_invalid_confirmation_is_422_and_does_not_write(
     client: TestClient,
-    payload: dict[str, Any],
+    scene_directory: Path,
+    payload: dict,
 ) -> None:
-    """Invalid content, participants, and extra fields return 422."""
-    scene = create_scene(client)
+    """Malformed or obsolete payloads cannot partially mutate timelines."""
+    scene = post_scene(client)
+    path = scene_directory / f"{scene['id']}.json"
+    before = path.read_bytes()
 
     response = client.post(
         f"/api/scenes/{scene['id']}/messages",
@@ -352,297 +108,146 @@ def test_message_rejects_invalid_payloads(
     )
 
     assert response.status_code == 422
-    reopened = client.get(f"/api/scenes/{scene['id']}")
-    _assert_all_timelines_empty(reopened.json())
+    assert path.read_bytes() == before
 
 
-def test_message_for_missing_scene_returns_404(client: TestClient) -> None:
-    """Confirming a message in a missing scene returns 404."""
-    response = client.post(
-        f"/api/scenes/{uuid4()}/messages",
-        json={
-            "sender_id": "A",
-            "recipient_id": "B",
-            "content": "无人收到",
-        },
-    )
-
-    assert response.status_code == 404
-
-
-def test_message_timeline_survives_restart_and_later_scene_update(
-    scene_directory: Path,
-) -> None:
-    """Messages reload after restart and survive editable-field updates."""
-    first_client = TestClient(create_app(SceneStorage(scene_directory)))
-    scene = create_scene(first_client)
-    messaged = send_message(first_client, scene["id"], content="保留这条消息")
-
-    restarted_client = TestClient(create_app(SceneStorage(scene_directory)))
-    reopened = restarted_client.get(f"/api/scenes/{scene['id']}")
-    assert reopened.status_code == 200
-    assert reopened.json() == messaged
-
-    update_response = restarted_client.put(
-        f"/api/scenes/{scene['id']}",
-        json=update_payload("消息后的场景"),
-    )
-    assert update_response.status_code == 200
-    assert [
-        agent["timeline"] for agent in update_response.json()["agents"]
-    ] == [agent["timeline"] for agent in messaged["agents"]]
-
-
-def test_failed_message_write_leaves_no_single_sided_record(
-    client: TestClient,
-    scene_directory: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A failed atomic save keeps both timelines and disk unchanged."""
-    scene = create_scene(client)
-    scene_path = scene_directory / f"{scene['id']}.json"
-    original_contents = scene_path.read_bytes()
-
-    def fail_replace(_source: Path, _target: Path) -> None:
-        raise OSError("simulated replace failure")
-
-    monkeypatch.setattr(storage_module.os, "replace", fail_replace)
-
+def test_manual_to_edit_changes_recipient(client: TestClient) -> None:
+    """Routing follows edited visible content, not a separate UI field."""
+    scene = post_scene(client)
     response = client.post(
         f"/api/scenes/{scene['id']}/messages",
-        json={
-            "sender_id": "A",
-            "recipient_id": "B",
-            "content": "不能只写给一方",
-        },
+        json={"sender_id": "A", "content": "To C: 改发给 C"},
     )
 
-    assert response.status_code == 500
-    assert scene_path.read_bytes() == original_contents
-    assert list(scene_directory.glob("*.tmp")) == []
-    _assert_all_timelines_empty(json.loads(original_contents))
+    assert response.status_code == 201
+    timelines = [agent["timeline"] for agent in response.json()["agents"]]
+    assert len(timelines[0]) == 1
+    assert timelines[1] == []
+    assert len(timelines[2]) == 1
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda payload: payload.update({"id": str(uuid4())}),
-        lambda payload: payload.update({"schema_version": 1}),
-        lambda payload: payload["agents"][0].update({"timeline": []}),
-    ],
-)
-def test_update_rejects_server_owned_fields(
+def test_delete_validates_perspective_pair_and_both_timeline_tops(
     client: TestClient,
-    mutate: Callable[[dict[str, Any]], None],
 ) -> None:
-    """PUT rejects payloads that include id, schema_version, or timeline."""
-    scene = create_scene(client)
-    payload = update_payload()
-    mutate(payload)
+    """Only a consistent To/From pair at both absolute tops is deletable."""
+    scene = post_scene(client)
+    first = client.post(
+        f"/api/scenes/{scene['id']}/messages",
+        json={"sender_id": "A", "content": "To B: 第一条"},
+    ).json()
+    first_id = first["agents"][0]["timeline"][0]["message_id"]
+    second = client.post(
+        f"/api/scenes/{scene['id']}/messages",
+        json={"sender_id": "A", "content": "To C: 第二条"},
+    ).json()
+    second_id = second["agents"][0]["timeline"][-1]["message_id"]
 
-    response = client.put(f"/api/scenes/{scene['id']}", json=payload)
-
-    assert response.status_code == 422
-
-
-@pytest.mark.parametrize(
-    "agent_ids",
-    [
-        ("A", "B"),
-        ("A", "A", "C"),
-        ("B", "A", "C"),
-    ],
-)
-def test_update_requires_exactly_a_b_c_in_order(
-    client: TestClient, agent_ids: tuple[str, ...]
-) -> None:
-    """PUT rejects agent lists that are not exactly A, B, C in order."""
-    scene = create_scene(client)
-    payload = update_payload()
-    payload["agents"] = [
-        {
-            **payload["agents"][index],
-            "id": agent_id,
-        }
-        for index, agent_id in enumerate(agent_ids)
+    conflict = client.delete(f"/api/scenes/{scene['id']}/messages/{first_id}")
+    assert conflict.status_code == 409
+    assert (
+        client.delete(
+            f"/api/scenes/{scene['id']}/messages/{second_id}"
+        ).status_code
+        == 200
+    )
+    deleted = client.delete(f"/api/scenes/{scene['id']}/messages/{first_id}")
+    assert deleted.status_code == 200
+    assert [agent["timeline"] for agent in deleted.json()["agents"]] == [
+        [],
+        [],
+        [],
     ]
 
-    response = client.put(f"/api/scenes/{scene['id']}", json=payload)
 
-    assert response.status_code == 422
-
-
-@pytest.mark.parametrize(
-    ("method", "path", "payload"),
-    [
-        ("post", "/api/scenes", {"name": "   "}),
-        ("put", "", update_payload(name=" ")),
-        (
-            "put",
-            "",
-            {
-                **update_payload(),
-                "agents": [
-                    {**agent, "name": "\t"} if agent["id"] == "B" else agent
-                    for agent in update_payload()["agents"]
-                ],
-            },
-        ),
-    ],
-)
-def test_scene_and_agent_names_must_not_be_blank(
-    client: TestClient,
-    method: str,
-    path: str,
-    payload: dict[str, Any],
+@pytest.mark.parametrize("schema_version", [1, 2, 3])
+def test_legacy_message_upgrade_is_in_memory_until_save(
+    tmp_path: Path,
+    schema_version: int,
 ) -> None:
-    """Scene and agent names that are blank or whitespace-only return 422."""
-    if method == "post":
-        response = client.post(path, json=payload)
-    else:
-        scene = create_scene(client)
-        response = client.put(f"/api/scenes/{scene['id']}", json=payload)
-
-    assert response.status_code == 422
-
-
-def test_missing_scene_returns_404(client: TestClient) -> None:
-    """GET for a non-existent scene ID returns a 404 error."""
-    response = client.get(f"/api/scenes/{uuid4()}")
-
-    assert response.status_code == 404
-    assert "does not exist" in response.json()["detail"]
-
-
-def test_v1_scene_is_upgraded_in_memory_and_written_only_after_save(
-    client: TestClient,
-    scene_directory: Path,
-) -> None:
-    """Reading v1 is non-mutating; explicit save persists v3 unchanged."""
+    """v1-v3 messages gain perspective prefixes without eager file writes."""
+    directory = tmp_path / f"v{schema_version}"
+    directory.mkdir()
     scene_id = uuid4()
-    timeline = [
+    message_id = uuid4()
+    raw = create_scene("旧场景").model_dump(mode="json")
+    raw["schema_version"] = schema_version
+    raw["id"] = str(scene_id)
+    if schema_version == 1:
+        for agent in raw["agents"]:
+            agent.pop("system_prompt")
+    raw["agents"][0]["timeline"] = [
         {
-            "message_id": str(uuid4()),
+            **({"type": "message"} if schema_version == 3 else {}),
+            "message_id": str(message_id),
             "direction": "sent",
             "counterpart_id": "B",
-            "content": "旧场景消息",
+            "content": "旧消息",
         }
     ]
-    v1_scene = {
-        "schema_version": 1,
-        "id": str(scene_id),
-        "name": "旧场景",
-        "agents": [
-            {
-                "id": agent_id,
-                "name": f"旧居民 {agent_id}",
-                "persona": f"人设 {agent_id}",
-                "desire": f"欲望 {agent_id}",
-                "fear": f"恐惧 {agent_id}",
-                "memory": f"记忆 {agent_id}",
-                "timeline": timeline if agent_id == "A" else [],
-            }
-            for agent_id in ("A", "B", "C")
-        ],
-    }
-    scene_directory.mkdir(parents=True)
-    scene_path = scene_directory / f"{scene_id}.json"
-    original = json.dumps(v1_scene, ensure_ascii=False).encode()
-    scene_path.write_bytes(original)
+    raw["agents"][1]["timeline"] = [
+        {
+            **({"type": "message"} if schema_version == 3 else {}),
+            "message_id": str(message_id),
+            "direction": "received",
+            "counterpart_id": "A",
+            "content": "旧消息",
+        }
+    ]
+    path = directory / f"{scene_id}.json"
+    original = json.dumps(raw, ensure_ascii=False).encode()
+    path.write_bytes(original)
+    storage = SceneStorage(directory)
 
-    opened = client.get(f"/api/scenes/{scene_id}")
+    upgraded = storage.get(scene_id)
 
-    assert opened.status_code == 200
-    upgraded = opened.json()
-    assert upgraded["schema_version"] == 3
-    assert upgraded["agents"][0]["timeline"][0]["type"] == "message"
-    upgraded_timeline = [{"type": "message", **timeline[0]}]
-    assert upgraded["agents"][0]["timeline"] == upgraded_timeline
-    assert "人设 A" in upgraded["agents"][0]["system_prompt"]
-    assert scene_path.read_bytes() == original
-
-    payload = {
-        "name": upgraded["name"],
-        "agents": [
-            {
-                key: agent[key]
-                for key in (
-                    "id",
-                    "name",
-                    "persona",
-                    "desire",
-                    "fear",
-                    "memory",
-                    "system_prompt",
-                )
-            }
-            for agent in upgraded["agents"]
-        ],
-    }
-    saved = client.put(f"/api/scenes/{scene_id}", json=payload)
-
-    assert saved.status_code == 200
-    persisted = json.loads(scene_path.read_text(encoding="utf-8"))
-    assert persisted["schema_version"] == 3
-    assert persisted["agents"][0]["timeline"] == upgraded_timeline
+    assert path.read_bytes() == original
+    assert upgraded.schema_version == 4
+    assert upgraded.agents[0].timeline[0].content == "To B: 旧消息"
+    assert upgraded.agents[1].timeline[0].content == "From A: 旧消息"
+    storage.save(upgraded)
+    assert json.loads(path.read_text())["schema_version"] == 4
 
 
-def test_system_prompt_must_not_be_blank(client: TestClient) -> None:
-    """Whitespace-only final prompts are rejected without changing disk."""
-    scene = create_scene(client)
-    payload = update_payload()
-    payload["agents"][0]["system_prompt"] = " \n\t "
-
-    response = client.put(f"/api/scenes/{scene['id']}", json=payload)
-
-    assert response.status_code == 422
-
-
-def test_corrupted_json_is_reported_instead_of_ignored(
-    client: TestClient, scene_directory: Path
+def test_existing_correct_legacy_prefix_is_not_duplicated(
+    tmp_path: Path,
 ) -> None:
-    """Corrupt JSON on disk produces 500 errors, not silent failures."""
-    corrupt_id = uuid4()
-    scene_directory.mkdir(parents=True)
-    (scene_directory / f"{corrupt_id}.json").write_text(
-        "{ definitely not json",
-        encoding="utf-8",
+    """An already perspective-tagged v3 record stays unchanged."""
+    directory = tmp_path / "scenes"
+    directory.mkdir()
+    scene = add_message(
+        create_scene("已有标签"),
+        CreateMessageRequest(sender_id="A", content="To B: 正文"),
+    )
+    raw = scene.model_dump(mode="json")
+    raw["schema_version"] = 3
+    path = directory / f"{scene.id}.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = SceneStorage(directory).get(scene.id)
+
+    assert loaded.agents[0].timeline[0].content == "To B: 正文"
+    assert loaded.agents[1].timeline[0].content == "From A: 正文"
+
+
+def test_legacy_inner_voice_is_rejected_with_clear_error(
+    tmp_path: Path,
+) -> None:
+    """Removed private prompt records cannot be silently imported."""
+    directory = tmp_path / "scenes"
+    directory.mkdir()
+    scene = create_scene("旧内心声音")
+    raw = scene.model_dump(mode="json")
+    raw["schema_version"] = 3
+    raw["agents"][0]["timeline"] = [
+        {
+            "type": "inner_voice",
+            "inner_voice_id": str(uuid4()),
+            "content": "旧提示",
+        }
+    ]
+    (directory / f"{scene.id}.json").write_text(
+        json.dumps(raw), encoding="utf-8"
     )
 
-    open_response = client.get(f"/api/scenes/{corrupt_id}")
-    list_response = client.get("/api/scenes")
-
-    assert open_response.status_code == 500
-    assert "invalid or corrupted" in open_response.json()["detail"]
-    assert list_response.status_code == 500
-    assert "invalid or corrupted" in list_response.json()["detail"]
-
-
-def test_failed_atomic_replace_preserves_previous_file(
-    client: TestClient,
-    scene_directory: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """When os.replace fails, the original file is untouched.
-
-    No .tmp files remain after a failed write.
-    """
-    scene = create_scene(client, "原始名称")
-    scene_path = scene_directory / f"{scene['id']}.json"
-    original_contents = scene_path.read_bytes()
-
-    def fail_replace(_source: Path, _target: Path) -> None:
-        raise OSError("simulated replace failure")
-
-    monkeypatch.setattr(storage_module.os, "replace", fail_replace)
-
-    response = client.put(
-        f"/api/scenes/{scene['id']}",
-        json=update_payload("不应落盘"),
-    )
-
-    assert response.status_code == 500
-    assert "Could not save scene" in response.json()["detail"]
-    assert scene_path.read_bytes() == original_contents
-    # No .tmp files lingering after a failed write.
-    assert list(scene_directory.glob("*.tmp")) == []
+    with pytest.raises(SceneReadError, match="removed 'inner_voice'"):
+        SceneStorage(directory).get(scene.id)
