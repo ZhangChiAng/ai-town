@@ -290,13 +290,14 @@ def test_request_forces_strict_tool_and_has_two_explicit_5m_breakpoints() -> (
     assert serialized.count('"cache_control"') == 2
 
 
-def test_timeline_maps_to_independent_native_messages_in_exact_order() -> None:
-    """Received and sent records become prefixed user and assistant turns."""
+def test_timeline_maps_to_alternating_native_messages_in_exact_order() -> None:
+    """Adjacent same-role records remain separate blocks in one API turn."""
     scene = create_scene("原生消息映射")
     for sender_id, recipient_id, content in (
         ("B", "A", "第一条收到"),
         ("A", "C", "第一条发出"),
         ("A", "B", "连续发出"),
+        ("B", "A", "连续收到之一"),
         ("C", "A", "最后收到"),
     ):
         scene = add_message(
@@ -317,23 +318,29 @@ def test_timeline_maps_to_independent_native_messages_in_exact_order() -> None:
         },
         {
             "role": "assistant",
-            "content": [{"type": "text", "text": "To C: 第一条发出"}],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "text", "text": "To B: 连续发出"}],
+            "content": [
+                {"type": "text", "text": "To C: 第一条发出"},
+                {"type": "text", "text": "To B: 连续发出"},
+            ],
         },
         {
             "role": "user",
             "content": [
+                {"type": "text", "text": "From B: 连续收到之一"},
                 {
                     "type": "text",
                     "text": "From C: 最后收到",
                     "cache_control": CACHE_CONTROL,
-                }
+                },
             ],
         },
     ]
+    assert all(
+        current["role"] != following["role"]
+        for current, following in zip(
+            request["messages"], request["messages"][1:], strict=False
+        )
+    )
 
 
 def test_empty_timeline_has_empty_messages_and_only_system_cache() -> None:
@@ -387,13 +394,13 @@ def test_context_order_and_cache_prefix_are_stable_as_timeline_grows() -> None:
     assert [
         {
             "role": message["role"],
-            "text": message["content"][0]["text"],
+            "text": [block["text"] for block in message["content"]],
         }
         for message in grown_messages[: len(old_messages)]
     ] == [
         {
             "role": message["role"],
-            "text": message["content"][0]["text"],
+            "text": [block["text"] for block in message["content"]],
         }
         for message in old_messages
     ]

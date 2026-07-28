@@ -142,16 +142,13 @@ def test_mixed_timeline_maps_in_order_and_keeps_private_boundary(
     assert request["messages"] == [
         {
             "role": "user",
-            "content": [{"type": "text", "text": "From B: 第一条收到"}],
-        },
-        {
-            "role": "user",
             "content": [
+                {"type": "text", "text": "From B: 第一条收到"},
                 {
                     "type": "text",
                     "text": "内心的声音：只给 A 的提示",
                     "cache_control": CACHE_CONTROL,
-                }
+                },
             ],
         },
     ]

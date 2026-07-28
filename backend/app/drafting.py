@@ -178,39 +178,25 @@ def _compose_message_tool(recipients: list[Agent]) -> dict[str, Any]:
 
 
 def _build_timeline_messages(agent: Agent) -> list[dict[str, Any]]:
-    """Map the private timeline directly to native Messages API turns."""
+    """Map the private timeline to alternating native Messages API turns."""
     messages: list[dict[str, Any]] = []
     for record in agent.timeline:
         if record.type == "inner_voice":
-            messages.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"内心的声音：{record.content}",
-                        }
-                    ],
-                }
-            )
-            continue
-        is_received = record.direction == "received"
-        role = "user" if is_received else "assistant"
-        prefix = "From" if is_received else "To"
-        messages.append(
-            {
-                "role": role,
-                "content": [
-                    {
-                        "type": "text",
-                        "text": (
-                            f"{prefix} {record.counterpart_id}: "
-                            f"{record.content}"
-                        ),
-                    }
-                ],
-            }
-        )
+            role = "user"
+            text = f"内心的声音：{record.content}"
+        else:
+            is_received = record.direction == "received"
+            role = "user" if is_received else "assistant"
+            prefix = "From" if is_received else "To"
+            text = f"{prefix} {record.counterpart_id}: {record.content}"
+
+        block = {"type": "text", "text": text}
+        if messages and messages[-1]["role"] == role:
+            # Some compatible gateways require strict role alternation even
+            # though Anthropic itself combines adjacent same-role messages.
+            messages[-1]["content"].append(block)
+        else:
+            messages.append({"role": role, "content": [block]})
     return messages
 
 
