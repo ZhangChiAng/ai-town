@@ -44,6 +44,10 @@ function makeScene(
   };
 }
 
+function cloneSceneForTest(scene: Scene): Scene {
+  return JSON.parse(JSON.stringify(scene)) as Scene;
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return {
     ok: status >= 200 && status < 300,
@@ -337,6 +341,138 @@ describe("App", () => {
     await nextTick();
     expectText("时间线为空");
     expectNoText("今晚在灯塔下见。");
+  });
+
+  it("puts the chat first and keeps secondary panels collapsed", async () => {
+    const scene = makeScene();
+    scene.agents[0].timeline = [
+      {
+        message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        direction: "received",
+        counterpart_id: "B",
+        content: "码头见。",
+      },
+      {
+        message_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        direction: "sent",
+        counterpart_id: "C",
+        content: "我随后就到。",
+      },
+    ];
+    stubFetch({
+      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
+      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
+    });
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+
+    const editor = container.querySelector(".agent-editor");
+    const children = Array.from(editor?.children ?? []);
+    expect(children.map((child) => child.classList[0])).toEqual([
+      "chat-panel",
+      "secondary-panel",
+      "secondary-panel",
+    ]);
+    expect(
+      children
+        .filter((child): child is HTMLDetailsElement =>
+          child instanceof HTMLDetailsElement,
+        )
+        .every((details) => !details.open),
+    ).toBe(true);
+    expect(container.querySelectorAll(".chat-message--received")).toHaveLength(
+      1,
+    );
+    expect(container.querySelectorAll(".chat-message--sent")).toHaveLength(1);
+    expectText("北辰 · Agent B");
+    expectText("发给 迟夏 · Agent C");
+  });
+
+  it("follows new timeline records only while the reader is near the bottom", async () => {
+    const scene = makeScene();
+    scene.agents[1].timeline = [
+      {
+        message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        direction: "received",
+        counterpart_id: "A",
+        content: "第一条消息",
+      },
+    ];
+    const firstUpdate = cloneSceneForTest(scene);
+    firstUpdate.agents[1].timeline.push({
+      message_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      direction: "sent",
+      counterpart_id: "C",
+      content: "上滚时收到的更新",
+    });
+    firstUpdate.agents[2].timeline.push({
+      message_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      direction: "received",
+      counterpart_id: "B",
+      content: "上滚时收到的更新",
+    });
+    const secondUpdate = cloneSceneForTest(firstUpdate);
+    secondUpdate.agents[1].timeline.push({
+      message_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      direction: "sent",
+      counterpart_id: "C",
+      content: "贴底时收到的更新",
+    });
+    secondUpdate.agents[2].timeline.push({
+      message_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      direction: "received",
+      counterpart_id: "B",
+      content: "贴底时收到的更新",
+    });
+    let sendCount = 0;
+    stubFetch({
+      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
+      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
+      [`POST /api/scenes/${scene.id}/messages`]: () => {
+        sendCount += 1;
+        return jsonResponse(sendCount === 1 ? firstUpdate : secondUpdate, 201);
+      },
+    });
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    const scroller = container.querySelector<HTMLElement>(".chat-messages");
+    if (scroller === null) {
+      throw new Error("Could not find chat scroller");
+    }
+    Object.defineProperties(scroller, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 200 },
+    });
+
+    findButton("Agent B").click();
+    await flushAsyncUpdates();
+    expect(scroller.scrollTop).toBe(1000);
+
+    scroller.scrollTop = 300;
+    scroller.dispatchEvent(new Event("scroll"));
+    await setSelectValue("#message-recipient", "C");
+    await setFieldValue("#message-content", "上滚时收到的更新");
+    findButton("确认发送").click();
+    await flushAsyncUpdates();
+
+    expect(scroller.scrollTop).toBe(300);
+    expectText("有新消息 · 回到最新");
+    findButton("回到最新").click();
+    await flushAsyncUpdates();
+    expect(scroller.scrollTop).toBe(1000);
+    expectNoText("有新消息 · 回到最新");
+
+    await setSelectValue("#message-recipient", "C");
+    await setFieldValue("#message-content", "贴底时收到的更新");
+    findButton("确认发送").click();
+    await flushAsyncUpdates();
+
+    expect(scroller.scrollTop).toBe(1000);
+    expectNoText("有新消息 · 回到最新");
   });
 
   it("keeps the draft and reports an error when message confirmation fails", async () => {

@@ -1,9 +1,11 @@
 <script setup lang="ts">
 import {
   computed,
+  nextTick,
   onBeforeUnmount,
   onMounted,
   ref,
+  watch,
 } from "vue";
 
 import {
@@ -65,9 +67,13 @@ const requestPreviews = ref<Record<AgentId, ModelRequest | null>>(
 );
 const previewErrors = ref<Record<AgentId, string>>(emptyMessageErrors());
 const previewingAgentId = ref<AgentId | null>(null);
+const timelineScroller = ref<HTMLElement | null>(null);
+const isTimelinePinned = ref(true);
+const hasNewTimelineUpdate = ref(false);
 
 let listRequestToken = 0;
 let summaryMutationVersion = 0;
+const TIMELINE_BOTTOM_THRESHOLD = 24;
 
 function cloneScene(scene: Scene): Scene {
   return JSON.parse(JSON.stringify(scene)) as Scene;
@@ -246,6 +252,77 @@ const canGenerateMessageDraft = computed(
     currentScene.value !== null &&
     !isDirty.value &&
     !editorLocked.value,
+);
+
+const activeTimelineSnapshot = computed(() => ({
+  identity: currentScene.value
+    ? `${currentScene.value.id}:${activeAgentId.value}`
+    : "",
+  records:
+    activeAgent.value?.timeline
+      .map(
+        (record) =>
+          `${record.message_id}:${record.direction}:${record.content}`,
+      )
+      .join("\u0000") ?? "",
+}));
+
+function counterpartName(agentId: AgentId): string {
+  return (
+    currentScene.value?.agents.find((agent) => agent.id === agentId)
+      ?.name ?? agentId
+  );
+}
+
+function timelineIsNearBottom(element: HTMLElement): boolean {
+  return (
+    element.scrollHeight - element.scrollTop - element.clientHeight <=
+    TIMELINE_BOTTOM_THRESHOLD
+  );
+}
+
+function handleTimelineScroll(): void {
+  const element = timelineScroller.value;
+  if (element === null) {
+    return;
+  }
+  isTimelinePinned.value = timelineIsNearBottom(element);
+  if (isTimelinePinned.value) {
+    hasNewTimelineUpdate.value = false;
+  }
+}
+
+async function scrollTimelineToLatest(): Promise<void> {
+  await nextTick();
+  const element = timelineScroller.value;
+  if (element === null) {
+    return;
+  }
+  element.scrollTop = element.scrollHeight;
+  isTimelinePinned.value = true;
+  hasNewTimelineUpdate.value = false;
+}
+
+watch(
+  activeTimelineSnapshot,
+  (snapshot, previousSnapshot) => {
+    if (
+      previousSnapshot === undefined ||
+      snapshot.identity !== previousSnapshot.identity
+    ) {
+      void scrollTimelineToLatest();
+      return;
+    }
+    if (snapshot.records === previousSnapshot.records) {
+      return;
+    }
+    if (isTimelinePinned.value) {
+      void scrollTimelineToLatest();
+    } else {
+      hasNewTimelineUpdate.value = true;
+    }
+  },
+  { flush: "post" },
 );
 
 function installScene(
@@ -887,113 +964,294 @@ onBeforeUnmount(() => {
           </nav>
 
           <div v-if="activeAgent" class="agent-editor">
-            <div class="agent-editor-heading">
-              <div>
-                <p class="eyebrow">AGENT {{ activeAgent.id }}</p>
-                <h2>{{ activeAgent.name || "未命名 Agent" }}</h2>
-              </div>
-              <p>
-                固定身份
-                <strong>{{ activeAgent.id }}</strong>
-              </p>
-            </div>
+            <section class="chat-panel" aria-labelledby="timeline-title">
+              <header class="chat-panel-heading">
+                <div>
+                  <p class="eyebrow">AGENT {{ activeAgent.id }}</p>
+                  <h2 id="timeline-title">
+                    {{ activeAgent.name || "未命名 Agent" }}
+                  </h2>
+                  <p>个人时间线 · 仅包含这位 Agent 已确认的收发消息</p>
+                </div>
+                <span class="chat-agent-id">
+                  固定身份 <strong>Agent {{ activeAgent.id }}</strong>
+                </span>
+              </header>
 
-            <div class="field-grid">
-              <label class="field field--wide" for="agent-name">
-                <span>显示名</span>
-                <small>可编辑；固定 ID 不会随名称改变</small>
-                <input
-                  id="agent-name"
-                  v-model="activeAgent.name"
-                  type="text"
-                  autocomplete="off"
-                  required
-                  :disabled="editorLocked"
-                  @input="markEdited"
-                />
-              </label>
-
-              <label
-                class="field field--wide system-prompt-field"
-                for="agent-system-prompt"
+              <div
+                ref="timelineScroller"
+                class="chat-messages"
+                aria-live="polite"
+                @scroll="handleTimelineScroll"
               >
-                <span>最终系统提示词</span>
-                <small>
-                  权威角色提示；保存值会逐字成为 Anthropic 请求中唯一的
-                  system 文本
-                </small>
-                <textarea
-                  id="agent-system-prompt"
-                  v-model="activeAgent.system_prompt"
-                  rows="15"
-                  :disabled="editorLocked"
-                  required
-                  @input="markEdited"
-                ></textarea>
-              </label>
+                <p
+                  v-if="activeAgent.timeline.length === 0"
+                  class="timeline-empty"
+                >
+                  时间线为空
+                </p>
+                <ol v-else class="chat-message-list">
+                  <li
+                    v-for="record in activeAgent.timeline"
+                    :key="`${record.message_id}-${record.direction}`"
+                    class="chat-message"
+                    :class="`chat-message--${record.direction}`"
+                  >
+                    <article class="chat-bubble">
+                      <p class="chat-message-meta">
+                        {{
+                          record.direction === "sent"
+                            ? `发给 ${counterpartName(record.counterpart_id)} · Agent ${record.counterpart_id}`
+                            : `${counterpartName(record.counterpart_id)} · Agent ${record.counterpart_id}`
+                        }}
+                      </p>
+                      <p class="chat-message-content">{{
+                        record.direction === "sent"
+                          ? `发送给 ${record.counterpart_id}：${record.content}`
+                          : `${record.counterpart_id}：${record.content}`
+                      }}</p>
+                      <button
+                        v-if="deletableMessageIds.has(record.message_id)"
+                        class="timeline-delete-button"
+                        type="button"
+                        :disabled="isDirty || editorLocked"
+                        @click="confirmDeleteMessage(record)"
+                      >
+                        {{
+                          deletingMessageId === record.message_id
+                            ? "删除中…"
+                            : "删除"
+                        }}
+                      </button>
+                    </article>
+                  </li>
+                </ol>
+              </div>
 
-              <details class="slot-materials field--wide">
-                <summary>
-                  <span>
-                    <strong>拼接素材</strong>
-                    <small>
-                      人设、欲望、恐惧与记忆不会随修改自动覆盖上方文本
-                    </small>
-                  </span>
-                </summary>
-                <div class="field-grid slot-material-grid">
-                  <label class="field field--wide" for="agent-persona">
-                    <span>人设</span>
-                    <small>身份、经历与相对稳定的性格描述</small>
-                    <textarea
-                      id="agent-persona"
-                      v-model="activeAgent.persona"
-                      rows="5"
+              <button
+                v-if="hasNewTimelineUpdate"
+                class="new-message-button"
+                type="button"
+                @click="scrollTimelineToLatest"
+              >
+                有新消息 · 回到最新
+              </button>
+
+              <footer class="chat-composer">
+                <div class="message-fields">
+                  <label class="message-recipient" for="message-recipient">
+                    <span>接收者</span>
+                    <select
+                      id="message-recipient"
+                      v-model="activeMessageDraft.recipientId"
                       :disabled="editorLocked"
-                      placeholder="暂时可以留空"
-                      @input="markEdited"
-                    ></textarea>
+                      @change="markMessageDraftEdited"
+                    >
+                      <option value="">请选择接收者</option>
+                      <option
+                        v-for="agentId in recipientOptions"
+                        :key="agentId"
+                        :value="agentId"
+                      >
+                        Agent {{ agentId }} ·
+                        {{ counterpartName(agentId) }}
+                      </option>
+                    </select>
                   </label>
 
-                  <label class="field" for="agent-desire">
-                    <span>欲望</span>
-                    <small>用自然语言描述 Agent 想要什么</small>
+                  <label class="message-content" for="message-content">
+                    <span>消息草稿</span>
                     <textarea
-                      id="agent-desire"
-                      v-model="activeAgent.desire"
-                      rows="7"
+                      id="message-content"
+                      v-model="activeMessageDraft.content"
+                      rows="3"
                       :disabled="editorLocked"
-                      placeholder="暂时可以留空"
-                      @input="markEdited"
-                    ></textarea>
-                  </label>
-
-                  <label class="field" for="agent-fear">
-                    <span>恐惧</span>
-                    <small>用自然语言描述 Agent 害怕什么</small>
-                    <textarea
-                      id="agent-fear"
-                      v-model="activeAgent.fear"
-                      rows="7"
-                      :disabled="editorLocked"
-                      placeholder="暂时可以留空"
-                      @input="markEdited"
-                    ></textarea>
-                  </label>
-
-                  <label class="field field--wide" for="agent-memory">
-                    <span>当前压缩记忆</span>
-                    <small>仅供人工编辑；本阶段不会自动更新</small>
-                    <textarea
-                      id="agent-memory"
-                      v-model="activeAgent.memory"
-                      rows="7"
-                      :disabled="editorLocked"
-                      placeholder="暂时可以留空"
-                      @input="markEdited"
+                      placeholder="手工填写这位 Agent 要发送的内容"
+                      @input="markMessageDraftEdited"
                     ></textarea>
                   </label>
                 </div>
+
+                <dl
+                  v-if="activeMessageDraft.usage"
+                  class="usage-metrics"
+                  aria-label="本次草稿生成 token 用量"
+                >
+                  <div>
+                    <dt>5 分钟缓存写入</dt>
+                    <dd>
+                      {{
+                        activeMessageDraft.usage
+                          .cache_creation_input_tokens
+                      }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>缓存读取</dt>
+                    <dd>
+                      {{
+                        activeMessageDraft.usage.cache_read_input_tokens
+                      }}
+                    </dd>
+                  </div>
+                  <div>
+                    <dt>未缓存输入</dt>
+                    <dd>{{ activeMessageDraft.usage.input_tokens }}</dd>
+                  </div>
+                  <div>
+                    <dt>输出</dt>
+                    <dd>{{ activeMessageDraft.usage.output_tokens }}</dd>
+                  </div>
+                </dl>
+
+                <div class="message-actions">
+                  <p v-if="isDirty" class="message-hint">
+                    请先保存场景，再生成或确认发送。
+                  </p>
+                  <p
+                    v-else-if="messageErrors[activeAgent.id]"
+                    class="form-error message-error"
+                    role="alert"
+                  >
+                    {{ messageErrors[activeAgent.id] }}
+                  </p>
+                  <p v-else class="message-hint">
+                    只有确认后的消息才会进入双方个人时间线。
+                  </p>
+                  <div class="message-action-buttons">
+                    <button
+                      v-if="activeDraftHasContent"
+                      class="text-button discard-draft-button"
+                      type="button"
+                      :disabled="editorLocked"
+                      @click="discardActiveDraft"
+                    >
+                      放弃草稿
+                    </button>
+                    <button
+                      class="secondary-button message-generate-button"
+                      type="button"
+                      :disabled="!canGenerateMessageDraft"
+                      @click="generateDraft"
+                    >
+                      {{
+                        generatingAgentId === activeAgent.id
+                          ? "生成中…"
+                          : activeDraftHasContent
+                            ? "重新生成"
+                            : "生成草稿"
+                      }}
+                    </button>
+                    <button
+                      class="primary-button message-send-button"
+                      type="button"
+                      :disabled="!canSendMessage"
+                      @click="confirmMessage"
+                    >
+                      {{
+                        sendingAgentId === activeAgent.id
+                          ? "发送中…"
+                          : "确认发送"
+                      }}
+                    </button>
+                  </div>
+                </div>
+              </footer>
+            </section>
+
+            <details class="secondary-panel role-panel">
+              <summary>
+                <span>
+                  <strong>角色设定</strong>
+                  <small>显示名、角色提示词、欲望、恐惧与记忆</small>
+                </span>
+              </summary>
+              <div class="secondary-panel-body field-grid">
+                <label class="field field--wide" for="agent-name">
+                  <span>显示名</span>
+                  <small>可编辑；固定 ID 不会随名称改变</small>
+                  <input
+                    id="agent-name"
+                    v-model="activeAgent.name"
+                    type="text"
+                    autocomplete="off"
+                    required
+                    :disabled="editorLocked"
+                    @input="markEdited"
+                  />
+                </label>
+
+                <label
+                  class="field field--wide system-prompt-field"
+                  for="agent-system-prompt"
+                >
+                  <span>最终系统提示词</span>
+                  <small>
+                    权威角色提示；保存值会逐字成为 Anthropic 请求中唯一的
+                    system 文本
+                  </small>
+                  <textarea
+                    id="agent-system-prompt"
+                    v-model="activeAgent.system_prompt"
+                    rows="15"
+                    :disabled="editorLocked"
+                    required
+                    @input="markEdited"
+                  ></textarea>
+                </label>
+
+                <label class="field field--wide" for="agent-persona">
+                  <span>人设</span>
+                  <small>身份、经历与相对稳定的性格描述</small>
+                  <textarea
+                    id="agent-persona"
+                    v-model="activeAgent.persona"
+                    rows="5"
+                    :disabled="editorLocked"
+                    placeholder="暂时可以留空"
+                    @input="markEdited"
+                  ></textarea>
+                </label>
+
+                <label class="field" for="agent-desire">
+                  <span>欲望</span>
+                  <small>用自然语言描述 Agent 想要什么</small>
+                  <textarea
+                    id="agent-desire"
+                    v-model="activeAgent.desire"
+                    rows="7"
+                    :disabled="editorLocked"
+                    placeholder="暂时可以留空"
+                    @input="markEdited"
+                  ></textarea>
+                </label>
+
+                <label class="field" for="agent-fear">
+                  <span>恐惧</span>
+                  <small>用自然语言描述 Agent 害怕什么</small>
+                  <textarea
+                    id="agent-fear"
+                    v-model="activeAgent.fear"
+                    rows="7"
+                    :disabled="editorLocked"
+                    placeholder="暂时可以留空"
+                    @input="markEdited"
+                  ></textarea>
+                </label>
+
+                <label class="field field--wide" for="agent-memory">
+                  <span>当前压缩记忆</span>
+                  <small>仅供人工编辑；本阶段不会自动更新</small>
+                  <textarea
+                    id="agent-memory"
+                    v-model="activeAgent.memory"
+                    rows="7"
+                    :disabled="editorLocked"
+                    placeholder="暂时可以留空"
+                    @input="markEdited"
+                  ></textarea>
+                </label>
+
                 <button
                   class="secondary-button recompose-button"
                   type="button"
@@ -1006,246 +1264,61 @@ onBeforeUnmount(() => {
                       : "从槽位重新拼接"
                   }}
                 </button>
-              </details>
-            </div>
-
-            <section
-              class="message-card"
-              aria-labelledby="message-draft-title"
-            >
-              <div class="message-card-heading">
-                <div>
-                  <p class="eyebrow">ONE-STEP TURN</p>
-                  <h3 id="message-draft-title">消息草稿</h3>
-                </div>
-                <p>
-                  发送者
-                  <strong>Agent {{ activeAgent.id }}</strong>
-                </p>
               </div>
+            </details>
 
-              <div class="message-fields">
-                <label class="message-recipient" for="message-recipient">
-                  <span>接收者</span>
-                  <select
-                    id="message-recipient"
-                    v-model="activeMessageDraft.recipientId"
+            <details class="secondary-panel observability-card">
+              <summary>
+                <span>
+                  <strong>JSON 请求预览</strong>
+                  <small>检查下一次模型调用的完整载荷</small>
+                </span>
+              </summary>
+              <div class="secondary-panel-body">
+                <div class="preview-actions">
+                  <button
+                    class="secondary-button preview-button"
+                    type="button"
                     :disabled="editorLocked"
-                    @change="markMessageDraftEdited"
+                    @click="loadRequestPreview"
                   >
-                    <option value="">请选择接收者</option>
-                    <option
-                      v-for="agentId in recipientOptions"
-                      :key="agentId"
-                      :value="agentId"
-                    >
-                      Agent {{ agentId }} ·
-                      {{
-                        currentScene.agents.find(
-                          (agent) => agent.id === agentId,
-                        )?.name
-                      }}
-                    </option>
-                  </select>
-                </label>
-
-                <label class="message-content" for="message-content">
-                  <span>正文</span>
-                  <textarea
-                    id="message-content"
-                    v-model="activeMessageDraft.content"
-                    rows="4"
-                    :disabled="editorLocked"
-                    placeholder="手工填写这位 Agent 要发送的内容"
-                    @input="markMessageDraftEdited"
-                  ></textarea>
-                </label>
-              </div>
-
-              <dl
-                v-if="activeMessageDraft.usage"
-                class="usage-metrics"
-                aria-label="本次草稿生成 token 用量"
-              >
-                <div>
-                  <dt>5 分钟缓存写入</dt>
-                  <dd>
                     {{
-                      activeMessageDraft.usage
-                        .cache_creation_input_tokens
+                      previewingAgentId === activeAgent.id
+                        ? "加载中…"
+                        : requestPreviews[activeAgent.id]
+                          ? "刷新预览"
+                          : "加载预览"
                     }}
-                  </dd>
+                  </button>
                 </div>
-                <div>
-                  <dt>缓存读取</dt>
-                  <dd>
-                    {{
-                      activeMessageDraft.usage.cache_read_input_tokens
-                    }}
-                  </dd>
-                </div>
-                <div>
-                  <dt>未缓存输入</dt>
-                  <dd>{{ activeMessageDraft.usage.input_tokens }}</dd>
-                </div>
-                <div>
-                  <dt>输出</dt>
-                  <dd>{{ activeMessageDraft.usage.output_tokens }}</dd>
-                </div>
-              </dl>
-
-              <div class="message-actions">
-                <p v-if="isDirty" class="message-hint">
-                  请先保存场景，再生成或确认发送。
+                <p v-if="isDirty" class="stale-preview-notice">
+                  场景有未保存修改；下一次请求预览基于已保存版本，当前显示为旧版本。
+                  请先保存再刷新。
                 </p>
                 <p
-                  v-else-if="messageErrors[activeAgent.id]"
-                  class="form-error message-error"
+                  v-if="previewErrors[activeAgent.id]"
+                  class="form-error"
                   role="alert"
                 >
-                  {{ messageErrors[activeAgent.id] }}
+                  {{ previewErrors[activeAgent.id] }}
                 </p>
-                <p v-else class="message-hint">
-                  只有确认后的消息才会进入双方个人时间线。
-                </p>
-                <div class="message-action-buttons">
-                  <button
-                    v-if="activeDraftHasContent"
-                    class="text-button discard-draft-button"
-                    type="button"
-                    :disabled="editorLocked"
-                    @click="discardActiveDraft"
+                <div class="request-preview">
+                  <p
+                    v-if="requestPreviews[activeAgent.id] === null"
+                    class="request-empty"
                   >
-                    放弃草稿
-                  </button>
-                  <button
-                    class="secondary-button message-generate-button"
-                    type="button"
-                    :disabled="!canGenerateMessageDraft"
-                    @click="generateDraft"
-                  >
-                    {{
-                      generatingAgentId === activeAgent.id
-                        ? "生成中…"
-                        : activeDraftHasContent
-                          ? "重新生成"
-                          : "生成草稿"
-                    }}
-                  </button>
-                  <button
-                    class="primary-button message-send-button"
-                    type="button"
-                    :disabled="!canSendMessage"
-                    @click="confirmMessage"
-                  >
-                    {{
-                      sendingAgentId === activeAgent.id
-                        ? "发送中…"
-                        : "确认发送"
-                    }}
-                  </button>
+                    尚未加载已保存场景的下一次请求。
+                  </p>
+                  <pre v-else>{{
+                    prettyJson(requestPreviews[activeAgent.id])
+                  }}</pre>
                 </div>
-              </div>
-            </section>
-
-            <section
-              class="observability-card"
-              aria-labelledby="observability-title"
-            >
-              <div class="message-card-heading">
-                <div>
-                  <p class="eyebrow">MODEL REQUEST</p>
-                  <h3 id="observability-title">JSON 请求预览</h3>
-                </div>
-                <button
-                  class="secondary-button preview-button"
-                  type="button"
-                  :disabled="editorLocked"
-                  @click="loadRequestPreview"
-                >
-                  {{
-                    previewingAgentId === activeAgent.id
-                      ? "加载中…"
-                      : requestPreviews[activeAgent.id]
-                        ? "刷新预览"
-                        : "加载预览"
-                  }}
-                </button>
-              </div>
-              <p v-if="isDirty" class="stale-preview-notice">
-                场景有未保存修改；下一次请求预览基于已保存版本，当前显示为旧版本。
-                请先保存再刷新。
-              </p>
-              <p
-                v-if="previewErrors[activeAgent.id]"
-                class="form-error"
-                role="alert"
-              >
-                {{ previewErrors[activeAgent.id] }}
-              </p>
-
-              <div class="request-preview">
-                <p
-                  v-if="requestPreviews[activeAgent.id] === null"
-                  class="request-empty"
-                >
-                  尚未加载已保存场景的下一次请求。
+                <p class="observability-note">
+                  此处展示传给 Anthropic Messages API 的完整载荷，不含 API
+                  Key、Base URL 或第三方响应。
                 </p>
-                <pre v-else>{{
-                  prettyJson(requestPreviews[activeAgent.id])
-                }}</pre>
               </div>
-              <p class="observability-note">
-                此处展示传给 Anthropic Messages API 的完整载荷，不含 API
-                Key、Base URL 或第三方响应。
-              </p>
-            </section>
-
-            <section class="timeline-card" aria-labelledby="timeline-title">
-              <div class="timeline-heading">
-                <p class="eyebrow">TIMELINE</p>
-                <h3 id="timeline-title">个人时间线</h3>
-                <small>按确认顺序排列，仅当前 Agent 可见的记录</small>
-              </div>
-              <p
-                v-if="activeAgent.timeline.length === 0"
-                class="timeline-empty"
-              >
-                时间线为空
-              </p>
-              <ol v-else class="timeline-list">
-                <li
-                  v-for="record in activeAgent.timeline"
-                  :key="`${record.message_id}-${record.direction}`"
-                >
-                  <div class="timeline-record">
-                    <p>
-                      <span class="timeline-direction">
-                        {{
-                          record.direction === "sent"
-                            ? `发送给 ${record.counterpart_id}：`
-                            : `${record.counterpart_id}：`
-                        }}
-                      </span>
-                      <span>{{ record.content }}</span>
-                    </p>
-                    <button
-                      v-if="deletableMessageIds.has(record.message_id)"
-                      class="timeline-delete-button"
-                      type="button"
-                      :disabled="isDirty || editorLocked"
-                      @click="confirmDeleteMessage(record)"
-                    >
-                      {{
-                        deletingMessageId === record.message_id
-                          ? "删除中…"
-                          : "删除"
-                      }}
-                    </button>
-                  </div>
-                </li>
-              </ol>
-            </section>
+            </details>
           </div>
         </template>
       </section>
