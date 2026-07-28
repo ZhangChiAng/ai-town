@@ -38,6 +38,10 @@ class TestClient:
         """Send a PUT request."""
         return self._request("PUT", path, json=json)
 
+    def delete(self, path: str) -> httpx.Response:
+        """Send a DELETE request."""
+        return self._request("DELETE", path)
+
     def _request(
         self,
         method: str,

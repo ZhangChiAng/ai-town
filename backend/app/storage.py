@@ -139,7 +139,7 @@ class SceneStorage:
 
         try:
             raw_scene = json.loads(contents)
-            scene = Scene.model_validate(_upgrade_v1_scene(raw_scene))
+            scene = Scene.model_validate(_upgrade_scene(raw_scene))
         except (json.JSONDecodeError, TypeError, ValidationError) as error:
             raise SceneReadError(
                 f"Scene file '{path.name}' is invalid or corrupted."
@@ -205,9 +205,11 @@ class SceneStorage:
                     temporary_path.unlink(missing_ok=True)
 
 
-def _upgrade_v1_scene(raw_scene: object) -> object:
-    """Return an in-memory v2 representation of a valid-looking v1 scene."""
-    if not isinstance(raw_scene, dict) or raw_scene.get("schema_version") != 1:
+def _upgrade_scene(raw_scene: object) -> object:
+    """Return an in-memory v3 representation of a v1 or v2 scene."""
+    if not isinstance(raw_scene, dict) or raw_scene.get(
+        "schema_version"
+    ) not in (1, 2):
         return raw_scene
 
     upgraded = dict(raw_scene)
@@ -221,12 +223,21 @@ def _upgrade_v1_scene(raw_scene: object) -> object:
             upgraded_agents.append(raw_agent)
             continue
         agent = dict(raw_agent)
-        agent["system_prompt"] = compose_system_prompt(
-            agent.get("persona", ""),
-            agent.get("desire", ""),
-            agent.get("fear", ""),
-            agent.get("memory", ""),
-        )
+        if upgraded["schema_version"] == 1:
+            agent["system_prompt"] = compose_system_prompt(
+                agent.get("persona", ""),
+                agent.get("desire", ""),
+                agent.get("fear", ""),
+                agent.get("memory", ""),
+            )
+        timeline = agent.get("timeline")
+        if isinstance(timeline, list):
+            agent["timeline"] = [
+                {"type": "message", **record}
+                if isinstance(record, dict) and "type" not in record
+                else record
+                for record in timeline
+            ]
         upgraded_agents.append(agent)
 
     upgraded["agents"] = upgraded_agents

@@ -11,6 +11,7 @@ import {
 import {
   composeSystemPrompt,
   createScene,
+  deleteInnerVoice,
   deleteMessage,
   generateMessageDraft,
   getModelRequestPreview,
@@ -18,16 +19,18 @@ import {
   listScenes,
   saveScene,
   sendMessage,
+  writeInnerVoice,
 } from "./api";
 import {
   AGENT_IDS,
   type AgentId,
+  type InnerVoiceTimelineRecord,
+  type MessageTimelineRecord,
   type MessageDraftUsage,
   type ModelRequest,
   type Scene,
   type SceneSummary,
   type SceneUpdate,
-  type TimelineRecord,
 } from "./types";
 
 type ListState = "loading" | "ready" | "error";
@@ -58,6 +61,10 @@ const messageDrafts = ref<Record<AgentId, MessageDraft>>(
 const messageErrors = ref<Record<AgentId, string>>(
   emptyMessageErrors(),
 );
+const innerVoiceDrafts = ref<Record<AgentId, string>>(emptyAgentStrings());
+const innerVoiceErrors = ref<Record<AgentId, string>>(emptyAgentStrings());
+const writingInnerVoiceAgentId = ref<AgentId | null>(null);
+const deletingInnerVoiceId = ref<string | null>(null);
 const sendingAgentId = ref<AgentId | null>(null);
 const deletingMessageId = ref<string | null>(null);
 const generatingAgentId = ref<AgentId | null>(null);
@@ -70,6 +77,11 @@ const previewingAgentId = ref<AgentId | null>(null);
 const timelineScroller = ref<HTMLElement | null>(null);
 const isTimelinePinned = ref(true);
 const hasNewTimelineUpdate = ref(false);
+const isInnerVoiceDialogOpen = ref(false);
+const innerVoiceDialogAgentId = ref<AgentId | null>(null);
+const innerVoiceDialog = ref<HTMLElement | null>(null);
+const innerVoiceTextarea = ref<HTMLTextAreaElement | null>(null);
+const innerVoiceTrigger = ref<HTMLButtonElement | null>(null);
 
 let listRequestToken = 0;
 let summaryMutationVersion = 0;
@@ -100,6 +112,10 @@ function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
 }
 
 function emptyMessageErrors(): Record<AgentId, string> {
+  return { A: "", B: "", C: "" };
+}
+
+function emptyAgentStrings(): Record<AgentId, string> {
   return { A: "", B: "", C: "" };
 }
 
@@ -151,6 +167,12 @@ const activeAgent = computed(() =>
   ),
 );
 
+const innerVoiceDialogAgent = computed(() =>
+  currentScene.value?.agents.find(
+    (agent) => agent.id === innerVoiceDialogAgentId.value,
+  ),
+);
+
 const activeMessageDraft = computed(
   () => messageDrafts.value[activeAgentId.value],
 );
@@ -164,6 +186,12 @@ const hasMessageDrafts = computed(() =>
     const draft = messageDrafts.value[agentId];
     return draft.recipientId !== "" || draft.content !== "";
   }),
+);
+
+const hasInnerVoiceDrafts = computed(() =>
+  AGENT_IDS.some(
+    (agentId) => innerVoiceDrafts.value[agentId] !== "",
+  ),
 );
 
 const activeDraftHasContent = computed(() => {
@@ -180,10 +208,17 @@ const deletableMessageIds = computed(() => {
 
   const recordsByMessageId = new Map<
     string,
-    { agentId: AgentId; index: number; record: TimelineRecord }[]
+    {
+      agentId: AgentId;
+      index: number;
+      record: MessageTimelineRecord;
+    }[]
   >();
   for (const agent of scene.agents) {
     agent.timeline.forEach((record, index) => {
+      if (record.type !== "message") {
+        return;
+      }
       const matches = recordsByMessageId.get(record.message_id) ?? [];
       matches.push({ agentId: agent.id, index, record });
       recordsByMessageId.set(record.message_id, matches);
@@ -231,6 +266,8 @@ const editorLocked = computed(
     saveState.value === "saving" ||
     sendingAgentId.value !== null ||
     deletingMessageId.value !== null ||
+    writingInnerVoiceAgentId.value !== null ||
+    deletingInnerVoiceId.value !== null ||
     generatingAgentId.value !== null ||
     composingAgentId.value !== null ||
     previewingAgentId.value !== null ||
@@ -254,6 +291,15 @@ const canGenerateMessageDraft = computed(
     !editorLocked.value,
 );
 
+const canWriteInnerVoice = computed(
+  () =>
+    currentScene.value !== null &&
+    innerVoiceDialogAgentId.value !== null &&
+    !isDirty.value &&
+    !editorLocked.value &&
+    innerVoiceDrafts.value[innerVoiceDialogAgentId.value].trim() !== "",
+);
+
 const activeTimelineSnapshot = computed(() => ({
   identity: currentScene.value
     ? `${currentScene.value.id}:${activeAgentId.value}`
@@ -262,7 +308,9 @@ const activeTimelineSnapshot = computed(() => ({
     activeAgent.value?.timeline
       .map(
         (record) =>
-          `${record.message_id}:${record.direction}:${record.content}`,
+          record.type === "message"
+            ? `message:${record.message_id}:${record.direction}:${record.content}`
+            : `inner_voice:${record.inner_voice_id}:${record.content}`,
       )
       .join("\u0000") ?? "",
 }));
@@ -336,6 +384,8 @@ function installScene(
   if (!preserveMessageDrafts) {
     messageDrafts.value = emptyMessageDrafts();
     messageErrors.value = emptyMessageErrors();
+    innerVoiceDrafts.value = emptyAgentStrings();
+    innerVoiceErrors.value = emptyAgentStrings();
   }
   requestPreviews.value = emptyRequestPreviews();
   previewErrors.value = emptyMessageErrors();
@@ -356,11 +406,15 @@ function upsertSummary(scene: Scene): void {
 }
 
 function confirmDiscardChanges(): boolean {
-  if (!isDirty.value && !hasMessageDrafts.value) {
+  if (
+    !isDirty.value &&
+    !hasMessageDrafts.value &&
+    !hasInnerVoiceDrafts.value
+  ) {
     return true;
   }
   return window.confirm(
-    "当前场景有未保存的更改或未确认的消息草稿。确定要放弃吗？",
+    "当前场景有未保存的更改、消息草稿或内心声音草稿。确定要放弃吗？",
   );
 }
 
@@ -598,8 +652,102 @@ async function confirmMessage(): Promise<void> {
   }
 }
 
+async function submitInnerVoice(): Promise<void> {
+  const scene = currentScene.value;
+  const agentId = innerVoiceDialogAgentId.value;
+  if (agentId === null) {
+    return;
+  }
+  const content = innerVoiceDrafts.value[agentId].trim();
+  if (
+    scene === null ||
+    isDirty.value ||
+    editorLocked.value ||
+    content === ""
+  ) {
+    return;
+  }
+
+  writingInnerVoiceAgentId.value = agentId;
+  innerVoiceErrors.value[agentId] = "";
+  let didWrite = false;
+  try {
+    const updated = await writeInnerVoice(scene.id, agentId, content);
+    installScene(updated, agentId, true);
+    innerVoiceDrafts.value[agentId] = "";
+    didWrite = true;
+  } catch (error) {
+    innerVoiceErrors.value[agentId] = errorMessage(
+      error,
+      "内心的声音写入失败，请重试。",
+    );
+  } finally {
+    writingInnerVoiceAgentId.value = null;
+    if (didWrite) {
+      closeInnerVoiceDialog();
+    }
+  }
+}
+
+async function openInnerVoiceDialog(): Promise<void> {
+  if (
+    currentScene.value === null ||
+    isDirty.value ||
+    editorLocked.value
+  ) {
+    return;
+  }
+  innerVoiceDialogAgentId.value = activeAgentId.value;
+  isInnerVoiceDialogOpen.value = true;
+  document.body.classList.add("modal-open");
+  await nextTick();
+  innerVoiceTextarea.value?.focus();
+}
+
+function closeInnerVoiceDialog(): void {
+  if (
+    !isInnerVoiceDialogOpen.value ||
+    writingInnerVoiceAgentId.value !== null
+  ) {
+    return;
+  }
+  isInnerVoiceDialogOpen.value = false;
+  innerVoiceDialogAgentId.value = null;
+  document.body.classList.remove("modal-open");
+  void nextTick(() => innerVoiceTrigger.value?.focus());
+}
+
+function handleInnerVoiceDialogKeydown(event: KeyboardEvent): void {
+  if (event.key === "Escape") {
+    event.preventDefault();
+    closeInnerVoiceDialog();
+    return;
+  }
+  if (event.key !== "Tab" || innerVoiceDialog.value === null) {
+    return;
+  }
+
+  const focusableElements = Array.from(
+    innerVoiceDialog.value.querySelectorAll<HTMLElement>(
+      "button:not(:disabled), textarea:not(:disabled)",
+    ),
+  );
+  if (focusableElements.length === 0) {
+    return;
+  }
+  const first = focusableElements[0];
+  const last = focusableElements.at(-1);
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last?.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
 async function confirmDeleteMessage(
-  record: TimelineRecord,
+  record: MessageTimelineRecord,
 ): Promise<void> {
   const scene = currentScene.value;
   const viewingAgentId = activeAgentId.value;
@@ -647,6 +795,54 @@ async function confirmDeleteMessage(
     actionError.value = errorMessage(error, "消息删除失败，请重试。");
   } finally {
     deletingMessageId.value = null;
+  }
+}
+
+async function confirmDeleteInnerVoice(
+  record: InnerVoiceTimelineRecord,
+): Promise<void> {
+  const scene = currentScene.value;
+  const agentId = activeAgentId.value;
+  const isTimelineTop =
+    activeAgent.value?.timeline.at(-1) === record;
+  if (
+    scene === null ||
+    isDirty.value ||
+    editorLocked.value ||
+    !isTimelineTop
+  ) {
+    return;
+  }
+  if (
+    !window.confirm(
+      [
+        "确定永久删除这条内心的声音吗？",
+        "",
+        record.content,
+        "",
+        "删除不可撤销，且仅允许删除时间线末条记录。",
+      ].join("\n"),
+    )
+  ) {
+    return;
+  }
+
+  deletingInnerVoiceId.value = record.inner_voice_id;
+  actionError.value = "";
+  try {
+    const updated = await deleteInnerVoice(
+      scene.id,
+      agentId,
+      record.inner_voice_id,
+    );
+    installScene(updated, agentId, true);
+  } catch (error) {
+    actionError.value = errorMessage(
+      error,
+      "内心的声音删除失败，请重试。",
+    );
+  } finally {
+    deletingInnerVoiceId.value = null;
   }
 }
 
@@ -721,7 +917,11 @@ function prettyJson(value: unknown): string {
 }
 
 function handleBeforeUnload(event: BeforeUnloadEvent): void {
-  if (!isDirty.value && !hasMessageDrafts.value) {
+  if (
+    !isDirty.value &&
+    !hasMessageDrafts.value &&
+    !hasInnerVoiceDrafts.value
+  ) {
     return;
   }
   event.preventDefault();
@@ -735,6 +935,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener("beforeunload", handleBeforeUnload);
+  document.body.classList.remove("modal-open");
 });
 </script>
 
@@ -971,11 +1172,32 @@ onBeforeUnmount(() => {
                   <h2 id="timeline-title">
                     {{ activeAgent.name || "未命名 Agent" }}
                   </h2>
-                  <p>个人时间线 · 仅包含这位 Agent 已确认的收发消息</p>
+                  <p>私人时间线 · 仅这位 Agent 可见的消息与内心声音</p>
                 </div>
-                <span class="chat-agent-id">
-                  固定身份 <strong>Agent {{ activeAgent.id }}</strong>
-                </span>
+                <div class="chat-heading-actions">
+                  <span class="chat-agent-id">
+                    固定身份 <strong>Agent {{ activeAgent.id }}</strong>
+                  </span>
+                  <button
+                    ref="innerVoiceTrigger"
+                    class="inner-voice-trigger"
+                    type="button"
+                    :disabled="isDirty || editorLocked"
+                    :aria-describedby="
+                      isDirty ? 'inner-voice-disabled-reason' : undefined
+                    "
+                    @click="openInnerVoiceDialog"
+                  >
+                    写入内心声音
+                  </button>
+                  <small
+                    v-if="isDirty"
+                    id="inner-voice-disabled-reason"
+                    class="inner-voice-disabled-reason"
+                  >
+                    请先保存场景
+                  </small>
+                </div>
               </header>
 
               <div
@@ -993,11 +1215,22 @@ onBeforeUnmount(() => {
                 <ol v-else class="chat-message-list">
                   <li
                     v-for="record in activeAgent.timeline"
-                    :key="`${record.message_id}-${record.direction}`"
+                    :key="
+                      record.type === 'message'
+                        ? `message-${record.message_id}-${record.direction}`
+                        : `inner-voice-${record.inner_voice_id}`
+                    "
                     class="chat-message"
-                    :class="`chat-message--${record.direction}`"
+                    :class="
+                      record.type === 'message'
+                        ? `chat-message--${record.direction}`
+                        : 'chat-message--inner-voice'
+                    "
                   >
-                    <article class="chat-bubble">
+                    <article
+                      v-if="record.type === 'message'"
+                      class="chat-bubble"
+                    >
                       <p class="chat-message-meta">
                         {{
                           record.direction === "sent"
@@ -1019,6 +1252,27 @@ onBeforeUnmount(() => {
                       >
                         {{
                           deletingMessageId === record.message_id
+                            ? "删除中…"
+                            : "删除"
+                        }}
+                      </button>
+                    </article>
+                    <article v-else class="chat-bubble inner-voice-bubble">
+                      <p class="inner-voice-label">内心的声音</p>
+                      <p class="chat-message-content">
+                        {{ record.content }}
+                      </p>
+                      <button
+                        v-if="
+                          activeAgent.timeline.at(-1) === record
+                        "
+                        class="timeline-delete-button"
+                        type="button"
+                        :disabled="isDirty || editorLocked"
+                        @click="confirmDeleteInnerVoice(record)"
+                      >
+                        {{
+                          deletingInnerVoiceId === record.inner_voice_id
                             ? "删除中…"
                             : "删除"
                         }}
@@ -1323,5 +1577,88 @@ onBeforeUnmount(() => {
         </template>
       </section>
     </main>
+
+    <div
+      v-if="isInnerVoiceDialogOpen && innerVoiceDialogAgent"
+      class="modal-backdrop"
+      @mousedown.self="closeInnerVoiceDialog"
+    >
+      <section
+        ref="innerVoiceDialog"
+        class="inner-voice-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="inner-voice-dialog-title"
+        aria-describedby="inner-voice-dialog-description"
+        @keydown="handleInnerVoiceDialogKeydown"
+      >
+        <header class="inner-voice-dialog-heading">
+          <div>
+            <p class="eyebrow">
+              AGENT {{ innerVoiceDialogAgent.id }} · 私人写入
+            </p>
+            <h2 id="inner-voice-dialog-title">写入内心声音</h2>
+          </div>
+          <button
+            class="modal-close-button"
+            type="button"
+            aria-label="关闭内心声音弹窗"
+            :disabled="writingInnerVoiceAgentId !== null"
+            @click="closeInnerVoiceDialog"
+          >
+            ×
+          </button>
+        </header>
+
+        <p id="inner-voice-dialog-description" class="inner-voice-target">
+          写入目标：<strong>{{ innerVoiceDialogAgent.name }}</strong>
+          <span>Agent {{ innerVoiceDialogAgent.id }}</span>
+        </p>
+
+        <form @submit.prevent="submitInnerVoice">
+          <label for="inner-voice-content">内容</label>
+          <textarea
+            id="inner-voice-content"
+            ref="innerVoiceTextarea"
+            v-model="innerVoiceDrafts[innerVoiceDialogAgent.id]"
+            rows="5"
+            :disabled="writingInnerVoiceAgentId !== null"
+            placeholder="例如：今天，B 告诉你他和 C 分手了，问问怎么回事吧"
+            @input="innerVoiceErrors[innerVoiceDialogAgent.id] = ''"
+          ></textarea>
+          <p class="inner-voice-privacy">
+            仅写入这位 Agent 的私人时间线；不会触发模型推理，也不会自动生成消息。
+          </p>
+          <p
+            v-if="innerVoiceErrors[innerVoiceDialogAgent.id]"
+            class="form-error"
+            role="alert"
+          >
+            {{ innerVoiceErrors[innerVoiceDialogAgent.id] }}
+          </p>
+          <div class="inner-voice-dialog-actions">
+            <button
+              class="secondary-button"
+              type="button"
+              :disabled="writingInnerVoiceAgentId !== null"
+              @click="closeInnerVoiceDialog"
+            >
+              取消
+            </button>
+            <button
+              class="primary-button"
+              type="submit"
+              :disabled="!canWriteInnerVoice"
+            >
+              {{
+                writingInnerVoiceAgentId === innerVoiceDialogAgent.id
+                  ? "写入中…"
+                  : "写入时间线"
+              }}
+            </button>
+          </div>
+        </form>
+      </section>
+    </div>
   </div>
 </template>

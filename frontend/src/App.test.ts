@@ -33,7 +33,7 @@ function makeScene(
   name = "雨夜港口",
 ): Scene {
   return {
-    schema_version: 2,
+    schema_version: 3,
     id,
     name,
     agents: [
@@ -280,6 +280,7 @@ describe("App", () => {
     const confirmed = makeScene();
     confirmed.agents[0].timeline = [
       {
+        type: "message",
         message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         direction: "sent",
         counterpart_id: "B",
@@ -288,6 +289,7 @@ describe("App", () => {
     ];
     confirmed.agents[1].timeline = [
       {
+        type: "message",
         message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         direction: "received",
         counterpart_id: "A",
@@ -347,12 +349,14 @@ describe("App", () => {
     const scene = makeScene();
     scene.agents[0].timeline = [
       {
+        type: "message",
         message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         direction: "received",
         counterpart_id: "B",
         content: "码头见。",
       },
       {
+        type: "message",
         message_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
         direction: "sent",
         counterpart_id: "C",
@@ -388,12 +392,18 @@ describe("App", () => {
     expect(container.querySelectorAll(".chat-message--sent")).toHaveLength(1);
     expectText("北辰 · Agent B");
     expectText("发给 迟夏 · Agent C");
+    expect(container.querySelector(".inner-voice-composer")).toBeNull();
+    expect(container.querySelector(".inner-voice-dialog")).toBeNull();
+    expect(findButton("写入内心声音")).toBeTruthy();
+    expect(container.querySelector(".agent-tabs")).toBeTruthy();
+    expect(container.querySelectorAll(".agent-tab")).toHaveLength(3);
   });
 
   it("follows new timeline records only while the reader is near the bottom", async () => {
     const scene = makeScene();
     scene.agents[1].timeline = [
       {
+        type: "message",
         message_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
         direction: "received",
         counterpart_id: "A",
@@ -402,12 +412,14 @@ describe("App", () => {
     ];
     const firstUpdate = cloneSceneForTest(scene);
     firstUpdate.agents[1].timeline.push({
+      type: "message",
       message_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       direction: "sent",
       counterpart_id: "C",
       content: "上滚时收到的更新",
     });
     firstUpdate.agents[2].timeline.push({
+      type: "message",
       message_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
       direction: "received",
       counterpart_id: "B",
@@ -415,12 +427,14 @@ describe("App", () => {
     });
     const secondUpdate = cloneSceneForTest(firstUpdate);
     secondUpdate.agents[1].timeline.push({
+      type: "message",
       message_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
       direction: "sent",
       counterpart_id: "C",
       content: "贴底时收到的更新",
     });
     secondUpdate.agents[2].timeline.push({
+      type: "message",
       message_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
       direction: "received",
       counterpart_id: "B",
@@ -748,6 +762,176 @@ describe("App", () => {
     expectValue("#message-content", "B 的草稿");
   });
 
+  it("keeps separate inner voice drafts and clears only a successful write", async () => {
+    const scene = makeScene();
+    const written = cloneSceneForTest(scene);
+    written.agents[0].timeline.push({
+      type: "inner_voice",
+      inner_voice_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      content: "问问 B 怎么回事",
+    });
+    let requestBody: unknown;
+    const fetchMock = stubFetch({
+      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
+      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
+      [`POST /api/scenes/${scene.id}/agents/A/inner-voices`]: (options) => {
+        requestBody = JSON.parse(String(options!.body));
+        return jsonResponse(written, 201);
+      },
+    });
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    expect(container.querySelector(".inner-voice-dialog")).toBeNull();
+
+    findButton("写入内心声音").click();
+    await nextTick();
+    await setFieldValue("#inner-voice-content", "  问问 B 怎么回事  ");
+    findButton("取消").click();
+    await nextTick();
+    expect(container.querySelector(".inner-voice-dialog")).toBeNull();
+
+    findButton("Agent B").click();
+    await nextTick();
+    findButton("写入内心声音").click();
+    await nextTick();
+    expectValue("#inner-voice-content", "");
+    await setFieldValue("#inner-voice-content", "B 的未写入内容");
+    findButton("取消").click();
+    await nextTick();
+
+    findButton("Agent A").click();
+    await nextTick();
+    findButton("写入内心声音").click();
+    await nextTick();
+    expectValue("#inner-voice-content", "  问问 B 怎么回事  ");
+    findButton("写入时间线").click();
+    await flushAsyncUpdates();
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `/api/scenes/${scene.id}/agents/A/inner-voices`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: "问问 B 怎么回事" }),
+      },
+    );
+    expect(requestBody).toEqual({ content: "问问 B 怎么回事" });
+    expect(container.querySelector(".inner-voice-dialog")).toBeNull();
+    expectText("内心的声音");
+    expectText("问问 B 怎么回事");
+
+    findButton("Agent B").click();
+    await nextTick();
+    findButton("写入内心声音").click();
+    await nextTick();
+    expectValue("#inner-voice-content", "B 的未写入内容");
+    expectNoText("问问 B 怎么回事");
+  });
+
+  it("keeps an inner voice draft on failure and locks writes while dirty", async () => {
+    const scene = makeScene();
+    const fetchMock = stubFetch({
+      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
+      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
+      [`POST /api/scenes/${scene.id}/agents/A/inner-voices`]: jsonResponse(
+        { detail: "Could not save inner voice" },
+        500,
+      ),
+    });
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+    await setFieldValue("#agent-persona", "尚未保存的人设");
+
+    expectButtonDisabled("写入内心声音");
+    expectText("请先保存场景");
+    expect(container.querySelector(".inner-voice-dialog")).toBeNull();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    await setFieldValue("#agent-persona", scene.agents[0].persona);
+    expectButtonEnabled("写入内心声音");
+    findButton("写入内心声音").click();
+    await nextTick();
+    await setFieldValue("#inner-voice-content", "不要丢掉这段内容");
+    expectButtonEnabled("写入时间线");
+    findButton("写入时间线").click();
+    await flushAsyncUpdates();
+
+    expect(container.querySelector(".inner-voice-dialog")).not.toBeNull();
+    expectValue("#inner-voice-content", "不要丢掉这段内容");
+    expectText("Could not save inner voice");
+  });
+
+  it("closes the inner voice dialog with Escape and restores trigger focus", async () => {
+    const scene = makeScene();
+    stubFetch({
+      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
+      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
+    });
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+
+    const trigger = findButton("写入内心声音");
+    trigger.click();
+    await nextTick();
+    expect(document.activeElement?.id).toBe("inner-voice-content");
+
+    container
+      .querySelector(".inner-voice-dialog")
+      ?.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+      );
+    await nextTick();
+
+    expect(container.querySelector(".inner-voice-dialog")).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it("renders and confirms deletion only for a top inner voice", async () => {
+    const scene = makeScene();
+    scene.agents[0].timeline.push({
+      type: "inner_voice",
+      inner_voice_id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      content: "这是没有虚构发送者的提示",
+    });
+    const deleted = cloneSceneForTest(scene);
+    deleted.agents[0].timeline = [];
+    const confirmMock = vi.fn().mockReturnValue(true);
+    vi.stubGlobal("confirm", confirmMock);
+    const fetchMock = stubFetch({
+      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
+      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
+      [`DELETE /api/scenes/${scene.id}/agents/A/inner-voices/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee`]:
+        jsonResponse(deleted),
+    });
+
+    mountApp();
+    await flushAsyncUpdates();
+    await openFirstScene();
+
+    expect(container.querySelectorAll(".chat-message--inner-voice")).toHaveLength(
+      1,
+    );
+    expectText("这是没有虚构发送者的提示");
+    expectNoText("发给");
+    findButton("删除").click();
+    await flushAsyncUpdates();
+
+    expect(confirmMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `/api/scenes/${scene.id}/agents/A/inner-voices/eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee`,
+      { method: "DELETE" },
+    );
+    expectNoText("这是没有虚构发送者的提示");
+  });
+
   it("asks before switching away from dirty scene content", async () => {
     const first = makeScene(FIRST_ID, "第一个场景");
     const second = makeScene(SECOND_ID, "第二个场景");
@@ -921,6 +1105,22 @@ describe("App", () => {
     const cleanEvent = new Event("beforeunload", { cancelable: true });
     window.dispatchEvent(cleanEvent);
     expect(cleanEvent.defaultPrevented).toBe(false);
+
+    findButton("写入内心声音").click();
+    await nextTick();
+    await setFieldValue("#inner-voice-content", "尚未写入的内心声音");
+    findButton("取消").click();
+    await nextTick();
+    const innerVoiceEvent = new Event("beforeunload", {
+      cancelable: true,
+    });
+    window.dispatchEvent(innerVoiceEvent);
+    expect(innerVoiceEvent.defaultPrevented).toBe(true);
+    findButton("写入内心声音").click();
+    await nextTick();
+    await setFieldValue("#inner-voice-content", "");
+    findButton("取消").click();
+    await nextTick();
 
     await setFieldValue("#message-content", "关闭前的草稿");
     const draftEvent = new Event("beforeunload", { cancelable: true });

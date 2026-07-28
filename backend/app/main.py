@@ -19,8 +19,11 @@ from app.models import (
     AgentId,
     ComposeSystemPromptRequest,
     ComposeSystemPromptResponse,
+    CreateInnerVoiceRequest,
     CreateMessageRequest,
     CreateSceneRequest,
+    InnerVoiceDeletionConflictError,
+    InnerVoiceNotFoundError,
     MessageDeletionConflictError,
     MessageDraftResponse,
     MessageNotFoundError,
@@ -28,9 +31,11 @@ from app.models import (
     Scene,
     SceneSummary,
     UpdateSceneRequest,
+    add_inner_voice,
     add_message,
     compose_system_prompt,
     create_scene,
+    delete_inner_voice,
     delete_message,
     update_scene,
 )
@@ -136,6 +141,24 @@ def create_app(
             content={"detail": str(error)},
         )
 
+    @application.exception_handler(InnerVoiceNotFoundError)
+    async def handle_inner_voice_not_found(
+        _request: Request, error: InnerVoiceNotFoundError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"detail": str(error)},
+        )
+
+    @application.exception_handler(InnerVoiceDeletionConflictError)
+    async def handle_inner_voice_deletion_conflict(
+        _request: Request, error: InnerVoiceDeletionConflictError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(error)},
+        )
+
     @application.exception_handler(DraftGenerationError)
     async def handle_draft_generation_error(
         _request: Request, error: DraftGenerationError
@@ -212,6 +235,37 @@ def create_app(
     ) -> Scene:
         current_scene = storage(request).get(scene_id)
         updated_scene = delete_message(current_scene, message_id)
+        storage(request).save(updated_scene)
+        return updated_scene
+
+    @application.post(
+        "/api/scenes/{scene_id}/agents/{agent_id}/inner-voices",
+        status_code=status.HTTP_201_CREATED,
+    )
+    async def post_inner_voice(
+        scene_id: UUID,
+        agent_id: AgentId,
+        payload: CreateInnerVoiceRequest,
+        request: Request,
+    ) -> Scene:
+        current_scene = storage(request).get(scene_id)
+        updated_scene = add_inner_voice(current_scene, agent_id, payload)
+        storage(request).save(updated_scene)
+        return updated_scene
+
+    @application.delete(
+        "/api/scenes/{scene_id}/agents/{agent_id}/inner-voices/{inner_voice_id}"
+    )
+    async def remove_inner_voice(
+        scene_id: UUID,
+        agent_id: AgentId,
+        inner_voice_id: UUID,
+        request: Request,
+    ) -> Scene:
+        current_scene = storage(request).get(scene_id)
+        updated_scene = delete_inner_voice(
+            current_scene, agent_id, inner_voice_id
+        )
         storage(request).save(updated_scene)
         return updated_scene
 

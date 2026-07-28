@@ -17,7 +17,11 @@ from tests.client import TestClient
 
 def _assert_all_timelines_empty(response_dict: dict[str, Any]) -> None:
     """Assert all three agents have empty timelines."""
-    assert [agent["timeline"] for agent in response_dict["agents"]] == [[], [], []]
+    assert [agent["timeline"] for agent in response_dict["agents"]] == [
+        [],
+        [],
+        [],
+    ]
 
 
 def _read_scene_file(scene_directory: Path, scene_id: str) -> dict[str, Any]:
@@ -92,7 +96,7 @@ def test_create_scene_writes_one_utf8_json_file(
     """Creating a scene persists a single UTF-8 JSON file on disk."""
     scene = create_scene(client, "  海边小镇  ")
 
-    assert scene["schema_version"] == 2
+    assert scene["schema_version"] == 3
     assert scene["name"] == "海边小镇"
     UUID(scene["id"])
     assert [
@@ -266,12 +270,14 @@ def test_message_appends_matching_records_only_to_participants(
     recipient_record = updated["agents"][2]["timeline"][0]
     UUID(sender_record["message_id"])
     assert sender_record == {
+        "type": "message",
         "message_id": recipient_record["message_id"],
         "direction": "sent",
         "counterpart_id": "C",
         "content": "灯塔下见。",
     }
     assert recipient_record == {
+        "type": "message",
         "message_id": sender_record["message_id"],
         "direction": "received",
         "counterpart_id": "A",
@@ -512,7 +518,7 @@ def test_v1_scene_is_upgraded_in_memory_and_written_only_after_save(
     client: TestClient,
     scene_directory: Path,
 ) -> None:
-    """Reading v1 is non-mutating; explicit save persists v2 unchanged."""
+    """Reading v1 is non-mutating; explicit save persists v3 unchanged."""
     scene_id = uuid4()
     timeline = [
         {
@@ -548,8 +554,10 @@ def test_v1_scene_is_upgraded_in_memory_and_written_only_after_save(
 
     assert opened.status_code == 200
     upgraded = opened.json()
-    assert upgraded["schema_version"] == 2
-    assert upgraded["agents"][0]["timeline"] == timeline
+    assert upgraded["schema_version"] == 3
+    assert upgraded["agents"][0]["timeline"][0]["type"] == "message"
+    upgraded_timeline = [{"type": "message", **timeline[0]}]
+    assert upgraded["agents"][0]["timeline"] == upgraded_timeline
     assert "人设 A" in upgraded["agents"][0]["system_prompt"]
     assert scene_path.read_bytes() == original
 
@@ -575,8 +583,8 @@ def test_v1_scene_is_upgraded_in_memory_and_written_only_after_save(
 
     assert saved.status_code == 200
     persisted = json.loads(scene_path.read_text(encoding="utf-8"))
-    assert persisted["schema_version"] == 2
-    assert persisted["agents"][0]["timeline"] == timeline
+    assert persisted["schema_version"] == 3
+    assert persisted["agents"][0]["timeline"] == upgraded_timeline
 
 
 def test_system_prompt_must_not_be_blank(client: TestClient) -> None:

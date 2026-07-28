@@ -1,6 +1,6 @@
 """Domain models and request/response schemas for scenes and agents."""
 
-from typing import Any, Literal, Self
+from typing import Annotated, Any, Literal, Self
 from uuid import UUID, uuid4
 
 from pydantic import (
@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 AGENT_IDS = ("A", "B", "C")
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = """\
 【规则】
@@ -77,15 +77,32 @@ def compose_system_prompt(
     )
 
 
-class TimelineRecord(ApiModel):
+class MessageTimelineRecord(ApiModel):
     """One confirmed message as seen from an individual agent."""
 
+    type: Literal["message"] = "message"
     message_id: UUID
     direction: MessageDirection
     counterpart_id: AgentId
     content: str
 
     _validate_content = field_validator("content")(_strip_non_blank_content)
+
+
+class InnerVoiceTimelineRecord(ApiModel):
+    """One user-authored private prompt in an individual agent's timeline."""
+
+    type: Literal["inner_voice"] = "inner_voice"
+    inner_voice_id: UUID
+    content: str
+
+    _validate_content = field_validator("content")(_strip_non_blank_content)
+
+
+TimelineRecord = Annotated[
+    MessageTimelineRecord | InnerVoiceTimelineRecord,
+    Field(discriminator="type"),
+]
 
 
 class Agent(ApiModel):
@@ -126,7 +143,7 @@ class AgentUpdate(ApiModel):
 class Scene(ApiModel):
     """A named scene containing exactly three agents (A, B, C)."""
 
-    schema_version: Literal[2] = SCHEMA_VERSION
+    schema_version: Literal[3] = SCHEMA_VERSION
     id: UUID
     name: str
     agents: list[Agent] = Field(min_length=3, max_length=3)
@@ -191,6 +208,14 @@ class CreateMessageRequest(ApiModel):
         return self
 
 
+class CreateInnerVoiceRequest(ApiModel):
+    """Payload for appending a private inner voice to one Agent."""
+
+    content: str
+
+    _validate_content = field_validator("content")(_strip_non_blank_content)
+
+
 class MessageDraftUsage(ApiModel):
     """Anthropic token usage returned for one draft generation."""
 
@@ -240,6 +265,14 @@ class MessageDeletionConflictError(RuntimeError):
     """Raised when a message cannot be safely removed from both timelines."""
 
 
+class InnerVoiceNotFoundError(LookupError):
+    """Raised when an Agent timeline does not contain an inner voice."""
+
+
+class InnerVoiceDeletionConflictError(RuntimeError):
+    """Raised when an inner voice is not the Agent timeline's final record."""
+
+
 def create_scene(name: str) -> Scene:
     """Create a new scene with default agents.
 
@@ -280,7 +313,7 @@ def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
         timeline = list(agent.timeline)
         if agent.id == message.sender_id:
             timeline.append(
-                TimelineRecord(
+                MessageTimelineRecord(
                     message_id=message_id,
                     direction="sent",
                     counterpart_id=message.recipient_id,
@@ -289,7 +322,7 @@ def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
             )
         elif agent.id == message.recipient_id:
             timeline.append(
-                TimelineRecord(
+                MessageTimelineRecord(
                     message_id=message_id,
                     direction="received",
                     counterpart_id=message.sender_id,
@@ -299,6 +332,63 @@ def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
 
         agents.append(agent.model_copy(update={"timeline": timeline}))
 
+    return scene.model_copy(update={"agents": agents})
+
+
+def add_inner_voice(
+    scene: Scene,
+    agent_id: AgentId,
+    request: CreateInnerVoiceRequest,
+) -> Scene:
+    """Append a private inner voice only to the target Agent's timeline."""
+    agents = []
+    for agent in scene.agents:
+        if agent.id != agent_id:
+            agents.append(agent)
+            continue
+        timeline = [
+            *agent.timeline,
+            InnerVoiceTimelineRecord(
+                inner_voice_id=uuid4(),
+                content=request.content,
+            ),
+        ]
+        agents.append(agent.model_copy(update={"timeline": timeline}))
+    return scene.model_copy(update={"agents": agents})
+
+
+def delete_inner_voice(
+    scene: Scene,
+    agent_id: AgentId,
+    inner_voice_id: UUID,
+) -> Scene:
+    """Delete an inner voice only when it is the target timeline's top."""
+    agent = next(agent for agent in scene.agents if agent.id == agent_id)
+    matching_indexes = [
+        index
+        for index, record in enumerate(agent.timeline)
+        if (
+            record.type == "inner_voice"
+            and record.inner_voice_id == inner_voice_id
+        )
+    ]
+    if not matching_indexes:
+        raise InnerVoiceNotFoundError(
+            f"Inner voice '{inner_voice_id}' does not exist for Agent "
+            f"'{agent_id}'."
+        )
+    if matching_indexes[-1] != len(agent.timeline) - 1:
+        raise InnerVoiceDeletionConflictError(
+            f"Inner voice '{inner_voice_id}' is not last in Agent "
+            f"'{agent_id}' timeline."
+        )
+
+    agents = [
+        current.model_copy(update={"timeline": current.timeline[:-1]})
+        if current.id == agent_id
+        else current
+        for current in scene.agents
+    ]
     return scene.model_copy(update={"agents": agents})
 
 
@@ -321,7 +411,7 @@ def delete_message(scene: Scene, message_id: UUID) -> Scene:
         (agent, index, record)
         for agent in scene.agents
         for index, record in enumerate(agent.timeline)
-        if record.message_id == message_id
+        if record.type == "message" and record.message_id == message_id
     ]
     if not matches:
         raise MessageNotFoundError(

@@ -28,14 +28,6 @@ from tests.client import TestClient
 MODEL = "anthropic/claude-haiku-4.5"
 
 
-class DraftFixture(NamedTuple):
-    """Collapsed draft_client fixture values."""
-
-    client: TestClient
-    fake: "FakeAnthropic"
-    scene_directory: Path
-
-
 class FakeMessages:
     """Capture requests and return or raise a configured result."""
 
@@ -58,6 +50,14 @@ class FakeAnthropic:
     def __init__(self, result: Any) -> None:
         """Initialize the fake Messages API resource."""
         self.messages = FakeMessages(result)
+
+
+class DraftFixture(NamedTuple):
+    """Collapsed draft_client fixture values."""
+
+    client: TestClient
+    fake: FakeAnthropic
+    scene_directory: Path
 
 
 def model_response(

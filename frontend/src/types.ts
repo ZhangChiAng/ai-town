@@ -2,12 +2,23 @@ export const AGENT_IDS = ["A", "B", "C"] as const;
 
 export type AgentId = (typeof AGENT_IDS)[number];
 
-export interface TimelineRecord {
+export interface MessageTimelineRecord {
+  type: "message";
   message_id: string;
   direction: "sent" | "received";
   counterpart_id: AgentId;
   content: string;
 }
+
+export interface InnerVoiceTimelineRecord {
+  type: "inner_voice";
+  inner_voice_id: string;
+  content: string;
+}
+
+export type TimelineRecord =
+  | MessageTimelineRecord
+  | InnerVoiceTimelineRecord;
 
 export interface Agent {
   id: AgentId;
@@ -21,7 +32,7 @@ export interface Agent {
 }
 
 export interface Scene {
-  schema_version: 2;
+  schema_version: 3;
   id: string;
   name: string;
   agents: Agent[];

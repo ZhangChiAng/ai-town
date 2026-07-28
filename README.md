@@ -9,6 +9,10 @@
 系统不会自动推进、自动更新记忆或建立全局事件。产品假设与信息边界以
 [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md) 为准。
 
+用户也可以在生成草稿前，向当前选中的单个 Agent 写入一段“内心的声音”。
+它会持久化到该 Agent 的私人时间线，其他 Agent 不可见；写入不会自动调用
+模型，仍需用户点击“生成草稿”推进。
+
 ## 环境要求
 
 - Python `>=3.14,<3.15`
@@ -105,7 +109,8 @@ Messages API，最长等待 60 秒，SDK 自动重试已关闭。模型通过严
 - `system`：当前 Agent 已保存的 `system_prompt`，逐字作为唯一角色提示；
 - 当前 Agent 自己的已确认个人时间线，逐条映射为原生 Messages API 消息：
   收到的记录使用 `user` 角色和 `From {counterpart_id}: {content}`，发出的记录
-  使用 `assistant` 角色和 `To {counterpart_id}: {content}`。
+  使用 `assistant` 角色和 `To {counterpart_id}: {content}`；内心声音使用
+  `user` 角色和固定文本 `内心的声音：{content}`。
 
 每条时间线记录保持独立和原有顺序，连续同角色消息不会合并。空时间线产生空
 `messages`，不会追加运行时提示语。四个拼接槽位不会在 user context 中重复
@@ -122,6 +127,18 @@ Messages API，最长等待 60 秒，SDK 自动重试已关闭。模型通过严
 `message_id` 权威复核一发一收、参与者、正文和双方栈顶位置，再同步移除两条
 记录并原子保存，未参与的第三位 Agent 不受影响。消息不存在返回 `404`，配对
 异常或不在双方栈顶返回 `409`，失败不会改写场景。
+
+### 内心的声音
+
+时间线下方的独立输入区会把内容写入当前 Agent，正文首尾空白会被移除，空白
+内容会被拒绝。未写入的文本按 Agent 分别保留，切换 A/B/C 不会丢失；成功后
+只清空目标 Agent 的输入，失败时保留正文并显示错误。场景有未保存编辑时禁止
+写入，写入成功后也不会自动生成或发送消息。
+
+时间线以“内心的声音”标签单独展示该记录，不显示虚构发送者。只有当它是目标
+Agent 时间线的绝对末条时才显示删除入口，并在删除前二次确认；不存在返回
+`404`，存在但不在栈顶返回 `409`。位于某条双方消息之后的内心声音也会阻止
+越过它删除该消息。所有写入和删除都使用场景的原子保存。
 
 上游请求失败或返回无效工具结果时，接口返回不包含密钥及提供商响应正文的
 `502`，并保留现有草稿与 usage。成功生成会以 INFO 级别记录场景 ID、Agent
@@ -196,10 +213,15 @@ URL 或第三方响应。提示词和请求不会写入日志。
 替换；无法读取或结构损坏的 JSON 会明确报错，不会被忽略或覆盖。现有
 `data/*.md` 仍只是实验行为参考，不会被应用加载或修改。
 
-当前格式为 schema v2，Agent 新增非空 `system_prompt`。读取 schema v1 文件时，
-后端会在内存中用旧有四个槽位生成最终系统提示词并返回 v2 表示，不会因读取而
-改写文件。只有用户随后显式保存场景时，磁盘文件才升级为 v2；场景 ID 与个人
-时间线保持不变。
+当前格式为 schema v3。时间线记录是带明确 `type` 的两类记录：
+
+- `message`：保留共享 `message_id`、收发方向、对方 Agent 与正文；
+- `inner_voice`：使用独立 `inner_voice_id` 与正文，只存在于目标 Agent 时间线。
+
+读取 schema v1 文件时，后端会在内存中用旧有四个槽位生成最终系统提示词；
+读取 v1/v2 时，旧消息会在内存中补全 `type: "message"` 并统一返回 v3 表示。
+读取本身不会改写文件，只有后续显式写操作才会原子落盘为 v3；旧消息内容、
+顺序、场景 ID 和已有最终系统提示词保持不变。
 
 主要接口：
 
@@ -211,6 +233,8 @@ URL 或第三方响应。提示词和请求不会写入日志。
 - `PUT /api/scenes/{id}`
 - `POST /api/scenes/{id}/messages`
 - `DELETE /api/scenes/{id}/messages/{message_id}`
+- `POST /api/scenes/{id}/agents/{agent_id}/inner-voices`
+- `DELETE /api/scenes/{id}/agents/{agent_id}/inner-voices/{inner_voice_id}`
 - `POST /api/scenes/{id}/agents/{agent_id}/message-drafts`
 - `GET /api/scenes/{id}/agents/{agent_id}/model-request-preview`
 
