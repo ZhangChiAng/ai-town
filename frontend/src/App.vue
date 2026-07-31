@@ -30,7 +30,6 @@ import {
   type Layer,
   type LayerDraftResponse,
   type ModelOption,
-  type ModelRequest,
   type ModelRequestPreviewResponse,
   type Scene,
   type SceneSummary,
@@ -51,11 +50,6 @@ interface TimelineItem {
   status?: string;
   input?: string;
   callId?: string;
-}
-
-interface ReadableBlock {
-  label: string;
-  text: string;
 }
 
 const sceneSummaries = ref<SceneSummary[]>([]);
@@ -193,7 +187,6 @@ const canConfirm = computed(
     activeDraft.value !== null &&
     activeDraft.value.layer === activeStage.value &&
     activeDraft.value.content.trim() !== "" &&
-    sceneModelAvailable.value &&
     !isDirty.value &&
     !editorLocked.value,
 );
@@ -715,50 +708,6 @@ async function loadPreview(): Promise<void> {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function readableModelContext(request: ModelRequest): ReadableBlock[] {
-  const blocks: ReadableBlock[] = [];
-  if (typeof request.instructions === "string") {
-    blocks.push({ label: "instructions", text: request.instructions });
-  }
-  if (Array.isArray(request.system)) {
-    for (const block of request.system) {
-      if (isRecord(block) && typeof block.text === "string") {
-        blocks.push({ label: "system", text: block.text });
-      }
-    }
-  }
-  const messages = Array.isArray(request.messages)
-    ? request.messages
-    : Array.isArray(request.input)
-      ? request.input
-      : [];
-  if (messages.length === 0) {
-    return blocks;
-  }
-  for (const message of messages) {
-    if (
-      !isRecord(message) ||
-      typeof message.role !== "string" ||
-      !Array.isArray(message.content)
-    ) {
-      continue;
-    }
-    for (const block of message.content) {
-      if (isRecord(block) && typeof block.text === "string") {
-        blocks.push({
-          label: message.role,
-          text: block.text,
-        });
-      }
-    }
-  }
-  return blocks;
-}
-
 function prettyJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
@@ -828,7 +777,7 @@ onBeforeUnmount(() => {
                 :key="option.model"
                 :value="option.model"
               >
-                {{ option.protocol }} · {{ option.model }}
+                {{ option.model }}
               </option>
             </select>
             <button type="submit" :disabled="editorLocked">
@@ -978,7 +927,7 @@ onBeforeUnmount(() => {
                   :key="option.model"
                   :value="option.model"
                 >
-                  {{ option.protocol }} · {{ option.model }}
+                  {{ option.model }}
                 </option>
               </select>
               <button
@@ -1171,7 +1120,7 @@ onBeforeUnmount(() => {
                   {{ draftErrors[activeAgent.id] }}
                 </p>
                 <p v-else-if="!sceneModelAvailable" class="hint">
-                  场景模型未绑定或当前不可用，不能生成或确认草稿。
+                  场景模型未绑定或当前不可用，不能预览或生成新草稿；已有有效草稿仍可确认。
                 </p>
                 <p v-else-if="isDirty" class="hint">
                   请先保存设定，再生成或确认。
@@ -1425,12 +1374,10 @@ onBeforeUnmount(() => {
                         class="readable-context"
                       >
                         <article
-                          v-for="(block, index) in readableModelContext(
-                            selectedPreview.request,
-                          )"
-                          :key="`${block.label}:${index}`"
+                          v-for="(block, index) in selectedPreview.context"
+                          :key="`${block.role}:${index}`"
                         >
-                          <strong>{{ block.label }}</strong>
+                          <strong>{{ block.role }}</strong>
                           <pre>{{ block.text }}</pre>
                         </article>
                       </div>

@@ -1,4 +1,9 @@
-import { createApp, nextTick, type App as VueApp } from "vue";
+import {
+  createApp,
+  nextTick,
+  reactive,
+  type App as VueApp,
+} from "vue";
 import {
   afterEach,
   beforeEach,
@@ -12,6 +17,7 @@ import App from "./App.vue";
 import type {
   ExternalEvent,
   LayerDraftResponse,
+  ModelOption,
   ModelRequestPreviewResponse,
   Scene,
 } from "./types";
@@ -199,6 +205,10 @@ describe("App", () => {
   async function mountOpenedScene(
     scene: Scene,
     routes: Record<string, RouteHandler> = {},
+    availableModels: ModelOption[] = [
+      { model: MODEL },
+      { model: "gpt-test" },
+    ],
   ): Promise<ReturnType<typeof vi.fn>> {
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -208,12 +218,7 @@ describe("App", () => {
           return jsonResponse([{ id: scene.id, name: scene.name }]);
         }
         if (method === "GET" && path === "/api/model-options") {
-          return jsonResponse({
-            options: [
-              { protocol: "anthropic", model: MODEL },
-              { protocol: "responses", model: "gpt-test" },
-            ],
-          });
+          return jsonResponse({ options: availableModels });
         }
         if (method === "GET" && path === `/api/scenes/${scene.id}`) {
           return jsonResponse(scene);
@@ -250,10 +255,7 @@ describe("App", () => {
         }
         if (method === "GET" && path === "/api/model-options") {
           return jsonResponse({
-            options: [
-              { protocol: "anthropic", model: MODEL },
-              { protocol: "responses", model: "gpt-test" },
-            ],
+            options: [{ model: MODEL }, { model: "gpt-test" }],
           });
         }
         if (method === "POST" && path === "/api/scenes") {
@@ -284,6 +286,40 @@ describe("App", () => {
 
     expect(createBody).toEqual({ name: "新场景", model: "gpt-test" });
     expect(container.textContent).toContain("gpt-test");
+    expect([...model.options].map((option) => option.text)).toEqual([
+      MODEL,
+      "gpt-test",
+    ]);
+  });
+
+  it("rejects model options containing internal metadata", async () => {
+    const fetchMock = vi.fn(
+      async (input: RequestInfo | URL) => {
+        const path = String(input);
+        if (path === "/api/scenes") {
+          return jsonResponse([]);
+        }
+        if (path === "/api/model-options") {
+          return jsonResponse({
+            options: [{ model: MODEL, internal_transport: "hidden" }],
+          });
+        }
+        throw new Error(`Unexpected request: GET ${path}`);
+      },
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    app = createApp(App);
+    app.mount(container);
+    await flush();
+
+    const model = container.querySelector(
+      '[aria-label="新场景模型"]',
+    ) as HTMLSelectElement;
+    expect(model.options).toHaveLength(0);
+    expect(model.disabled).toBe(true);
+    expect(container.textContent).toContain(
+      "后端返回了无法识别的模型列表。",
+    );
   });
 
   it("binds an unbound scene once and then enables model operations", async () => {
@@ -417,6 +453,51 @@ describe("App", () => {
     expect(generationCount).toBe(2);
   });
 
+  it("confirms an existing draft after its model is removed", async () => {
+    const availableModels = reactive<ModelOption[]>([
+      { model: MODEL },
+      { model: "gpt-test" },
+    ]);
+    let confirmationBody: unknown;
+    await mountOpenedScene(
+      pendingScene(),
+      {
+        [`POST /api/scenes/${SCENE_ID}/agents/A/inner-drafts`]:
+          jsonResponse(innerDraft()),
+        [`POST /api/scenes/${SCENE_ID}/agents/A/inner-confirmations`]: (
+          init,
+        ) => {
+          confirmationBody = JSON.parse(String(init?.body));
+          return jsonResponse(halfRoundScene());
+        },
+      },
+      availableModels,
+    );
+    findButton(container, "生成内层草稿").click();
+    await flush();
+
+    availableModels.splice(
+      availableModels.findIndex((option) => option.model === MODEL),
+      1,
+    );
+    await nextTick();
+
+    expect(container.textContent).toContain(`${MODEL} 当前不可用`);
+    expect(findButton(container, "重新生成").disabled).toBe(true);
+    expect(findButton(container, "加载预览").disabled).toBe(true);
+    expect(findButton(container, "确认内层").disabled).toBe(false);
+    findButton(container, "确认内层").click();
+    await flush();
+
+    expect(confirmationBody).toEqual({
+      call_id: INNER_CALL_ID,
+      event_id: EVENT_ID,
+      content: "先观察风向。",
+      state_token: STATE_TOKEN,
+    });
+    expect(container.textContent).toContain("等待外层人格");
+  });
+
   it("creates, edits, and deletes only manual queued events", async () => {
     const scene = pendingScene();
     const agentEvent: ExternalEvent = {
@@ -494,24 +575,22 @@ describe("App", () => {
     const preview: ModelRequestPreviewResponse = {
       layer: "outer",
       event_id: EVENT_ID,
+      context: [
+        { role: "system", text: "OUTER A" },
+        { role: "user", text: "上一轮外层输入" },
+        { role: "assistant", text: "To B: 上一轮外层输出" },
+        {
+          role: "user",
+          text:
+            "外部事件：\n海面突然起雾。\n\n" +
+            "你内心有一个声音：\n先观察风向。\n别急着靠岸。",
+        },
+      ],
       request: {
-        model: "gpt-test",
-        instructions: "OUTER A",
-        input: [
-          {
-            role: "user",
-            content: [
-              {
-                type: "input_text",
-                text:
-                  "外部事件：\n海面突然起雾。\n\n" +
-                  "你内心有一个声音：\n先观察风向。\n别急着靠岸。",
-              },
-            ],
-          },
-        ],
-        max_output_tokens: 2048,
-        store: false,
+        opaque_adapter_envelope: {
+          nested_wire_value: "只应出现在原始 JSON",
+        },
+        engine_number: 7,
       },
     };
     await mountOpenedScene(scene, {
@@ -528,8 +607,16 @@ describe("App", () => {
     findButton(details, "加载预览").click();
     await flush();
 
-    expect(details.textContent).toContain("OUTER A");
-    expect(details.textContent).toContain("你内心有一个声音");
+    const readable = details.querySelector(
+      ".readable-context",
+    ) as HTMLElement;
+    expect(
+      [...readable.querySelectorAll("article")].map((article) => ({
+        role: article.querySelector("strong")?.textContent,
+        text: article.querySelector("pre")?.textContent,
+      })),
+    ).toEqual(preview.context);
+    expect(readable.textContent).not.toContain("只应出现在原始 JSON");
     findButton(details, "原始 JSON").click();
     await nextTick();
     expect(details.querySelector(".request-preview > pre")?.textContent).toBe(

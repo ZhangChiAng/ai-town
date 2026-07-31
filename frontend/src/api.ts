@@ -9,6 +9,7 @@ import type {
   ModelOption,
   ModelOptionsResponse,
   ModelReasoningBlock,
+  ModelRequestContextItem,
   ModelRequestPreviewResponse,
   OuterTurn,
   Scene,
@@ -73,9 +74,22 @@ function isReasoningBlock(value: unknown): value is ModelReasoningBlock {
 function isModelOption(value: unknown): value is ModelOption {
   return (
     isRecord(value) &&
-    (value.protocol === "anthropic" || value.protocol === "responses") &&
+    Object.keys(value).length === 1 &&
     typeof value.model === "string" &&
     value.model.trim() !== ""
+  );
+}
+
+function isModelRequestContextItem(
+  value: unknown,
+): value is ModelRequestContextItem {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 2 &&
+    (value.role === "system" ||
+      value.role === "user" ||
+      value.role === "assistant") &&
+    typeof value.text === "string"
   );
 }
 
@@ -197,6 +211,8 @@ function isPreview(
     isRecord(value) &&
     isLayer(value.layer) &&
     typeof value.event_id === "string" &&
+    Array.isArray(value.context) &&
+    value.context.every(isModelRequestContextItem) &&
     isRecord(value.request)
   );
 }

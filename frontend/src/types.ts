@@ -3,7 +3,6 @@ export const AGENT_IDS = ["A", "B", "C"] as const;
 export type AgentId = (typeof AGENT_IDS)[number];
 export type Layer = "inner" | "outer";
 export type EventKind = "manual" | "agent_message";
-export type ModelProtocol = "anthropic" | "responses";
 
 export interface TokenUsage {
   input_tokens: number;
@@ -18,7 +17,6 @@ export interface ModelReasoningBlock {
 }
 
 export interface ModelOption {
-  protocol: ModelProtocol;
   model: string;
 }
 
@@ -111,6 +109,11 @@ export interface SceneUpdate {
 
 export type ModelRequest = Record<string, unknown>;
 
+export interface ModelRequestContextItem {
+  role: "system" | "user" | "assistant";
+  text: string;
+}
+
 export interface LayerDraftResponse {
   layer: Layer;
   call_id: string;
@@ -132,5 +135,6 @@ export interface ConfirmLayerRequest {
 export interface ModelRequestPreviewResponse {
   layer: Layer;
   event_id: string;
+  context: ModelRequestContextItem[];
   request: ModelRequest;
 }
