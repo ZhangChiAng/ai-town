@@ -21,28 +21,56 @@
 
 ## 模型配置
 
-复制根目录的 [`.env.example`](.env.example) 为 `.env`：
+根目录的 `models.toml` 是必需的本地配置并已被 Git 忽略。先从提交的示例复制：
 
-```dotenv
-ANTHROPIC_BASE_URL="https://api.example.com/anthropic"
-ANTHROPIC_API_KEY="sk-anthropic-xxxxx"
-ANTHROPIC_MODEL="anthropic/claude-haiku-4.5"
+Linux Bash：
 
-RESPONSES_BASE_URL="https://api.example.com/v1"
-RESPONSES_API_KEY="sk-responses-xxxxx"
-RESPONSES_MODEL="gpt-5-mini"
+```bash
+cp models.example.toml models.toml
 ```
 
-- `ANTHROPIC_*` 配置 Anthropic Messages API 兼容端点和模型。
-- `RESPONSES_*` 配置 OpenAI Responses API 兼容端点和模型。
-- 两个 base URL 都会原样交给对应 Python SDK。
-- 新场景必须从这两个具体模型中显式选择一个；场景内的两层和三个 Agent
-  始终共用该绑定，绑定后不能更换。
-- 同名进程环境变量优先于 `.env`。
+Windows PowerShell：
 
-任一配置缺失、空白，base URL 不是有效 HTTP(S) URL，或模型名与协议冲突时，
-FastAPI 启动失败；错误只列变量名，不输出密钥或其他值。真实 `.env` 已被
-Git 忽略。
+```powershell
+Copy-Item models.example.toml models.toml
+```
+
+每个 `[[models]]` 严格包含四个字段：
+
+```toml
+[[models]]
+model = "anthropic/claude-haiku-4.5"
+protocol = "anthropic_messages"
+base_url = "https://api.example.com/anthropic"
+api_key_env = "AI_TOWN_ANTHROPIC_API_KEY"
+
+[[models]]
+model = "openai/gpt-5-mini"
+protocol = "openai_responses"
+base_url = "https://api.example.com/v1"
+api_key_env = "AI_TOWN_RESPONSES_API_KEY"
+```
+
+请把占位 URL 和模型名替换为兼容端点的实际值。`model` 大小写敏感且全局
+唯一；TOML 顺序就是界面顺序，可以配置任意数量模型，也可以让多个模型使用
+同一 protocol。当前正式内部 key 为 `anthropic_messages` 和
+`openai_responses`。protocol、端点和密钥不会出现在模型选择、scene 数据或
+`GET /api/model-options` 中。
+
+`api_key_env` 只引用环境变量名，真实 key 不得写进 `models.toml`。可直接设置
+进程环境变量，也可选择复制 [`.env.example`](.env.example) 为 `.env` 并填写：
+
+```dotenv
+AI_TOWN_ANTHROPIC_API_KEY=""
+AI_TOWN_RESPONSES_API_KEY=""
+```
+
+进程环境优先于 `.env`；`.env` 文件本身可选，但每个 `api_key_env` 引用的值
+必须存在且非空。旧的六变量配置方式不再读取，也没有兼容回退。
+
+空模型清单、重复 model、四个字段之外的未知字段、非法 URL、非法环境变量名、
+缺失密钥或未注册 protocol 都会使 FastAPI 启动失败。错误只报告位置和类别，
+不输出配置值或 secret。真实 `models.toml` 与 `.env` 均已被 Git 忽略。
 
 ## 安装与运行
 
@@ -130,18 +158,22 @@ input/output turns，以及上面的本轮输入。另一层 system prompt、另
 历史、其他 Agent 状态、回退元数据和未确认草稿都不会进入请求。
 
 “模型请求预览”可明确选择内层或外层，并展示可读上下文与同一份原始 JSON。
-外层没有对应已确认内层时，预览和生成都会返回 `409`。
+有序可读 `context` 固定为 system、完整历史的 user/assistant 交替项和当前
+user；前端不从供应商 payload 反推上下文。外层没有对应已确认内层时，预览和
+生成都会返回 `409`。
 
-绑定模型为 Anthropic 时，原始请求使用 `system/messages`；绑定 Responses
-模型时使用 `instructions/input/store=false`。界面的可读视图来自同一份协议
-原始快照，不增加运行时发信提示或其他模型未见的文本。
+Anthropic adapter 的原始请求使用 `system/messages` 和两个缓存断点；Responses
+adapter 使用 `instructions/input/store=false` 且不发送 Anthropic 缓存字段。
+原始 `request` JSON 可以保留任意 adapter payload，可读视图只使用中性
+`context`，不增加运行时发信提示或其他模型未见的文本。
 
 ## 确认、冲突与回退
 
-生成响应带有事件 ID、调用 ID 和完整请求状态令牌。确认时后端重新构造当前
-请求；如果期间队首事件、相关 prompt、同层历史或人格阶段发生变化，返回
-`409`，且不写入 JSON。用户编辑后的非法外层输出返回 `422`。界面在失败时
-保留草稿。
+生成响应带有事件 ID、调用 ID 和协议无关状态令牌。令牌哈希场景模型、Agent、
+人格层、完整事件、当前层 system prompt、当前层全部历史与本轮 input，不哈希
+adapter payload。因此事件、prompt、同层历史、模型或阶段变化会使确认返回
+`409`；单纯调整供应商请求字段、缓存元数据或 adapter 实现不会。用户编辑后的
+非法外层输出返回 `422`。界面在失败时保留草稿。
 
 场景有一个只含调用引用的全局回退栈：
 
@@ -151,8 +183,9 @@ input/output turns，以及上面的本轮输入。另一层 system prompt、另
 只能回退全场景最近一次已确认模型调用。一次操作只回退一层，不会连锁执行。
 
 显式未绑定或绑定模型不在当前进程配置中的场景仍可查看、编辑、管理事件和
-回退，但预览、生成及确认两层调用均返回 `409`。未绑定 v6 场景可通过界面或
-`PUT /api/scenes/{scene_id}/model` 永久绑定一次。
+回退，但不能新建预览或生成，相关请求返回 `409`。确认既不访问模型注册表也不
+调用模型；模型从配置移除后，已有且业务状态仍有效的浏览器草稿仍可确认。
+未绑定 v6 场景可通过界面或 `PUT /api/scenes/{scene_id}/model` 永久绑定一次。
 
 ## 双协议与独立 prompt cache
 
@@ -166,6 +199,10 @@ Anthropic 的两层分别使用原生 block-level
 Responses 使用提供商自动缓存，请求中不发送 Anthropic 的缓存元数据。两种
 协议每次仍发送当前层完整历史，不做截断或摘要，并统一展示缓存写入、缓存
 读取、未缓存输入和输出 token 指标；短上下文指标为 0 属于正常情况。
+
+后端按 TOML 顺序创建模型 backend，并在部分启动失败或正常退出时逆序关闭已
+创建资源。新增正式协议只需实现 adapter、注册 factory 并通过共享 contract
+tests，不需要修改业务 workflow、API 路由或前端。
 
 ## Scene schema v6
 
@@ -190,7 +227,7 @@ turn 保存调用 ID、事件 ID、显示顺序、实际 input 和确认 output�
 ## API
 
 - `GET /api/health`
-- `GET /api/model-options`
+- `GET /api/model-options`（元素严格只有 `model`，保持 TOML 顺序）
 - `GET /api/scenes`
 - `POST /api/scenes`（`{name, model}`）
 - `GET /api/scenes/{scene_id}`
@@ -214,10 +251,10 @@ turn 保存调用 ID、事件 ID、显示顺序、实际 input 和确认 output�
 
 ```bash
 cd backend
-uv run ruff format --check .
-uv run ruff check .
-uv run python -m compileall app tests
-uv run pytest
+uv run --locked ruff format --check .
+uv run --locked ruff check .
+uv run --locked python -m compileall app tests
+uv run --locked pytest
 ```
 
 前端：

@@ -37,8 +37,8 @@ require_command uv
 require_command npm
 require_command setsid
 
-if [[ ! -f "${PROJECT_ROOT}/.env" ]]; then
-  echo "缺少 ${PROJECT_ROOT}/.env，请先复制 .env.example 并填写模型配置。" >&2
+if [[ ! -f "${PROJECT_ROOT}/models.toml" ]]; then
+  echo "缺少 ${PROJECT_ROOT}/models.toml，请先复制 models.example.toml。" >&2
   exit 1
 fi
 

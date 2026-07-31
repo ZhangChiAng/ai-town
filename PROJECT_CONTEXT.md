@@ -174,23 +174,28 @@ Agent 直接恢复到等待外层阶段，不需要重新生成内层。
 ## 7. 并发与确认规则
 
 生成响应包含当前 `event_id`、浏览器使用的 `call_id`、文本、临时 reasoning、
-token usage、实际请求快照和由完整请求计算的状态令牌。
+token usage、实际请求快照和由协议无关业务上下文计算的状态令牌。
 
-确认时后端从当前已保存场景重新构造同层请求，并校验：
+`state_token` 哈希场景绑定模型、Agent、人格层、当前完整事件、当前层
+`system_prompt`、当前层全部已确认 turns 和本轮 input。它不哈希 adapter
+payload；请求字段、缓存传输元数据或 adapter 实现变化不会单独使草稿失效。
+
+确认时后端从当前已保存场景重新构造同层业务上下文，并校验：
 
 - 当前人格阶段；
 - 当前事件 ID；
-- 完整请求状态令牌；
+- 协议无关状态令牌；
 - 调用 ID 尚未确认；
 - 当前层输出格式。
 
-事件内容、相关 system prompt、同层历史或阶段在生成后发生变化时，确认返回
-`409`。无效的用户编辑外层输出返回 `422`。失败不改写 JSON，也不会清空
-浏览器中的草稿。
+模型绑定、事件、相关 system prompt、同层历史、本轮 input 或阶段在生成后发生
+变化时，确认返回 `409`。无效的用户编辑外层输出返回 `422`。失败不改写
+JSON，也不会清空浏览器中的草稿。
 
-场景未绑定模型或绑定模型不在当前进程配置中时，预览、生成和两层确认均返回
-`409`；查看、编辑场景与事件以及回退不受影响。创建或一次性绑定时选择未配置
-模型返回 `422`。
+预览和生成要求场景绑定模型仍在当前进程注册表中，否则返回 `409`。确认不访问
+模型注册表，也不调用模型；只要浏览器草稿的业务状态仍然有效，即使其模型已从
+当前配置移除，仍可确认。查看、编辑场景与事件以及回退也不依赖模型可用性。
+创建场景或一次性绑定时选择当前未配置模型返回 `422`。
 
 ## 8. 默认双层提示词
 
@@ -217,11 +222,12 @@ token usage、实际请求快照和由完整请求计算的状态令牌。
 每个 Agent 默认外层提示词直接写入自己的固定 ID 和可选接收 ID。用户后续
 可以自由修改完整文本，但保存的两份 system prompt 都不得为空白。
 
-## 9. 双协议、Prompt cache 与可观测性
+## 9. 模型后端、Prompt cache 与可观测性
 
-进程同时配置并注册一个 Anthropic Messages 模型和一个 OpenAI Responses
-兼容模型。场景按绑定的具体模型选择协议；两个协议使用同一份人格层隔离规则
-与逐字输入，但保留各自原生请求结构。
+进程可按配置顺序注册一个或多个模型，也允许同一协议配置多个模型。场景只绑定
+大小写敏感的具体模型名；协议是后端内部 factory key，不出现在模型选择界面、
+scene 数据或 model-options API 中。所有后端使用同一份人格层隔离规则和逐字
+输入，但具体 adapter 保留自己的原生请求结构。
 
 Anthropic 的内层和外层分别维护 block-level 5 分钟缓存断点：
 
@@ -236,9 +242,10 @@ Responses 使用 `instructions`、完整 `input`、`store=false` 与提供商自
 缓存门槛与是否命中由模型提供商决定，系统不填充无意义文本。
 
 请求预览按 `inner|outer` 明确选择层级，不调用模型、不写 JSON。外层尚无已
-确认内层时拒绝预览。可读视图逐字展示同一请求快照中的 system/instructions、
-role 与 text blocks；原始 JSON 保留协议实际字段。界面不能生成模型未见的
-姓名、方向或解释文本，也不能隐藏模型已见的正文。
+确认内层时拒绝预览。响应中的有序 `context` 固定为 system、完整历史的
+user/assistant 交替项和当前 user；可读视图只使用这份中性上下文。原始
+`request` JSON 保留任意 adapter payload，前端不解析供应商字段。界面不能生成
+模型未见的姓名、方向或解释文本，也不能隐藏模型已见的正文。
 
 两种协议统一返回缓存写入、缓存读取、未缓存输入和输出 token 数，并只提取
 提供商允许公开的 thinking、reasoning summary 或 reasoning text。签名、加密
@@ -250,11 +257,31 @@ role 与 text blocks；原始 JSON 保留协议实际字段。界面不能生成
 - 前端：Vue 3 + TypeScript + Vite；
 - 持久化：`data/scenes/<scene-id>.json`；
 - 模型调用：Anthropic Messages 与 OpenAI Responses 两种兼容端点；
-- 进程使用 `ANTHROPIC_BASE_URL/API_KEY/MODEL` 和
-  `RESPONSES_BASE_URL/API_KEY/MODEL` 六项配置；
 - 一个场景的三个 Agent、两个层级始终共用该场景绑定的同一模型；
 - Linux 开发，并可在安装 Python、uv、Node.js 与 npm 的 Windows 机器上
   本地运行。
+
+仓库根目录必须有被 Git 忽略的 `models.toml`。它包含一个或多个有序
+`[[models]]`，每项严格只有：
+
+- `model`：大小写敏感且全局唯一的场景绑定标识；
+- `protocol`：只供注册表查找 factory 的内部 key；
+- `base_url`：有效的绝对 HTTP(S) URL；
+- `api_key_env`：保存真实密钥的环境变量名，而非密钥本身。
+
+当前正式 protocol key 为 `anthropic_messages` 和 `openai_responses`。
+配置层不硬编码协议枚举；注册表拒绝没有已注册 factory 的 key。TOML 声明顺序
+就是后端创建顺序和界面模型顺序，`GET /api/model-options` 的每个元素严格只有
+`{model}`。scene schema 保持 v6，并继续只用 `scene.model` 保存绑定。
+
+进程环境中的密钥优先于可选 `.env`；真实密钥不得写入 TOML。仓库提交
+`models.example.toml` 作为结构示例。旧的六变量配置方式已彻底停止解析，没有
+兼容回退。空清单、重复 model、未知字段、非法 URL、非法密钥变量名、缺失密钥
+或未知协议都使启动失败，错误不得包含配置值或 secret。
+
+注册表按 TOML 顺序创建 backend。部分创建失败时，已创建项逆序关闭；正常退出
+时所有 backend 也逆序关闭。新增正式协议只需实现 adapter、注册 factory 并通过
+共享 contract tests，不修改业务 workflow、路由或前端。
 
 `data/` 是被 Git 忽略的纯运行时目录，不包含产品基线或参考材料。应用按需创建
 `data/scenes/`，只在其中保存 schema v6 场景 JSON。
