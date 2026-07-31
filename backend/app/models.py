@@ -454,14 +454,13 @@ class BindSceneModelRequest(ApiModel):
 
 
 class ModelOption(ApiModel):
-    """One public model choice without endpoint credentials."""
+    """One public model choice without protocol or endpoint details."""
 
-    protocol: Literal["anthropic", "responses"]
     model: str
 
 
 class ModelOptionsResponse(ApiModel):
-    """Configured model choices in stable protocol order."""
+    """Configured model choices in stable TOML order."""
 
     options: list[ModelOption]
 
@@ -537,11 +536,19 @@ class ConfirmLayerRequest(ApiModel):
     _validate_content = field_validator("content")(_strip_non_blank)
 
 
+class ModelRequestContextItem(ApiModel):
+    """One ordered, readable item in a model request preview."""
+
+    role: Literal["system", "user", "assistant"]
+    text: str
+
+
 class ModelRequestPreviewResponse(ApiModel):
-    """Exact next provider request for one selected persona layer."""
+    """Readable context and exact request for one selected persona layer."""
 
     layer: Layer
     event_id: UUID
+    context: list[ModelRequestContextItem]
     request: dict[str, Any]
 
 

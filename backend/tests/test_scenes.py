@@ -3,14 +3,18 @@
 import json
 from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 
-from app.drafting import LayerDraftService
 from app.main import create_app
+from app.model_backends import (
+    ModelConversation,
+    ModelGeneration,
+    ModelUsage,
+    PreparedModelRequest,
+)
 from app.models import SCHEMA_VERSION, create_scene
 from app.storage import SceneReadError, SceneStorage
 from tests.client import TestClient
@@ -18,21 +22,51 @@ from tests.client import TestClient
 MODEL = "anthropic/claude-test"
 
 
-class FakeMessages:
-    """Capture model calls and return configured responses in order."""
+class FakeBackend:
+    """Protocol-unlike backend used by HTTP and persistence tests."""
 
-    def __init__(self, texts: list[str]) -> None:
-        """Create provider responses from visible text strings."""
+    def __init__(self, texts: list[str], model: str = MODEL) -> None:
+        """Queue visible outputs without using a provider-shaped client."""
+        self._model = model
         self.texts = texts
-        self.requests: list[dict[str, Any]] = []
+        self.conversations: list[ModelConversation] = []
+        self.requests: list[PreparedModelRequest] = []
+        self.close_calls = 0
 
-    def create(self, **kwargs: Any) -> Any:
-        """Record a request and return its next visible text."""
-        self.requests.append(deepcopy(kwargs))
-        text = self.texts.pop(0)
-        return SimpleNamespace(
-            content=[SimpleNamespace(type="text", text=text)],
-            usage=SimpleNamespace(
+    @property
+    def model(self) -> str:
+        """Return the exact model bound to route-test scenes."""
+        return self._model
+
+    def prepare(
+        self,
+        conversation: ModelConversation,
+    ) -> PreparedModelRequest:
+        """Expose an arbitrary JSON-safe payload for preview assertions."""
+        self.conversations.append(conversation)
+        return PreparedModelRequest(
+            payload={
+                "engine": self.model,
+                "dialogue": {
+                    "system": conversation.system_prompt,
+                    "turns": [
+                        [turn.input, turn.output] for turn in conversation.turns
+                    ],
+                    "current": conversation.current_input,
+                },
+            }
+        )
+
+    def generate(
+        self,
+        prepared: PreparedModelRequest,
+    ) -> ModelGeneration:
+        """Return one queued output and record one upstream-equivalent call."""
+        self.requests.append(prepared)
+        return ModelGeneration(
+            content=self.texts.pop(0),
+            reasoning=(),
+            usage=ModelUsage(
                 input_tokens=8,
                 output_tokens=4,
                 cache_creation_input_tokens=1,
@@ -40,13 +74,9 @@ class FakeMessages:
             ),
         )
 
-
-class FakeClient:
-    """Minimal model client for route tests."""
-
-    def __init__(self, texts: list[str]) -> None:
-        """Expose a fake messages resource."""
-        self.messages = FakeMessages(texts)
+    def close(self) -> None:
+        """Record lifecycle cleanup for structural compatibility."""
+        self.close_calls += 1
 
 
 @pytest.fixture
@@ -58,12 +88,12 @@ def scene_directory(tmp_path: Path) -> Path:
 def make_client(
     scene_directory: Path,
     texts: list[str] | None = None,
-) -> tuple[TestClient, FakeClient]:
+) -> tuple[TestClient, FakeBackend]:
     """Create an API client with one injectable global model."""
-    model_client = FakeClient(texts or [])
+    model_client = FakeBackend(texts or [])
     application = create_app(
         SceneStorage(scene_directory),
-        LayerDraftService(model_client, MODEL),
+        model_client,
     )
     return TestClient(application), model_client
 
@@ -130,10 +160,10 @@ def confirm(
 def test_model_options_are_ordered_and_hide_credentials(
     scene_directory: Path,
 ) -> None:
-    """The public registry exposes only protocol and concrete model name."""
+    """The public registry exposes only ordered concrete model names."""
     services = {
-        "gpt-test": LayerDraftService(FakeClient([]), "gpt-test"),
-        MODEL: LayerDraftService(FakeClient([]), MODEL),
+        "gpt-test": _backend_for_model("gpt-test"),
+        MODEL: FakeBackend([]),
     }
     client = TestClient(create_app(SceneStorage(scene_directory), services))
 
@@ -142,8 +172,8 @@ def test_model_options_are_ordered_and_hide_credentials(
     assert response.status_code == 200
     assert response.json() == {
         "options": [
-            {"protocol": "anthropic", "model": MODEL},
-            {"protocol": "responses", "model": "gpt-test"},
+            {"model": "gpt-test"},
+            {"model": MODEL},
         ]
     }
     assert "key" not in response.text.casefold()
@@ -200,16 +230,6 @@ def test_unbound_scene_can_bind_once(
     [
         ("POST", "/agents/A/inner-drafts", None),
         (
-            "POST",
-            "/agents/A/inner-confirmations",
-            {
-                "call_id": "33333333-3333-4333-8333-333333333333",
-                "event_id": "22222222-2222-4222-8222-222222222222",
-                "content": "草稿",
-                "state_token": "a" * 64,
-            },
-        ),
-        (
             "GET",
             "/agents/A/model-request-preview?layer=inner",
             None,
@@ -243,6 +263,34 @@ def test_unbound_or_unavailable_model_blocks_only_model_operations(
         json={"content": "仍可编辑事件"},
     )
     assert event.status_code == 201
+
+
+def test_valid_draft_confirms_after_bound_model_is_removed(
+    scene_directory: Path,
+) -> None:
+    """Confirmation uses browser state and never resolves a current backend."""
+    client, backend = make_client(scene_directory, ["仍可确认的内层草稿"])
+    scene = post_event(client, post_scene(client)["id"], "A", "事件")
+    draft = generate(client, scene["id"], "A", "inner")
+    calls_before = len(backend.requests)
+    unavailable_client = TestClient(
+        create_app(SceneStorage(scene_directory), {})
+    )
+
+    response = confirm(
+        unavailable_client,
+        scene["id"],
+        "A",
+        "inner",
+        draft,
+    )
+
+    assert response.status_code == 200
+    assert len(backend.requests) == calls_before
+    assert (
+        response.json()["agents"][0]["inner_context"]["turns"][0]["output"]
+        == "仍可确认的内层草稿"
+    )
 
 
 def test_new_schema_round_trips_without_legacy_agent_fields(
@@ -442,7 +490,7 @@ def test_generation_writes_nothing_and_two_confirmations_route_atomically(
     assert received["kind"] == "agent_message"
     assert received["source_call_id"] == outer_turn["call_id"]
     assert received["id"] == outer_turn["generated_event_id"]
-    assert len(model_client.messages.requests) == 2
+    assert len(model_client.requests) == 2
 
     restarted = SceneStorage(scene_directory).get(UUID(scene["id"]))
     assert restarted.model_dump(mode="json") == completed
@@ -472,10 +520,15 @@ def test_half_round_restores_outer_stage_after_restart(
 
     assert preview.status_code == 200
     assert preview.json()["layer"] == "outer"
-    assert (
-        preview.json()["request"]["messages"][-1]["content"][0]["text"]
-        == "外部事件：\n事件\n\n你内心有一个声音：\n内层已确认"
-    )
+    assert preview.json()["context"][-1] == {
+        "role": "user",
+        "text": "外部事件：\n事件\n\n你内心有一个声音：\n内层已确认",
+    }
+
+
+def _backend_for_model(model: str) -> FakeBackend:
+    """Build a route-test backend with an alternate exact model name."""
+    return FakeBackend([], model=model)
 
 
 def test_stale_and_invalid_confirmations_never_partially_write(

@@ -1,7 +1,7 @@
 """FastAPI routes for the two-layer AI Town experiment."""
 
 from collections.abc import AsyncIterator, Mapping
-from contextlib import ExitStack, asynccontextmanager
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
@@ -9,13 +9,19 @@ from uuid import UUID
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
-from app.config import load_model_settings
-from app.drafting import (
+from app.draft_workflow import (
     DraftGenerationError,
-    LayerDraftService,
-    create_anthropic_client,
-    create_responses_client,
+    DraftWorkflow,
+    confirm_draft,
 )
+from app.model_backends import (
+    BackendFactory,
+    ModelBackend,
+    create_anthropic_messages_backend,
+    create_model_backend_registry,
+    create_openai_responses_backend,
+)
+from app.model_config import load_model_settings
 from app.models import (
     AgentId,
     BindSceneModelRequest,
@@ -28,6 +34,7 @@ from app.models import (
     LayerDraftResponse,
     ModelOption,
     ModelOptionsResponse,
+    ModelRequestContextItem,
     ModelRequestPreviewResponse,
     Scene,
     SceneConflictError,
@@ -54,63 +61,54 @@ class HealthResponse(TypedDict):
 DEFAULT_SCENE_DIRECTORY = (
     Path(__file__).resolve().parents[2] / "data" / "scenes"
 )
+BACKEND_FACTORIES: dict[str, BackendFactory] = {
+    "anthropic_messages": create_anthropic_messages_backend,
+    "openai_responses": create_openai_responses_backend,
+}
 
 
 def create_app(
     scene_storage: SceneStorage | None = None,
-    layer_draft_services: (
-        Mapping[str, LayerDraftService] | LayerDraftService | None
-    ) = None,
+    model_backends: Mapping[str, ModelBackend] | ModelBackend | None = None,
 ) -> FastAPI:
-    """Create the application with injectable storage and model services."""
+    """Create the application with injectable storage and model backends."""
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-        if injected_services is not None:
+        if injected_backends is not None:
             yield
             return
 
-        # ExitStack closes the first client if the second fails to initialize.
-        with ExitStack() as clients:
-            settings = load_model_settings()
-            anthropic_client = create_anthropic_client(settings.anthropic)
-            clients.callback(anthropic_client.close)
-            responses_client = create_responses_client(settings.responses)
-            clients.callback(responses_client.close)
-            install_model_services(
-                application,
-                {
-                    settings.anthropic.model: LayerDraftService(
-                        anthropic_client,
-                        settings.anthropic.model,
-                    ),
-                    settings.responses.model: LayerDraftService(
-                        responses_client,
-                        settings.responses.model,
-                    ),
-                },
-            )
+        settings = load_model_settings()
+        registry = create_model_backend_registry(
+            settings,
+            BACKEND_FACTORIES,
+        )
+        try:
+            install_model_backends(application, registry)
             yield
+        finally:
+            registry.close()
 
     application = FastAPI(title="AI Town API", lifespan=lifespan)
     application.state.scene_storage = scene_storage or SceneStorage(
         DEFAULT_SCENE_DIRECTORY
     )
-    injected_services = _normalize_services(layer_draft_services)
-    if injected_services is not None:
-        install_model_services(application, injected_services)
+    injected_backends = _normalize_backends(model_backends)
+    if injected_backends is not None:
+        install_model_backends(application, injected_backends)
 
     def storage(request: Request) -> SceneStorage:
         """Return request-scoped access to the configured storage."""
         return request.app.state.scene_storage
 
-    def model_services(request: Request) -> dict[str, LayerDraftService]:
-        """Return the concrete-name model service registry."""
-        return request.app.state.layer_draft_services
+    def draft_workflows(request: Request) -> dict[str, DraftWorkflow]:
+        """Return workflows keyed by exact configured model name."""
+        return request.app.state.draft_workflows
 
     def require_available_model(model: str, request: Request) -> None:
         """Reject a model name that is not configured in this process."""
-        if model not in model_services(request):
+        if model not in draft_workflows(request):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="Selected model is not available.",
@@ -119,15 +117,15 @@ def create_app(
     def drafts_for_scene(
         scene: Scene,
         request: Request,
-    ) -> LayerDraftService:
+    ) -> DraftWorkflow:
         """Resolve the immutable scene binding to an available service."""
         if scene.model is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Scene must be bound to a model before model requests.",
             )
-        service = model_services(request).get(scene.model)
-        if service is None:
+        workflow = draft_workflows(request).get(scene.model)
+        if workflow is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -135,7 +133,7 @@ def create_app(
                     "current configuration."
                 ),
             )
-        return service
+        return workflow
 
     @application.exception_handler(SceneNotFoundError)
     async def handle_scene_not_found(
@@ -355,11 +353,9 @@ def create_app(
         payload: ConfirmLayerRequest,
         request: Request,
     ) -> Scene:
-        current_scene = storage(request).get(scene_id)
-        service = drafts_for_scene(current_scene, request)
         return storage(request).mutate(
             scene_id,
-            lambda scene: service.confirm(
+            lambda scene: confirm_draft(
                 scene,
                 agent_id,
                 "inner",
@@ -376,11 +372,9 @@ def create_app(
         payload: ConfirmLayerRequest,
         request: Request,
     ) -> Scene:
-        current_scene = storage(request).get(scene_id)
-        service = drafts_for_scene(current_scene, request)
         return storage(request).mutate(
             scene_id,
-            lambda scene: service.confirm(
+            lambda scene: confirm_draft(
                 scene,
                 agent_id,
                 "outer",
@@ -398,10 +392,19 @@ def create_app(
         request: Request,
     ) -> ModelRequestPreviewResponse:
         scene = storage(request).get(scene_id)
-        return drafts_for_scene(scene, request).preview(
+        preview = drafts_for_scene(scene, request).preview(
             scene,
             agent_id,
             layer,
+        )
+        return ModelRequestPreviewResponse(
+            layer=preview.layer,
+            event_id=preview.event_id,
+            context=[
+                ModelRequestContextItem(role=item.role, text=item.text)
+                for item in preview.context
+            ],
+            request=preview.request,
         )
 
     @application.post("/api/scenes/{scene_id}/rollback")
@@ -411,34 +414,30 @@ def create_app(
     return application
 
 
-def _normalize_services(
-    services: Mapping[str, LayerDraftService] | LayerDraftService | None,
-) -> dict[str, LayerDraftService] | None:
-    """Normalize the injectable single-service convenience form."""
-    if services is None:
+def _normalize_backends(
+    backends: Mapping[str, ModelBackend] | ModelBackend | None,
+) -> dict[str, ModelBackend] | None:
+    """Normalize the injectable single-backend convenience form."""
+    if backends is None:
         return None
-    if isinstance(services, LayerDraftService):
-        return {services.model: services}
-    return dict(services)
+    if isinstance(backends, ModelBackend):
+        return {backends.model: backends}
+    return dict(backends)
 
 
-def install_model_services(
+def install_model_backends(
     application: FastAPI,
-    services: Mapping[str, LayerDraftService],
+    backends: Mapping[str, ModelBackend],
 ) -> None:
-    """Install a concrete-name registry and stable public model options."""
-    registry = dict(services)
-    options: list[ModelOption] = []
-    for protocol in ("anthropic", "responses"):
-        options.extend(
-            ModelOption(protocol=service.protocol, model=model)
-            for model, service in registry.items()
-            if service.protocol == protocol
-        )
-    application.state.layer_draft_services = registry
-    # Keep the registry name protocol-neutral for lifecycle introspection.
-    application.state.message_draft_services = registry
-    application.state.model_options = options
+    """Install ordered backends, workflows, and protocol-free options."""
+    registry = dict(backends)
+    application.state.model_backends = registry
+    application.state.draft_workflows = {
+        model: DraftWorkflow(backend) for model, backend in registry.items()
+    }
+    application.state.model_options = [
+        ModelOption(model=model) for model in registry
+    ]
 
 
 app = create_app()
