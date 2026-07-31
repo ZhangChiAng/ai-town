@@ -82,8 +82,25 @@
 - 后端：Python + FastAPI；
 - 前端：Vue 3 + TypeScript + Vite；
 - 持久化：JSON；
-- 模型接口：OpenAI Compatible API；
-- 三个 Agent 使用同一个模型配置；
+- 一个进程同时配置并初始化 Anthropic Messages 与 OpenAI
+  Responses-compatible 两种模型服务；唯一配置是
+  `ANTHROPIC_BASE_URL/API_KEY/MODEL` 和
+  `RESPONSES_BASE_URL/API_KEY/MODEL` 六项，全部必填；
+- Anthropic 模型名必须包含 `claude`（忽略大小写），Responses 模型名不得包含；
+  两个 `BASE_URL` 都必须是对应 SDK 的 API 根地址，其中 OpenAI SDK 会在
+  Responses 根地址后追加 `/responses`；
+- 创建场景时必须从当前两项具体模型名中显式选择一项，不默认选择；场景内三个
+  Agent 共用该模型，绑定后不可切换。旧场景加载为未绑定，可由用户一次性选择；
+  若已绑定模型不再存在于当前配置，场景仍可查看、编辑和人工发送消息，但不能
+  预览或生成模型请求；
+- Claude 请求保留 5 分钟显式缓存断点，Responses 请求只使用端点的自动
+  prompt caching，不增加模型专属缓存参数；
+- 两种协议都必须用真实端点验收生成、请求信息边界与缓存 usage；
+- 上游响应实际返回的可读 `thinking`、reasoning summary 或 reasoning text
+  必须在当前草稿旁供用户查看；这些内容只属于本次临时观测，不可编辑，不写入
+  场景 JSON、个人时间线或后续模型上下文。签名、加密 reasoning 与安全遮蔽数据
+  不属于可读内容，不得暴露；端点未返回可读内容时界面必须如实说明；
+- 同一场景的三个 Agent 使用同一个不可变模型绑定；
 - 在 Linux 环境开发；
 - 在安装了 Python 和 Node.js 的 Windows 机器上本地运行。
 

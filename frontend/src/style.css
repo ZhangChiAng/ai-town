@@ -185,12 +185,13 @@ textarea:disabled {
   font-weight: 700;
 }
 
-.create-row {
-  display: flex;
+.create-fields {
+  display: grid;
   gap: 8px;
 }
 
-.create-row input,
+.create-fields input,
+.create-fields select,
 .scene-name-field input,
 .field input,
 .field textarea,
@@ -206,7 +207,8 @@ textarea:disabled {
     background 140ms ease;
 }
 
-.create-row input:hover,
+.create-fields input:hover,
+.create-fields select:hover,
 .scene-name-field input:hover,
 .field input:hover,
 .field textarea:hover,
@@ -216,7 +218,8 @@ textarea:disabled {
   background: rgb(255 255 255 / 86%);
 }
 
-.create-row input:focus,
+.create-fields input:focus,
+.create-fields select:focus,
 .scene-name-field input:focus,
 .field input:focus,
 .field textarea:focus,
@@ -228,12 +231,20 @@ textarea:disabled {
   box-shadow: 0 0 0 3px rgb(82 112 93 / 12%);
 }
 
-.create-row input {
+.create-fields input,
+.create-fields select {
   min-width: 0;
   height: 42px;
   padding: 0 12px;
   border-radius: 9px;
   font-size: 0.84rem;
+}
+
+.create-fields select {
+  width: 100%;
+  border: 1px solid rgb(30 41 34 / 16%);
+  color: #1e2922;
+  background: rgb(255 255 255 / 67%);
 }
 
 .primary-button {
@@ -284,7 +295,7 @@ textarea:disabled {
 }
 
 .create-button {
-  flex: 0 0 auto;
+  height: 42px;
   padding: 0 15px;
   font-size: 0.8rem;
 }
@@ -638,6 +649,68 @@ textarea:disabled {
   font-size: 0.8rem;
 }
 
+.scene-model {
+  display: flex;
+  max-width: 1400px;
+  min-height: 58px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  margin: 12px auto 0;
+  padding: 11px 14px;
+  border: 1px solid rgb(30 41 34 / 11%);
+  border-radius: 10px;
+  background: rgb(255 255 255 / 42%);
+}
+
+.scene-model > div:first-child {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.scene-model-label,
+.scene-model small {
+  color: #718078;
+  font-size: 0.68rem;
+}
+
+.scene-model strong {
+  overflow-wrap: anywhere;
+  font-size: 0.82rem;
+}
+
+.model-binding-controls {
+  display: flex;
+  flex: 0 1 600px;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.model-binding-controls select {
+  min-width: 0;
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid rgb(30 41 34 / 16%);
+  border-radius: 9px;
+  color: #1e2922;
+  background: #fff;
+}
+
+.model-binding-controls button {
+  flex: 0 0 auto;
+  padding: 0 14px;
+}
+
+.scene-model > .form-error,
+.scene-model > .model-unavailable {
+  max-width: 480px;
+  margin: 0;
+  color: #a13e36;
+  font-size: 0.72rem;
+  line-height: 1.5;
+}
+
 .agent-tabs {
   display: grid;
   overflow: hidden;
@@ -840,7 +913,7 @@ textarea:disabled {
 }
 
 .field textarea::placeholder,
-.create-row input::placeholder {
+.create-fields input::placeholder {
   color: #a2aaa5;
 }
 
@@ -918,6 +991,71 @@ textarea:disabled {
 
 .message-fields textarea {
   resize: vertical;
+}
+
+.reasoning-panel {
+  margin-top: 16px;
+  padding: 13px 14px;
+  border: 1px solid rgb(81 66 38 / 16%);
+  border-radius: 10px;
+  background: rgb(255 249 235 / 62%);
+}
+
+.reasoning-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.reasoning-heading h3,
+.reasoning-block h4 {
+  margin: 0;
+  color: #594a31;
+}
+
+.reasoning-heading h3 {
+  font-size: 0.76rem;
+}
+
+.reasoning-heading span,
+.reasoning-block h4,
+.reasoning-empty {
+  font-size: 0.64rem;
+}
+
+.reasoning-heading span,
+.reasoning-empty {
+  color: #81745f;
+}
+
+.reasoning-blocks {
+  display: grid;
+  gap: 10px;
+  margin-top: 11px;
+}
+
+.reasoning-block {
+  min-width: 0;
+}
+
+.reasoning-block h4 {
+  font-weight: 750;
+}
+
+.reasoning-block pre {
+  overflow-wrap: anywhere;
+  margin: 5px 0 0;
+  color: #433b30;
+  font-family: inherit;
+  font-size: 0.72rem;
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.reasoning-empty {
+  margin: 9px 0 0;
+  line-height: 1.55;
 }
 
 .usage-metrics {
@@ -1462,6 +1600,15 @@ textarea:disabled {
   .save-controls {
     justify-content: space-between;
   }
+
+  .scene-model {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .model-binding-controls {
+    flex-basis: auto;
+  }
 }
 
 @media (max-width: 680px) {
@@ -1525,6 +1672,15 @@ textarea:disabled {
 
   .agent-tabs {
     gap: 0;
+  }
+
+  .model-binding-controls {
+    flex-direction: column;
+  }
+
+  .model-binding-controls select,
+  .model-binding-controls button {
+    min-height: 40px;
   }
 
   .agent-tab {

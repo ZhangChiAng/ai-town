@@ -4,7 +4,9 @@ import type {
   MessageCreate,
   MessageDraftResponse,
   MessageDraftUsage,
+  ModelReasoningBlock,
   ModelRequest,
+  ModelOption,
   Scene,
   SceneSummary,
   SceneUpdate,
@@ -62,13 +64,23 @@ function isTimelineRecord(value: unknown): boolean {
 function isScene(value: unknown): value is Scene {
   return (
     isRecord(value) &&
-    value.schema_version === 4 &&
+    value.schema_version === 5 &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
+    (value.model === null || typeof value.model === "string") &&
     Array.isArray(value.agents) &&
     value.agents.length === 3 &&
     value.agents.every(isAgent) &&
     value.agents.map((agent) => agent.id).join("") === "ABC"
+  );
+}
+
+function isModelOption(value: unknown): value is ModelOption {
+  return (
+    isRecord(value) &&
+    (value.protocol === "anthropic" || value.protocol === "responses") &&
+    typeof value.model === "string" &&
+    value.model.trim() !== ""
   );
 }
 
@@ -96,6 +108,19 @@ function isMessageDraftUsage(
   );
 }
 
+function isModelReasoningBlock(
+  value: unknown,
+): value is ModelReasoningBlock {
+  return (
+    isRecord(value) &&
+    (value.type === "thinking" ||
+      value.type === "summary_text" ||
+      value.type === "reasoning_text") &&
+    typeof value.text === "string" &&
+    value.text.trim() !== ""
+  );
+}
+
 function isMessageDraftResponse(
   value: unknown,
 ): value is MessageDraftResponse {
@@ -103,6 +128,8 @@ function isMessageDraftResponse(
     isRecord(value) &&
     typeof value.content === "string" &&
     value.content.trim() !== "" &&
+    Array.isArray(value.reasoning) &&
+    value.reasoning.every(isModelReasoningBlock) &&
     isMessageDraftUsage(value.usage) &&
     isRecord(value.request_snapshot)
   );
@@ -177,12 +204,48 @@ export async function listScenes(): Promise<SceneSummary[]> {
   return body;
 }
 
-export async function createScene(name: string): Promise<Scene> {
+export async function getModelOptions(): Promise<ModelOption[]> {
+  const body = await requestJson("/api/model-options");
+  if (
+    !isRecord(body) ||
+    !Array.isArray(body.options) ||
+    body.options.length !== 2 ||
+    !body.options.every(isModelOption) ||
+    body.options[0].protocol !== "anthropic" ||
+    body.options[1].protocol !== "responses"
+  ) {
+    throw new ApiError("后端返回了无法识别的模型选项。");
+  }
+  return body.options;
+}
+
+export async function createScene(
+  name: string,
+  model: string,
+): Promise<Scene> {
   const body = await requestJson("/api/scenes", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, model }),
   });
+  if (!isScene(body)) {
+    throw new ApiError("后端返回了无法识别的场景数据。");
+  }
+  return body;
+}
+
+export async function bindSceneModel(
+  sceneId: string,
+  model: string,
+): Promise<Scene> {
+  const body = await requestJson(
+    `/api/scenes/${encodeURIComponent(sceneId)}/model`,
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    },
+  );
   if (!isScene(body)) {
     throw new ApiError("后端返回了无法识别的场景数据。");
   }

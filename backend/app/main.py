@@ -1,12 +1,12 @@
 """FastAPI application factory and route definitions for the AI Town API."""
 
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Mapping
+from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from app.config import load_model_settings
@@ -14,9 +14,11 @@ from app.drafting import (
     DraftGenerationError,
     MessageDraftService,
     create_anthropic_client,
+    create_responses_client,
 )
 from app.models import (
     AgentId,
+    BindSceneModelRequest,
     ComposeSystemPromptRequest,
     ComposeSystemPromptResponse,
     CreateMessageRequest,
@@ -24,11 +26,15 @@ from app.models import (
     MessageDeletionConflictError,
     MessageDraftResponse,
     MessageNotFoundError,
+    ModelOption,
+    ModelOptionsResponse,
     ModelRequestPreviewResponse,
     Scene,
+    SceneModelBindingConflictError,
     SceneSummary,
     UpdateSceneRequest,
     add_message,
+    bind_scene_model,
     compose_system_prompt,
     create_scene,
     delete_message,
@@ -54,16 +60,18 @@ DEFAULT_SCENE_DIRECTORY = (
 
 def create_app(
     scene_storage: SceneStorage | None = None,
-    message_draft_service: MessageDraftService | None = None,
+    message_draft_services: (
+        Mapping[str, MessageDraftService] | MessageDraftService | None
+    ) = None,
 ) -> FastAPI:
     """Build and configure a FastAPI application instance.
 
     Args:
         scene_storage: Pre-configured SceneStorage instance. When omitted, a
             default storage pointed at ``data/scenes/`` is used.
-        message_draft_service: Injectable draft service for tests. When
-            omitted, startup loads model settings and creates an Anthropic
-            client.
+        message_draft_services: Injectable model-name registry for tests.
+            Passing one service remains supported for focused route tests.
+            When omitted, startup creates both configured SDK clients.
 
     Returns:
         A fully configured FastAPI application with routes and exception
@@ -72,33 +80,72 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        client = None
-        if message_draft_service is None:
-            settings = load_model_settings()
-            client = create_anthropic_client(settings)
-            app.state.message_draft_service = MessageDraftService(
-                client,
-                settings.model,
-            )
-
-        try:
+        if injected_services is not None:
             yield
-        finally:
-            if client is not None:
-                client.close()
+            return
+
+        # ExitStack also closes the first client if the second fails to start.
+        with ExitStack() as clients:
+            settings = load_model_settings()
+            anthropic_client = create_anthropic_client(settings.anthropic)
+            clients.callback(anthropic_client.close)
+            responses_client = create_responses_client(settings.responses)
+            clients.callback(responses_client.close)
+            install_model_services(
+                app,
+                {
+                    settings.anthropic.model: MessageDraftService(
+                        anthropic_client,
+                        settings.anthropic.model,
+                    ),
+                    settings.responses.model: MessageDraftService(
+                        responses_client,
+                        settings.responses.model,
+                    ),
+                },
+            )
+            yield
 
     application = FastAPI(title="AI Town API", lifespan=lifespan)
     application.state.scene_storage = scene_storage or SceneStorage(
         DEFAULT_SCENE_DIRECTORY
     )
-    if message_draft_service is not None:
-        application.state.message_draft_service = message_draft_service
+    injected_services = _normalize_services(message_draft_services)
+    if injected_services is not None:
+        install_model_services(application, injected_services)
 
     def storage(request: Request) -> SceneStorage:
         return request.app.state.scene_storage
 
-    def drafts(request: Request) -> MessageDraftService:
-        return request.app.state.message_draft_service
+    def model_services(request: Request) -> dict[str, MessageDraftService]:
+        return request.app.state.message_draft_services
+
+    def require_available_model(model: str, request: Request) -> None:
+        if model not in model_services(request):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="Selected model is not available.",
+            )
+
+    def drafts_for_scene(
+        scene: Scene,
+        request: Request,
+    ) -> MessageDraftService:
+        if scene.model is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Scene must be bound to a model before model requests.",
+            )
+        service = model_services(request).get(scene.model)
+        if service is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "The scene's bound model is not available in the "
+                    "current configuration."
+                ),
+            )
+        return service
 
     @application.exception_handler(SceneNotFoundError)
     async def handle_scene_not_found(
@@ -136,6 +183,15 @@ def create_app(
             content={"detail": str(error)},
         )
 
+    @application.exception_handler(SceneModelBindingConflictError)
+    async def handle_scene_model_binding_conflict(
+        _request: Request, error: SceneModelBindingConflictError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"detail": str(error)},
+        )
+
     @application.exception_handler(DraftGenerationError)
     async def handle_draft_generation_error(
         _request: Request, error: DraftGenerationError
@@ -148,6 +204,10 @@ def create_app(
     @application.get("/api/health")
     async def health() -> HealthResponse:
         return {"status": "ok"}
+
+    @application.get("/api/model-options")
+    async def get_model_options(request: Request) -> ModelOptionsResponse:
+        return ModelOptionsResponse(options=request.app.state.model_options)
 
     @application.get("/api/scenes")
     async def list_scenes(request: Request) -> list[SceneSummary]:
@@ -171,7 +231,8 @@ def create_app(
         status_code=status.HTTP_201_CREATED,
     )
     async def add_scene(payload: CreateSceneRequest, request: Request) -> Scene:
-        scene = create_scene(payload.name)
+        require_available_model(payload.model, request)
+        scene = create_scene(payload.name, payload.model)
         storage(request).create(scene)
         return scene
 
@@ -187,6 +248,21 @@ def create_app(
     ) -> Scene:
         current_scene = storage(request).get(scene_id)
         updated_scene = update_scene(current_scene, payload)
+        storage(request).save(updated_scene)
+        return updated_scene
+
+    @application.put("/api/scenes/{scene_id}/model")
+    async def put_scene_model(
+        scene_id: UUID,
+        payload: BindSceneModelRequest,
+        request: Request,
+    ) -> Scene:
+        current_scene = storage(request).get(scene_id)
+        if current_scene.model is not None:
+            # A bound scene conflicts regardless of the replacement value.
+            bind_scene_model(current_scene, payload.model)
+        require_available_model(payload.model, request)
+        updated_scene = bind_scene_model(current_scene, payload.model)
         storage(request).save(updated_scene)
         return updated_scene
 
@@ -222,7 +298,9 @@ def create_app(
         request: Request,
     ) -> MessageDraftResponse:
         current_scene = storage(request).get(scene_id)
-        return drafts(request).generate(current_scene, agent_id)
+        return drafts_for_scene(current_scene, request).generate(
+            current_scene, agent_id
+        )
 
     @application.get(
         "/api/scenes/{scene_id}/agents/{agent_id}/model-request-preview"
@@ -234,10 +312,40 @@ def create_app(
     ) -> ModelRequestPreviewResponse:
         current_scene = storage(request).get(scene_id)
         return ModelRequestPreviewResponse(
-            request=drafts(request).preview(current_scene, agent_id)
+            request=drafts_for_scene(current_scene, request).preview(
+                current_scene, agent_id
+            )
         )
 
     return application
+
+
+def _normalize_services(
+    services: Mapping[str, MessageDraftService] | MessageDraftService | None,
+) -> dict[str, MessageDraftService] | None:
+    """Normalize the injectable single-service convenience form."""
+    if services is None:
+        return None
+    if isinstance(services, MessageDraftService):
+        return {services.model: services}
+    return dict(services)
+
+
+def install_model_services(
+    application: FastAPI,
+    services: Mapping[str, MessageDraftService],
+) -> None:
+    """Install a concrete-name service registry and stable public options."""
+    registry = dict(services)
+    options: list[ModelOption] = []
+    for protocol in ("anthropic", "responses"):
+        options.extend(
+            ModelOption(protocol=service.protocol, model=model)
+            for model, service in registry.items()
+            if service.protocol == protocol
+        )
+    application.state.message_draft_services = registry
+    application.state.model_options = options
 
 
 app = create_app()

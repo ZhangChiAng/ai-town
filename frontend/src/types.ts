@@ -22,10 +22,16 @@ export interface Agent {
 }
 
 export interface Scene {
-  schema_version: 4;
+  schema_version: 5;
   id: string;
   name: string;
+  model: string | null;
   agents: Agent[];
+}
+
+export interface ModelOption {
+  protocol: "anthropic" | "responses";
+  model: string;
 }
 
 export interface SceneSummary {
@@ -60,8 +66,14 @@ export interface MessageDraftUsage {
   cache_read_input_tokens: number;
 }
 
+export interface ModelReasoningBlock {
+  type: "thinking" | "summary_text" | "reasoning_text";
+  text: string;
+}
+
 export interface MessageDraftResponse {
   content: string;
+  reasoning: ModelReasoningBlock[];
   usage: MessageDraftUsage;
   request_snapshot: ModelRequest;
 }

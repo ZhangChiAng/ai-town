@@ -216,10 +216,10 @@ class SceneStorage:
 
 
 def _upgrade_scene(raw_scene: object) -> object:
-    """Return an in-memory v4 representation of a v1, v2, or v3 scene."""
+    """Return an unbound in-memory v5 representation of a v1-v4 scene."""
     if not isinstance(raw_scene, dict) or raw_scene.get(
         "schema_version"
-    ) not in (1, 2, 3):
+    ) not in (1, 2, 3, 4):
         return raw_scene
 
     upgraded = dict(raw_scene)
@@ -259,6 +259,7 @@ def _upgrade_scene(raw_scene: object) -> object:
         upgraded_agents.append(agent)
 
     upgraded["agents"] = upgraded_agents
+    upgraded["model"] = None
     upgraded["schema_version"] = SCHEMA_VERSION
     return upgraded
 

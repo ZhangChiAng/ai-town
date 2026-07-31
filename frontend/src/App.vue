@@ -9,10 +9,12 @@ import {
 } from "vue";
 
 import {
+  bindSceneModel,
   composeSystemPrompt,
   createScene,
   deleteMessage,
   generateMessageDraft,
+  getModelOptions,
   getModelRequestPreview,
   getScene,
   listScenes,
@@ -24,6 +26,8 @@ import {
   type AgentId,
   type MessageTimelineRecord,
   type MessageDraftUsage,
+  type ModelReasoningBlock,
+  type ModelOption,
   type ModelRequest,
   type Scene,
   type SceneSummary,
@@ -31,9 +35,11 @@ import {
 } from "./types";
 
 type ListState = "loading" | "ready" | "error";
+type ModelOptionsState = "loading" | "ready" | "error";
 type SaveState = "idle" | "saving" | "success" | "error";
 interface MessageDraft {
   content: string;
+  reasoning: ModelReasoningBlock[];
   usage: MessageDraftUsage | null;
 }
 type PreviewMode = "readable" | "json";
@@ -43,6 +49,13 @@ const currentScene = ref<Scene | null>(null);
 const savedScene = ref<Scene | null>(null);
 const activeAgentId = ref<AgentId>("A");
 const newSceneName = ref("");
+const newSceneModel = ref("");
+const modelOptions = ref<ModelOption[]>([]);
+const modelOptionsState = ref<ModelOptionsState>("loading");
+const modelOptionsError = ref("");
+const bindingModel = ref("");
+const bindingError = ref("");
+const isBindingModel = ref(false);
 
 const listState = ref<ListState>("loading");
 const listError = ref("");
@@ -84,14 +97,17 @@ function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
   return {
     A: {
       content: "",
+      reasoning: [],
       usage: null,
     },
     B: {
       content: "",
+      reasoning: [],
       usage: null,
     },
     C: {
       content: "",
+      reasoning: [],
       usage: null,
     },
   };
@@ -163,6 +179,20 @@ const hasMessageDrafts = computed(() =>
 const activeDraftHasContent = computed(() => {
   return activeMessageDraft.value.content !== "";
 });
+
+const boundModelOption = computed(() => {
+  const model = currentScene.value?.model;
+  if (model === null || model === undefined) {
+    return undefined;
+  }
+  return modelOptions.value.find((option) => option.model === model);
+});
+
+const canUseBoundModel = computed(
+  () =>
+    currentScene.value?.model !== null &&
+    boundModelOption.value !== undefined,
+);
 
 const deletableMessageIds = computed(() => {
   const scene = currentScene.value;
@@ -239,6 +269,7 @@ const editorLocked = computed(
     generatingAgentId.value !== null ||
     composingAgentId.value !== null ||
     previewingAgentId.value !== null ||
+    isBindingModel.value ||
     isCreating.value ||
     openingSceneId.value !== null,
 );
@@ -254,6 +285,7 @@ const canSendMessage = computed(
 const canGenerateMessageDraft = computed(
   () =>
     currentScene.value !== null &&
+    canUseBoundModel.value &&
     !isDirty.value &&
     !editorLocked.value,
 );
@@ -359,6 +391,8 @@ function installScene(
   }
   requestPreviews.value = emptyRequestPreviews();
   previewErrors.value = emptyMessageErrors();
+  bindingModel.value = "";
+  bindingError.value = "";
   saveState.value = "idle";
   saveError.value = "";
   actionError.value = "";
@@ -422,6 +456,18 @@ async function refreshScenes(): Promise<void> {
   }
 }
 
+async function refreshModelOptions(): Promise<void> {
+  modelOptionsState.value = "loading";
+  modelOptionsError.value = "";
+  try {
+    modelOptions.value = await getModelOptions();
+    modelOptionsState.value = "ready";
+  } catch (error) {
+    modelOptionsState.value = "error";
+    modelOptionsError.value = errorMessage(error, "无法加载模型选项。");
+  }
+}
+
 async function openScene(summary: SceneSummary): Promise<void> {
   if (
     summary.id === currentScene.value?.id ||
@@ -453,9 +499,14 @@ async function openScene(summary: SceneSummary): Promise<void> {
 async function submitNewScene(): Promise<void> {
   createError.value = "";
   const name = newSceneName.value.trim();
+  const model = newSceneModel.value;
 
   if (!name) {
     createError.value = "请输入场景名称。";
+    return;
+  }
+  if (!model) {
+    createError.value = "请选择这个场景使用的模型。";
     return;
   }
   if (
@@ -472,15 +523,54 @@ async function submitNewScene(): Promise<void> {
   isCreating.value = true;
 
   try {
-    const scene = await createScene(name);
+    const scene = await createScene(name, model);
     upsertSummary(scene);
     installScene(scene);
     newSceneName.value = "";
+    newSceneModel.value = "";
   } catch (error) {
     createError.value = errorMessage(error, "无法创建场景。");
   } finally {
     isCreating.value = false;
   }
+}
+
+async function bindCurrentSceneModel(): Promise<void> {
+  const scene = currentScene.value;
+  if (
+    scene === null ||
+    scene.model !== null ||
+    bindingModel.value === "" ||
+    editorLocked.value
+  ) {
+    return;
+  }
+
+  const selectedAgentId = activeAgentId.value;
+  isBindingModel.value = true;
+  bindingError.value = "";
+  try {
+    const bound = await bindSceneModel(scene.id, bindingModel.value);
+    installScene(bound, selectedAgentId, true);
+  } catch (error) {
+    bindingError.value = errorMessage(error, "模型绑定失败，请重试。");
+  } finally {
+    isBindingModel.value = false;
+  }
+}
+
+function modelOptionLabel(option: ModelOption): string {
+  return `${option.protocol === "anthropic" ? "Claude" : "Responses"} — ${option.model}`;
+}
+
+function boundModelLabel(model: string): string {
+  const option = boundModelOption.value;
+  const protocol =
+    option?.protocol ??
+    (model.toLocaleLowerCase().includes("claude")
+      ? "anthropic"
+      : "responses");
+  return `${protocol === "anthropic" ? "Claude" : "Responses"} — ${model}`;
 }
 
 function markEdited(): void {
@@ -556,6 +646,7 @@ async function generateDraft(): Promise<void> {
   const senderId = activeAgentId.value;
   if (
     scene === null ||
+    !canUseBoundModel.value ||
     isDirty.value ||
     editorLocked.value
   ) {
@@ -569,6 +660,7 @@ async function generateDraft(): Promise<void> {
     const generated = await generateMessageDraft(scene.id, senderId);
     messageDrafts.value[senderId] = {
       content: generated.content,
+      reasoning: generated.reasoning,
       usage: generated.usage,
     };
   } catch (error) {
@@ -605,6 +697,7 @@ async function confirmMessage(): Promise<void> {
     installScene(updated, senderId, true);
     messageDrafts.value[senderId] = {
       content: "",
+      reasoning: [],
       usage: null,
     };
   } catch (error) {
@@ -704,7 +797,7 @@ async function recomposeActiveSystemPrompt(): Promise<void> {
 async function loadRequestPreview(): Promise<void> {
   const scene = currentScene.value;
   const agentId = activeAgentId.value;
-  if (scene === null || editorLocked.value) {
+  if (scene === null || editorLocked.value || !canUseBoundModel.value) {
     return;
   }
 
@@ -730,6 +823,7 @@ function discardActiveDraft(): void {
   const agentId = activeAgentId.value;
   messageDrafts.value[agentId] = {
     content: "",
+    reasoning: [],
     usage: null,
   };
   messageErrors.value[agentId] = "";
@@ -739,10 +833,22 @@ function prettyJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
+function reasoningLabel(type: ModelReasoningBlock["type"]): string {
+  if (type === "thinking") return "Claude thinking";
+  if (type === "summary_text") return "推理摘要";
+  return "思维链";
+}
+
 function readableModelContext(
   request: ModelRequest,
 ): { label: string; text: string }[] {
   const context: { label: string; text: string }[] = [];
+  if (typeof request.instructions === "string") {
+    context.push({
+      label: "instructions",
+      text: request.instructions,
+    });
+  }
   const system = request.system;
   if (Array.isArray(system)) {
     for (const block of system) {
@@ -757,11 +863,13 @@ function readableModelContext(
     }
   }
 
-  const messages = request.messages;
-  if (!Array.isArray(messages)) {
+  const turns = Array.isArray(request.messages)
+    ? request.messages
+    : request.input;
+  if (!Array.isArray(turns)) {
     return context;
   }
-  for (const message of messages) {
+  for (const message of turns) {
     if (
       typeof message !== "object" ||
       message === null ||
@@ -799,6 +907,7 @@ function handleBeforeUnload(event: BeforeUnloadEvent): void {
 
 onMounted(() => {
   void refreshScenes();
+  void refreshModelOptions();
   window.addEventListener("beforeunload", handleBeforeUnload);
 });
 
@@ -835,7 +944,7 @@ onBeforeUnmount(() => {
 
         <form class="create-form" @submit.prevent="submitNewScene">
           <label for="new-scene-name">创建命名场景</label>
-          <div class="create-row">
+          <div class="create-fields">
             <input
               id="new-scene-name"
               v-model="newSceneName"
@@ -846,14 +955,41 @@ onBeforeUnmount(() => {
               :disabled="editorLocked"
               @input="createError = ''"
             />
+            <select
+              id="new-scene-model"
+              v-model="newSceneModel"
+              name="new-scene-model"
+              aria-label="场景模型"
+              :disabled="editorLocked || modelOptionsState !== 'ready'"
+              @change="createError = ''"
+            >
+              <option value="" disabled>选择模型（创建后不可更改）</option>
+              <option
+                v-for="option in modelOptions"
+                :key="option.protocol"
+                :value="option.model"
+              >
+                {{ modelOptionLabel(option) }}
+              </option>
+            </select>
             <button
               class="primary-button create-button"
               type="submit"
-              :disabled="editorLocked"
+              :disabled="editorLocked || modelOptionsState !== 'ready'"
             >
               {{ isCreating ? "创建中…" : "创建" }}
             </button>
           </div>
+          <p
+            v-if="modelOptionsState === 'error'"
+            class="form-error"
+            role="alert"
+          >
+            {{ modelOptionsError }}
+            <button class="text-button" type="button" @click="refreshModelOptions">
+              重试
+            </button>
+          </p>
           <p v-if="createError" class="form-error" role="alert">
             {{ createError }}
           </p>
@@ -1006,6 +1142,60 @@ onBeforeUnmount(() => {
             </div>
           </header>
 
+          <section class="scene-model" aria-label="场景模型绑定">
+            <div>
+              <span class="scene-model-label">场景模型</span>
+              <template v-if="currentScene.model !== null">
+                <strong>{{ boundModelLabel(currentScene.model) }}</strong>
+                <small>创建后固定，不可切换</small>
+              </template>
+              <template v-else>
+                <strong>旧场景尚未绑定模型</strong>
+                <small>可选择一次；绑定后不可切换</small>
+              </template>
+            </div>
+            <div v-if="currentScene.model === null" class="model-binding-controls">
+              <select
+                id="legacy-scene-model"
+                v-model="bindingModel"
+                aria-label="为旧场景绑定模型"
+                :disabled="editorLocked || modelOptionsState !== 'ready'"
+                @change="bindingError = ''"
+              >
+                <option value="" disabled>选择模型</option>
+                <option
+                  v-for="option in modelOptions"
+                  :key="option.protocol"
+                  :value="option.model"
+                >
+                  {{ modelOptionLabel(option) }}
+                </option>
+              </select>
+              <button
+                class="secondary-button"
+                type="button"
+                :disabled="editorLocked || bindingModel === ''"
+                @click="bindCurrentSceneModel"
+              >
+                {{ isBindingModel ? "绑定中…" : "确认绑定" }}
+              </button>
+            </div>
+            <p v-if="bindingError" class="form-error" role="alert">
+              {{ bindingError }}
+            </p>
+            <p
+              v-if="
+                currentScene.model !== null &&
+                modelOptionsState === 'ready' &&
+                !canUseBoundModel
+              "
+              class="model-unavailable"
+              role="status"
+            >
+              当前配置不再提供此模型；仍可查看、编辑和人工发送消息，但不能预览或生成模型请求。
+            </p>
+          </section>
+
           <nav class="agent-tabs" aria-label="选择 Agent">
             <button
               v-for="agentId in AGENT_IDS"
@@ -1114,13 +1304,40 @@ onBeforeUnmount(() => {
                   </label>
                 </div>
 
+                <section
+                  v-if="activeMessageDraft.usage"
+                  class="reasoning-panel"
+                  aria-label="本次模型思维内容"
+                >
+                  <div class="reasoning-heading">
+                    <h3>模型思维</h3>
+                    <span>仅本次草稿 · 不保存</span>
+                  </div>
+                  <div
+                    v-if="activeMessageDraft.reasoning.length"
+                    class="reasoning-blocks"
+                  >
+                    <article
+                      v-for="(block, index) in activeMessageDraft.reasoning"
+                      :key="`${block.type}-${index}`"
+                      class="reasoning-block"
+                    >
+                      <h4>{{ reasoningLabel(block.type) }}</h4>
+                      <pre>{{ block.text }}</pre>
+                    </article>
+                  </div>
+                  <p v-else class="reasoning-empty">
+                    本次响应没有返回可读思维内容。
+                  </p>
+                </section>
+
                 <dl
                   v-if="activeMessageDraft.usage"
                   class="usage-metrics"
                   aria-label="本次草稿生成 token 用量"
                 >
                   <div>
-                    <dt>5 分钟缓存写入</dt>
+                    <dt>缓存写入</dt>
                     <dd>
                       {{
                         activeMessageDraft.usage
@@ -1149,6 +1366,9 @@ onBeforeUnmount(() => {
                 <div class="message-actions">
                   <p v-if="isDirty" class="message-hint">
                     请先保存场景，再生成或确认发送。
+                  </p>
+                  <p v-else-if="!canUseBoundModel" class="message-hint">
+                    场景模型未绑定或当前不可用；仍可手写并确认发送消息。
                   </p>
                   <p
                     v-else-if="messageErrors[activeAgent.id]"
@@ -1229,8 +1449,7 @@ onBeforeUnmount(() => {
                 >
                   <span>最终系统提示词</span>
                   <small>
-                    权威角色提示；保存值会逐字成为 Anthropic 请求中唯一的
-                    system 文本
+                    权威角色提示；保存值会逐字成为模型请求中唯一的系统指令
                   </small>
                   <textarea
                     id="agent-system-prompt"
@@ -1321,7 +1540,7 @@ onBeforeUnmount(() => {
                   <button
                     class="secondary-button preview-button"
                     type="button"
-                    :disabled="editorLocked"
+                    :disabled="editorLocked || !canUseBoundModel"
                     @click="loadRequestPreview"
                   >
                     {{
@@ -1392,7 +1611,7 @@ onBeforeUnmount(() => {
                 </div>
                 <p class="observability-note">
                   两种视图来自同一次后端请求快照；可读视图逐字展示其中的
-                  system、role 与 text block，原始 JSON 保留传输元数据。
+                  系统指令、role 与文本块，原始 JSON 保留传输元数据。
                 </p>
               </div>
             </details>

@@ -12,7 +12,7 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 AGENT_IDS = ("A", "B", "C")
 DEFAULT_SYSTEM_PROMPT_TEMPLATE = """\
 【行为原则】
@@ -67,6 +67,14 @@ def _require_non_blank_system_prompt(value: str) -> str:
     if not value.strip():
         raise ValueError("system_prompt must not be blank")
     return value
+
+
+def _strip_non_blank_model(value: str) -> str:
+    """Strip whitespace and require a concrete model name."""
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError("model must not be blank")
+    return stripped
 
 
 def compose_system_prompt(
@@ -134,12 +142,21 @@ class AgentUpdate(ApiModel):
 class Scene(ApiModel):
     """A named scene containing exactly three agents (A, B, C)."""
 
-    schema_version: Literal[4] = SCHEMA_VERSION
+    schema_version: Literal[5] = SCHEMA_VERSION
     id: UUID
     name: str
+    model: str | None
     agents: list[Agent] = Field(min_length=3, max_length=3)
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
+
+    @field_validator("model")
+    @classmethod
+    def validate_model(cls, value: str | None) -> str | None:
+        """Allow legacy unbound scenes or one concrete model name."""
+        if value is None:
+            return None
+        return _strip_non_blank_model(value)
 
     @model_validator(mode="after")
     def validate_agent_ids(self) -> Self:
@@ -161,8 +178,31 @@ class CreateSceneRequest(ApiModel):
     """Payload for creating a new scene."""
 
     name: str
+    model: str
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
+    _validate_model = field_validator("model")(_strip_non_blank_model)
+
+
+class BindSceneModelRequest(ApiModel):
+    """One-time model binding payload for a legacy scene."""
+
+    model: str
+
+    _validate_model = field_validator("model")(_strip_non_blank_model)
+
+
+class ModelOption(ApiModel):
+    """One public model choice without endpoint credentials."""
+
+    protocol: Literal["anthropic", "responses"]
+    model: str
+
+
+class ModelOptionsResponse(ApiModel):
+    """Configured model choices in stable protocol order."""
+
+    options: list[ModelOption]
 
 
 class UpdateSceneRequest(ApiModel):
@@ -196,7 +236,7 @@ class CreateMessageRequest(ApiModel):
 
 
 class MessageDraftUsage(ApiModel):
-    """Anthropic token usage returned for one draft generation."""
+    """Protocol-neutral token partitions for one draft generation."""
 
     input_tokens: int = Field(ge=0)
     output_tokens: int = Field(ge=0)
@@ -204,10 +244,26 @@ class MessageDraftUsage(ApiModel):
     cache_read_input_tokens: int = Field(ge=0)
 
 
+class ModelReasoningBlock(ApiModel):
+    """One readable model-provided reasoning block for observer display."""
+
+    type: Literal["thinking", "summary_text", "reasoning_text"]
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def validate_text(cls, value: str) -> str:
+        """Require readable content while preserving provider whitespace."""
+        if not value.strip():
+            raise ValueError("reasoning text must not be blank")
+        return value
+
+
 class MessageDraftResponse(ApiModel):
     """Editable model-generated message draft."""
 
     content: str
+    reasoning: list[ModelReasoningBlock]
     usage: MessageDraftUsage
     request_snapshot: dict[str, Any]
 
@@ -241,6 +297,10 @@ class MessageNotFoundError(LookupError):
 
 class MessageDeletionConflictError(RuntimeError):
     """Raised when a message cannot be safely removed from both timelines."""
+
+
+class SceneModelBindingConflictError(RuntimeError):
+    """Raised when attempting to replace an existing scene model binding."""
 
 
 _ADDRESSED_MESSAGE_PATTERN = re.compile(
@@ -281,11 +341,12 @@ def _parse_received_message(content: str) -> tuple[AgentId, str]:
     return match.group(1), match.group(2)
 
 
-def create_scene(name: str) -> Scene:
+def create_scene(name: str, model: str) -> Scene:
     """Create a new scene with default agents.
 
     Args:
         name: The display name for the scene.
+        model: Concrete configured model bound to the scene.
 
     Returns:
         A Scene with a new UUID and one default agent per agent ID.
@@ -293,6 +354,7 @@ def create_scene(name: str) -> Scene:
     return Scene(
         id=uuid4(),
         name=name,
+        model=model,
         agents=[
             Agent(
                 id=agent_id,
@@ -302,6 +364,15 @@ def create_scene(name: str) -> Scene:
             for agent_id in AGENT_IDS
         ],
     )
+
+
+def bind_scene_model(scene: Scene, model: str) -> Scene:
+    """Bind a legacy scene to one model without allowing later replacement."""
+    if scene.model is not None:
+        raise SceneModelBindingConflictError(
+            f"Scene '{scene.id}' already has a model binding."
+        )
+    return scene.model_copy(update={"model": _strip_non_blank_model(model)})
 
 
 def add_message(scene: Scene, message: CreateMessageRequest) -> Scene:
@@ -453,6 +524,7 @@ def update_scene(scene: Scene, update: UpdateSceneRequest) -> Scene:
         schema_version=scene.schema_version,
         id=scene.id,
         name=update.name,
+        model=scene.model,
         agents=[
             Agent(
                 id=updated_agent.id,

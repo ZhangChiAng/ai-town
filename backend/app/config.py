@@ -9,7 +9,17 @@ from dotenv import dotenv_values
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_ENV_FILE = REPOSITORY_ROOT / ".env"
-MODEL_VARIABLES = ("BASE_URL", "API_KEY", "MODEL")
+ANTHROPIC_VARIABLES = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_MODEL",
+)
+RESPONSES_VARIABLES = (
+    "RESPONSES_BASE_URL",
+    "RESPONSES_API_KEY",
+    "RESPONSES_MODEL",
+)
+MODEL_VARIABLES = ANTHROPIC_VARIABLES + RESPONSES_VARIABLES
 
 
 class ModelConfigError(RuntimeError):
@@ -18,17 +28,25 @@ class ModelConfigError(RuntimeError):
 
 @dataclass(frozen=True)
 class ModelSettings:
-    """Validated settings used to create the Anthropic client."""
+    """Validated settings used to create one model SDK client."""
 
     base_url: str
     api_key: str
     model: str
 
 
+@dataclass(frozen=True)
+class ConfiguredModels:
+    """The two protocol configurations required by one application process."""
+
+    anthropic: ModelSettings
+    responses: ModelSettings
+
+
 def load_model_settings(
     env_file: Path = DEFAULT_ENV_FILE,
     environ: dict[str, str] | None = None,
-) -> ModelSettings:
+) -> ConfiguredModels:
     """Load model settings with process environment values taking priority.
 
     Args:
@@ -40,8 +58,9 @@ def load_model_settings(
         Validated model settings.
 
     Raises:
-        ModelConfigError: If a value is missing, blank, or BASE_URL is not a
-            valid HTTP(S) URL. The error only identifies variable names.
+        ModelConfigError: If a value is missing or blank, a base URL is not a
+            valid HTTP(S) URL, or a model conflicts with its protocol. The
+            error only identifies variable names.
     """
     environment = os.environ if environ is None else environ
     file_values = dotenv_values(env_file) if env_file.is_file() else {}
@@ -55,8 +74,20 @@ def load_model_settings(
             continue
         values[name] = raw_value.strip()
 
-    if "BASE_URL" in values and not _is_valid_http_url(values["BASE_URL"]):
-        invalid_names.append("BASE_URL")
+    for name in ("ANTHROPIC_BASE_URL", "RESPONSES_BASE_URL"):
+        if name in values and not _is_valid_http_url(values[name]):
+            invalid_names.append(name)
+
+    anthropic_model = values.get("ANTHROPIC_MODEL")
+    if (
+        anthropic_model is not None
+        and "claude" not in anthropic_model.casefold()
+    ):
+        invalid_names.append("ANTHROPIC_MODEL")
+
+    responses_model = values.get("RESPONSES_MODEL")
+    if responses_model is not None and "claude" in responses_model.casefold():
+        invalid_names.append("RESPONSES_MODEL")
 
     if invalid_names:
         names = ", ".join(
@@ -64,10 +95,17 @@ def load_model_settings(
         )
         raise ModelConfigError(f"Invalid model configuration: {names}")
 
-    return ModelSettings(
-        base_url=values["BASE_URL"],
-        api_key=values["API_KEY"],
-        model=values["MODEL"],
+    return ConfiguredModels(
+        anthropic=ModelSettings(
+            base_url=values["ANTHROPIC_BASE_URL"],
+            api_key=values["ANTHROPIC_API_KEY"],
+            model=values["ANTHROPIC_MODEL"],
+        ),
+        responses=ModelSettings(
+            base_url=values["RESPONSES_BASE_URL"],
+            api_key=values["RESPONSES_API_KEY"],
+            model=values["RESPONSES_MODEL"],
+        ),
     )
 
 
