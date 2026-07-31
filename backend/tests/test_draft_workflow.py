@@ -291,6 +291,8 @@ def test_generation_errors_are_sanitized_and_never_retried() -> None:
         DraftWorkflow(transport).generate(scene, "A", "inner")
 
     assert str(caught.value) == "Model request failed."
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
     assert len(transport.generated) == 1
     invalid_outer = FakeBackend([generation("not addressed")])
     inner = DraftWorkflow(FakeBackend([generation("inner")])).generate(

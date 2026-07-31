@@ -196,6 +196,68 @@ def test_factory_failure_is_sanitized_after_reverse_cleanup() -> None:
     ]
 
 
+def test_invalid_factory_result_is_sanitized_and_reverse_cleaned() -> None:
+    """Returned objects are validated inside the protected startup boundary."""
+    events: list[str] = []
+    secret = "secret-from-model-property"
+
+    class ExplodingIdentityBackend(RecordingBackend):
+        """Own a resource but fail while exposing its registry identity."""
+
+        @property
+        def model(self) -> str:
+            """Simulate a malformed adapter property with sensitive detail."""
+            raise RuntimeError(secret)
+
+        def close(self) -> None:
+            """Record cleanup without reading the broken model property."""
+            events.append("close:exploding")
+
+    def factory(settings: ModelBackendSettings) -> ModelBackend:
+        events.append(f"create:{settings.model}")
+        if settings.model == "second":
+            return ExplodingIdentityBackend(settings.model, events)
+        return RecordingBackend(settings.model, events)
+
+    with pytest.raises(
+        BackendRegistryError, match="backend factory failed"
+    ) as caught:
+        create_model_backend_registry(
+            (_settings("first"), _settings("second")),
+            {"shared_protocol": factory},
+        )
+
+    error = caught.value
+    assert secret not in str(error)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    assert events == [
+        "create:first",
+        "create:second",
+        "close:exploding",
+        "close:first",
+    ]
+
+
+def test_none_factory_result_closes_previously_created_backends() -> None:
+    """A factory returning no backend is a sanitized partial failure."""
+    events: list[str] = []
+
+    def factory(settings: ModelBackendSettings) -> ModelBackend:
+        events.append(f"create:{settings.model}")
+        if settings.model == "second":
+            return None  # type: ignore[return-value]
+        return RecordingBackend(settings.model, events)
+
+    with pytest.raises(BackendRegistryError, match="backend factory failed"):
+        create_model_backend_registry(
+            (_settings("first"), _settings("second")),
+            {"shared_protocol": factory},
+        )
+
+    assert events == ["create:first", "create:second", "close:first"]
+
+
 def test_normal_close_is_reverse_order_and_idempotent() -> None:
     """The registry owns one reverse-order close pass on normal shutdown."""
     events: list[str] = []

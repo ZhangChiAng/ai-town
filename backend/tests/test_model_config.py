@@ -229,6 +229,8 @@ api_key_env = "SECOND_KEY"
         "https:///missing-host",
         "https://example.test:invalid-port",
         "https://example.test/has a space",
+        "https://example.test/%zz",
+        "https://example.test\\\\evil",
     ],
 )
 def test_rejects_invalid_absolute_http_urls(

@@ -16,6 +16,7 @@ DEFAULT_ENV_FILE = REPOSITORY_ROOT / ".env"
 
 _MODEL_FIELDS = frozenset({"model", "protocol", "base_url", "api_key_env"})
 _ENVIRONMENT_VARIABLE_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_MALFORMED_PERCENT_ESCAPE_PATTERN = re.compile(r"%(?![0-9A-Fa-f]{2})")
 
 
 class ModelConfigError(RuntimeError):
@@ -225,7 +226,12 @@ def _require_string(
 
 def _is_valid_http_url(value: str) -> bool:
     """Return whether a value is an absolute HTTP(S) URL."""
-    if any(character.isspace() for character in value):
+    if any(
+        character.isspace() or ord(character) < 32 or character == "\\"
+        for character in value
+    ):
+        return False
+    if _MALFORMED_PERCENT_ESCAPE_PATTERN.search(value) is not None:
         return False
     try:
         parsed = urlsplit(value)

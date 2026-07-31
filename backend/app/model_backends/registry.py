@@ -94,26 +94,56 @@ def create_model_backend_registry(
     _validate_settings(ordered_settings, factories)
 
     backends: list[ModelBackend] = []
+    factory_failed = False
     for model_settings in ordered_settings:
+        backend: ModelBackend | None = None
+        backend_model = ""
         try:
             backend = factories[model_settings.protocol](model_settings)
-        except BaseException:
-            _close_after_failed_creation(backends)
+            if not isinstance(backend, ModelBackend):
+                raise TypeError("factory returned an invalid backend")
+            backend_model = backend.model
+        except BaseException as error:
+            cleanup_targets = [*backends]
+            if backend is not None:
+                cleanup_targets.append(backend)
+            _close_after_failed_creation(cleanup_targets)
+            if not isinstance(error, Exception):
+                raise
+            factory_failed = True
             break
 
+        assert backend is not None
         backends.append(backend)
-        if backend.model != model_settings.model:
+        if backend_model != model_settings.model:
             _close_after_failed_creation(backends)
             raise BackendRegistryError(
                 "Invalid backend registry: factory returned wrong model"
             ) from None
-    else:
-        return ModelBackendRegistry(backends)
 
-    # Raising outside the handler prevents provider errors becoming context.
-    raise BackendRegistryError(
-        "Invalid backend registry: backend factory failed"
-    ) from None
+    if factory_failed:
+        # Raising outside the handler drops provider exceptions completely.
+        raise BackendRegistryError(
+            "Invalid backend registry: backend factory failed"
+        ) from None
+
+    registry_failed = False
+    registry: ModelBackendRegistry | None = None
+    try:
+        registry = ModelBackendRegistry(backends)
+    except BaseException as error:
+        _close_after_failed_creation(backends)
+        if not isinstance(error, Exception):
+            raise
+        registry_failed = True
+
+    if registry_failed:
+        # A hostile or stateful backend identity must not leak startup data.
+        raise BackendRegistryError(
+            "Invalid backend registry: backend factory failed"
+        ) from None
+    assert registry is not None
+    return registry
 
 
 def _validate_settings(

@@ -583,6 +583,13 @@ async function generateDraft(): Promise<void> {
   busyAction.value = `generate:${agentId}:${layer}`;
   draftErrors.value[agentId] = "";
   try {
+    // A browser draft can survive a backend restart with a new model list.
+    await refreshModelOptions();
+    if (!sceneModelAvailable.value) {
+      draftErrors.value[agentId] =
+        "场景模型当前不可用，未发起生成。";
+      return;
+    }
     drafts.value[agentId] = await generateLayerDraft(
       scene.id,
       agentId,
@@ -696,6 +703,12 @@ async function loadPreview(): Promise<void> {
   busyAction.value = `preview:${key}`;
   previewError.value = "";
   try {
+    // Refresh without touching browser-held drafts or confirmation state.
+    await refreshModelOptions();
+    if (!sceneModelAvailable.value) {
+      previewError.value = "场景模型当前不可用，未加载预览。";
+      return;
+    }
     previews.value[key] = await getModelRequestPreview(
       scene.id,
       activeAgentId.value,

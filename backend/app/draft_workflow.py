@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID, uuid4
 
-from app.model_backends import (
+from app.model_backends.contracts import (
     JsonObject,
     ModelBackend,
     ModelConversation,
@@ -106,17 +106,22 @@ class DraftWorkflow:
     ) -> LayerDraftResponse:
         """Prepare once, call once, and return an unpersisted browser draft."""
         draft = self._prepare(scene, agent_id, layer)
+        generation = None
+        failure_message = None
         try:
             generation = self._backend.generate(draft.request)
             if layer == "outer":
                 parse_addressed_message(generation.content, agent_id)
-        except ValueError as error:
-            raise DraftGenerationError(
-                f"Model returned an invalid {layer} draft."
-            ) from error
-        except Exception as error:
+        except ValueError:
+            failure_message = f"Model returned an invalid {layer} draft."
+        except Exception:
             # Provider bodies and credentials never cross this boundary.
-            raise DraftGenerationError("Model request failed.") from error
+            failure_message = "Model request failed."
+
+        if failure_message is not None:
+            # Raise outside the handler so no provider exception stays linked.
+            raise DraftGenerationError(failure_message) from None
+        assert generation is not None
 
         usage = TokenUsage(
             input_tokens=generation.usage.input_tokens,

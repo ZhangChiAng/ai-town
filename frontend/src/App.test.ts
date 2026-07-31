@@ -1,7 +1,6 @@
 import {
   createApp,
   nextTick,
-  reactive,
   type App as VueApp,
 } from "vue";
 import {
@@ -205,7 +204,7 @@ describe("App", () => {
   async function mountOpenedScene(
     scene: Scene,
     routes: Record<string, RouteHandler> = {},
-    availableModels: ModelOption[] = [
+    availableModels: () => ModelOption[] = () => [
       { model: MODEL },
       { model: "gpt-test" },
     ],
@@ -218,7 +217,7 @@ describe("App", () => {
           return jsonResponse([{ id: scene.id, name: scene.name }]);
         }
         if (method === "GET" && path === "/api/model-options") {
-          return jsonResponse({ options: availableModels });
+          return jsonResponse({ options: availableModels() });
         }
         if (method === "GET" && path === `/api/scenes/${scene.id}`) {
           return jsonResponse(scene);
@@ -454,16 +453,20 @@ describe("App", () => {
   });
 
   it("confirms an existing draft after its model is removed", async () => {
-    const availableModels = reactive<ModelOption[]>([
+    let availableModels: ModelOption[] = [
       { model: MODEL },
       { model: "gpt-test" },
-    ]);
+    ];
+    let generationCount = 0;
+    let optionsRequestCount = 0;
     let confirmationBody: unknown;
     await mountOpenedScene(
       pendingScene(),
       {
-        [`POST /api/scenes/${SCENE_ID}/agents/A/inner-drafts`]:
-          jsonResponse(innerDraft()),
+        [`POST /api/scenes/${SCENE_ID}/agents/A/inner-drafts`]: () => {
+          generationCount += 1;
+          return jsonResponse(innerDraft());
+        },
         [`POST /api/scenes/${SCENE_ID}/agents/A/inner-confirmations`]: (
           init,
         ) => {
@@ -471,18 +474,22 @@ describe("App", () => {
           return jsonResponse(halfRoundScene());
         },
       },
-      availableModels,
+      () => {
+        optionsRequestCount += 1;
+        // Return a fresh array, matching a real JSON response boundary.
+        return availableModels.map((option) => ({ ...option }));
+      },
     );
     findButton(container, "生成内层草稿").click();
     await flush();
 
-    availableModels.splice(
-      availableModels.findIndex((option) => option.model === MODEL),
-      1,
-    );
-    await nextTick();
+    availableModels = [{ model: "gpt-test" }];
+    findButton(container, "重新生成").click();
+    await flush();
 
     expect(container.textContent).toContain(`${MODEL} 当前不可用`);
+    expect(generationCount).toBe(1);
+    expect(optionsRequestCount).toBeGreaterThanOrEqual(3);
     expect(findButton(container, "重新生成").disabled).toBe(true);
     expect(findButton(container, "加载预览").disabled).toBe(true);
     expect(findButton(container, "确认内层").disabled).toBe(false);

@@ -118,6 +118,17 @@ def test_concrete_adapters_do_not_depend_on_business_or_storage_layers() -> (
 def test_draft_workflow_has_no_provider_routing_or_wire_vocabulary() -> None:
     """The draft workflow consumes only protocol-neutral ports and values."""
     tree = _parse(APP_ROOT / "draft_workflow.py")
+    backend_imports = (
+        target
+        for target, _symbol in _import_targets(tree)
+        if target == "app.model_backends"
+        or target.startswith("app.model_backends.")
+    )
+    assert all(
+        target == "app.model_backends.contracts"
+        or target.startswith("app.model_backends.contracts.")
+        for target in backend_imports
+    ), "draft_workflow must depend directly on the neutral contracts"
     vocabulary = _identifiers(tree) | _strings(tree)
 
     for value in vocabulary:
