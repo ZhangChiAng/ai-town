@@ -1,35 +1,154 @@
 import { createApp, nextTick, type App as VueApp } from "vue";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import App from "./App.vue";
-import type { MessageDraftResponse, Scene } from "./types";
+import type {
+  ExternalEvent,
+  LayerDraftResponse,
+  ModelRequestPreviewResponse,
+  Scene,
+} from "./types";
 
 const SCENE_ID = "11111111-1111-4111-8111-111111111111";
-const ANTHROPIC_MODEL = "anthropic/claude-test";
-const RESPONSES_MODEL = "gpt-test";
-const MODEL_OPTIONS = {
-  options: [
-    { protocol: "anthropic", model: ANTHROPIC_MODEL },
-    { protocol: "responses", model: RESPONSES_MODEL },
-  ],
-};
+const EVENT_ID = "22222222-2222-4222-8222-222222222222";
+const INNER_CALL_ID = "33333333-3333-4333-8333-333333333333";
+const OUTER_CALL_ID = "44444444-4444-4444-8444-444444444444";
+const GENERATED_EVENT_ID = "55555555-5555-4555-8555-555555555555";
+const STATE_TOKEN = "a".repeat(64);
+const MODEL = "anthropic/claude-test";
 
-function makeScene(model: string | null = ANTHROPIC_MODEL): Scene {
+type RouteHandler =
+  | Response
+  | ((init?: RequestInit) => Response | Promise<Response>);
+
+function makeScene(): Scene {
   return {
-    schema_version: 5,
+    schema_version: 6,
     id: SCENE_ID,
     name: "海边小镇",
-    model,
+    model: MODEL,
     agents: (["A", "B", "C"] as const).map((id) => ({
       id,
       name: `居民 ${id}`,
-      persona: "",
-      desire: "",
-      fear: "",
-      memory: "",
-      system_prompt: `SYSTEM ${id}`,
-      timeline: [],
+      inner_context: {
+        system_prompt: `INNER ${id}`,
+        turns: [],
+      },
+      outer_context: {
+        system_prompt: `OUTER ${id}`,
+        turns: [],
+      },
+      pending_events: [],
     })),
+    rollback_stack: [],
+    next_sequence: 1,
+  };
+}
+
+function manualEvent(
+  content = "海面突然起雾。",
+  id = EVENT_ID,
+  sequence = 1,
+): ExternalEvent {
+  return {
+    id,
+    sequence,
+    kind: "manual",
+    content,
+    source_agent_id: null,
+    source_call_id: null,
+  };
+}
+
+function pendingScene(): Scene {
+  const scene = makeScene();
+  scene.agents[0].pending_events.push(manualEvent());
+  scene.next_sequence = 2;
+  return scene;
+}
+
+function halfRoundScene(): Scene {
+  const scene = makeScene();
+  scene.agents[0].inner_context.turns.push({
+    call_id: INNER_CALL_ID,
+    event_id: EVENT_ID,
+    sequence: 2,
+    input: "外部事件：\n海面突然起雾。",
+    output: "先观察风向。\n别急着靠岸。",
+    consumed_event: manualEvent(),
+  });
+  scene.rollback_stack.push({
+    call_id: INNER_CALL_ID,
+    agent_id: "A",
+    layer: "inner",
+  });
+  scene.next_sequence = 3;
+  return scene;
+}
+
+function completeScene(): Scene {
+  const scene = halfRoundScene();
+  scene.agents[0].outer_context.turns.push({
+    call_id: OUTER_CALL_ID,
+    event_id: EVENT_ID,
+    sequence: 3,
+    input:
+      "外部事件：\n海面突然起雾。\n\n" +
+      "你内心有一个声音：\n先观察风向。\n别急着靠岸。",
+    output: "To B: 今晚先别出海。",
+    recipient_id: "B",
+    generated_event_id: GENERATED_EVENT_ID,
+  });
+  scene.agents[1].pending_events.push({
+    id: GENERATED_EVENT_ID,
+    sequence: 3,
+    kind: "agent_message",
+    content: "From A: 今晚先别出海。",
+    source_agent_id: "A",
+    source_call_id: OUTER_CALL_ID,
+  });
+  scene.rollback_stack.push({
+    call_id: OUTER_CALL_ID,
+    agent_id: "A",
+    layer: "outer",
+  });
+  scene.next_sequence = 4;
+  return scene;
+}
+
+function innerDraft(): LayerDraftResponse {
+  return {
+    layer: "inner",
+    call_id: INNER_CALL_ID,
+    event_id: EVENT_ID,
+    content: "先观察风向。",
+    reasoning: [
+      { type: "thinking", text: "临时判断，不应持久化" },
+    ],
+    usage: {
+      input_tokens: 10,
+      output_tokens: 5,
+      cache_creation_input_tokens: 2,
+      cache_read_input_tokens: 3,
+    },
+    request_snapshot: {
+      model: "test-model",
+      system: [{ type: "text", text: "INNER A" }],
+      messages: [
+        {
+          role: "user",
+          content: [{ type: "text", text: "外部事件：\n海面突然起雾。" }],
+        },
+      ],
+    },
+    state_token: STATE_TOKEN,
   };
 }
 
@@ -48,6 +167,19 @@ async function flush(): Promise<void> {
   await nextTick();
 }
 
+function findButton(
+  container: HTMLElement,
+  text: string,
+): HTMLButtonElement {
+  const button = [...container.querySelectorAll("button")].find(
+    (candidate) => candidate.textContent?.includes(text),
+  );
+  if (button === undefined) {
+    throw new Error(`Button not found: ${text}`);
+  }
+  return button as HTMLButtonElement;
+}
+
 describe("App", () => {
   let container: HTMLDivElement;
   let app: VueApp<Element> | undefined;
@@ -61,97 +193,13 @@ describe("App", () => {
     app?.unmount();
     container.remove();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   async function mountOpenedScene(
-    routes: Record<string, Response | (() => Response)>,
+    scene: Scene,
+    routes: Record<string, RouteHandler> = {},
   ): Promise<ReturnType<typeof vi.fn>> {
-    const fetchMock = vi.fn(
-      async (input: RequestInfo | URL, init?: RequestInit) => {
-        const method = init?.method ?? "GET";
-        const route = `${method} ${String(input)}`;
-        if (route === "GET /api/model-options") {
-          return jsonResponse(MODEL_OPTIONS);
-        }
-        const result = routes[route];
-        if (result === undefined) {
-          throw new Error(`Unexpected request: ${route}`);
-        }
-        return typeof result === "function" ? result() : result;
-      },
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    app = createApp(App);
-    app.mount(container);
-    await flush();
-    (
-      [...container.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("海边小镇"),
-      ) as HTMLButtonElement
-    ).click();
-    await flush();
-    return fetchMock;
-  }
-
-  it("shows authoritative timeline text without generated direction labels", async () => {
-    const scene = makeScene();
-    scene.agents[0].timeline.push({
-      type: "message",
-      message_id: "22222222-2222-4222-8222-222222222222",
-      direction: "sent",
-      counterpart_id: "B",
-      content: "To B: 灯塔下见。",
-    });
-
-    await mountOpenedScene({
-      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
-      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
-    });
-
-    expect(container.textContent).toContain("To B: 灯塔下见。");
-    expect(container.textContent).not.toContain("发送给 B：");
-    expect(container.textContent).not.toContain("发给 居民 B");
-    expect(container.textContent).not.toContain("内心的声音");
-  });
-
-  it("edits and submits the complete To-prefixed draft unchanged", async () => {
-    const scene = makeScene();
-    const confirmed = makeScene();
-    confirmed.agents[0].timeline.push({
-      type: "message",
-      message_id: "33333333-3333-4333-8333-333333333333",
-      direction: "sent",
-      counterpart_id: "C",
-      content: "To C: 改去码头。",
-    });
-    confirmed.agents[2].timeline.push({
-      type: "message",
-      message_id: "33333333-3333-4333-8333-333333333333",
-      direction: "received",
-      counterpart_id: "A",
-      content: "From A: 改去码头。",
-    });
-    const generated: MessageDraftResponse = {
-      content: "To B: 灯塔下见。",
-      reasoning: [
-        {
-          type: "thinking",
-          text: "UNIQUE READONLY REASONING",
-        },
-        {
-          type: "summary_text",
-          text: "先做一个低压力的邀请。",
-        },
-      ],
-      usage: {
-        input_tokens: 10,
-        output_tokens: 5,
-        cache_creation_input_tokens: 2,
-        cache_read_input_tokens: 3,
-      },
-      request_snapshot: {},
-    };
-    let sentBody: unknown;
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const method = init?.method ?? "GET";
@@ -160,212 +208,39 @@ describe("App", () => {
           return jsonResponse([{ id: scene.id, name: scene.name }]);
         }
         if (method === "GET" && path === "/api/model-options") {
-          return jsonResponse(MODEL_OPTIONS);
+          return jsonResponse({
+            options: [
+              { protocol: "anthropic", model: MODEL },
+              { protocol: "responses", model: "gpt-test" },
+            ],
+          });
         }
         if (method === "GET" && path === `/api/scenes/${scene.id}`) {
           return jsonResponse(scene);
         }
-        if (
-          method === "POST" &&
-          path === `/api/scenes/${scene.id}/agents/A/message-drafts`
-        ) {
-          return jsonResponse(generated);
+        const handler = routes[`${method} ${path}`];
+        if (handler === undefined) {
+          throw new Error(`Unexpected request: ${method} ${path}`);
         }
-        if (method === "POST" && path === `/api/scenes/${scene.id}/messages`) {
-          sentBody = JSON.parse(String(init?.body));
-          return jsonResponse(confirmed, 201);
-        }
-        throw new Error(`Unexpected request: ${method} ${path}`);
+        return typeof handler === "function"
+          ? await handler(init)
+          : handler;
       },
     );
     vi.stubGlobal("fetch", fetchMock);
     app = createApp(App);
     app.mount(container);
     await flush();
-    (
-      [...container.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("海边小镇"),
-      ) as HTMLButtonElement
-    ).click();
+    findButton(container, scene.name).click();
     await flush();
-    (
-      [...container.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("生成草稿"),
-      ) as HTMLButtonElement
-    ).click();
-    await flush();
+    return fetchMock;
+  }
 
-    const textarea = container.querySelector(
-      "#message-content",
-    ) as HTMLTextAreaElement;
-    expect(textarea.value).toBe("To B: 灯塔下见。");
-    expect(container.textContent).toContain("模型思维");
-    expect(container.textContent).toContain("Claude thinking");
-    expect(container.textContent).toContain("UNIQUE READONLY REASONING");
-    expect(container.textContent).toContain("推理摘要");
-    expect(container.textContent).toContain("缓存写入");
-    expect(container.textContent).not.toContain("5 分钟缓存写入");
-    textarea.value = "To C: 改去码头。";
-    textarea.dispatchEvent(new Event("input", { bubbles: true }));
-    await nextTick();
-    (
-      [...container.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("确认发送"),
-      ) as HTMLButtonElement
-    ).click();
-    await flush();
-
-    expect(sentBody).toEqual({
-      sender_id: "A",
-      content: "To C: 改去码头。",
-    });
-    expect(container.textContent).not.toContain("UNIQUE READONLY REASONING");
-    expect(container.querySelector("#message-recipient")).toBeNull();
-  });
-
-  it("states when a generated response has no readable reasoning", async () => {
-    const scene = makeScene();
-    const generated: MessageDraftResponse = {
-      content: "To B: 下午喝茶吗？",
-      reasoning: [],
-      usage: {
-        input_tokens: 10,
-        output_tokens: 5,
-        cache_creation_input_tokens: 0,
-        cache_read_input_tokens: 0,
-      },
-      request_snapshot: {},
-    };
-    await mountOpenedScene({
-      "GET /api/scenes": jsonResponse([
-        { id: scene.id, name: scene.name },
-      ]),
-      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
-      [`POST /api/scenes/${scene.id}/agents/A/message-drafts`]:
-        jsonResponse(generated),
-    });
-
-    (
-      [...container.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("生成草稿"),
-      ) as HTMLButtonElement
-    ).click();
-    await flush();
-
-    expect(container.textContent).toContain(
-      "本次响应没有返回可读思维内容。",
-    );
-  });
-
-  it("renders Anthropic context and raw JSON from one snapshot", async () => {
-    const scene = makeScene();
-    const request = {
-      model: "test-model",
-      system: [{ type: "text", text: "SYSTEM A", cache_control: {} }],
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "From B: 你好。" },
-            { type: "text", text: "FORMAT INSTRUCTION" },
-          ],
-        },
-      ],
-    };
-    await mountOpenedScene({
-      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
-      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
-      [`GET /api/scenes/${scene.id}/agents/A/model-request-preview`]:
-        jsonResponse({ request }),
-    });
-
-    const details = [...container.querySelectorAll("details")].find(
-      (element) => element.textContent?.includes("模型请求预览"),
-    ) as HTMLDetailsElement;
-    details.open = true;
-    (
-      [...details.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("加载预览"),
-      ) as HTMLButtonElement
-    ).click();
-    await flush();
-
-    expect(details.textContent).toContain("SYSTEM A");
-    expect(details.textContent).toContain("From B: 你好。");
-    expect(details.textContent).toContain("FORMAT INSTRUCTION");
-    (
-      [...details.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("原始 JSON"),
-      ) as HTMLButtonElement
-    ).click();
-    await nextTick();
-    expect(details.querySelector(".request-preview > pre")?.textContent).toBe(
-      JSON.stringify(request, null, 2),
-    );
-  });
-
-  it("renders Responses instructions and input from one snapshot", async () => {
-    const scene = makeScene();
-    const request = {
-      model: "gpt-test",
-      instructions: "SYSTEM A",
-      input: [
-        {
-          role: "assistant",
-          content: [
-            { type: "input_text", text: "To B: 之前的消息。" },
-          ],
-        },
-        {
-          role: "user",
-          content: [
-            { type: "input_text", text: "FORMAT INSTRUCTION" },
-          ],
-        },
-      ],
-      max_output_tokens: 2048,
-      store: false,
-    };
-    await mountOpenedScene({
-      "GET /api/scenes": jsonResponse([
-        { id: scene.id, name: scene.name },
-      ]),
-      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
-      [`GET /api/scenes/${scene.id}/agents/A/model-request-preview`]:
-        jsonResponse({ request }),
-    });
-
-    const details = [...container.querySelectorAll("details")].find(
-      (element) => element.textContent?.includes("模型请求预览"),
-    ) as HTMLDetailsElement;
-    details.open = true;
-    (
-      [...details.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("加载预览"),
-      ) as HTMLButtonElement
-    ).click();
-    await flush();
-
-    expect(details.textContent).toContain("instructions");
-    expect(details.textContent).toContain("SYSTEM A");
-    expect(details.textContent).toContain("assistant");
-    expect(details.textContent).toContain("To B: 之前的消息。");
-    expect(details.textContent).toContain("FORMAT INSTRUCTION");
-    (
-      [...details.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("原始 JSON"),
-      ) as HTMLButtonElement
-    ).click();
-    await nextTick();
-    expect(details.querySelector(".request-preview > pre")?.textContent).toBe(
-      JSON.stringify(request, null, 2),
-    );
-  });
-
-  it("shows both actual model names with no creation default", async () => {
-    let createdBody: unknown;
-    const created = makeScene(RESPONSES_MODEL);
-    created.name = "雨夜港口";
+  it("creates a scene with the explicitly selected model", async () => {
+    const created = makeScene();
+    created.name = "新场景";
+    created.model = "gpt-test";
+    let createBody: unknown;
     const fetchMock = vi.fn(
       async (input: RequestInfo | URL, init?: RequestInit) => {
         const method = init?.method ?? "GET";
@@ -374,10 +249,15 @@ describe("App", () => {
           return jsonResponse([]);
         }
         if (method === "GET" && path === "/api/model-options") {
-          return jsonResponse(MODEL_OPTIONS);
+          return jsonResponse({
+            options: [
+              { protocol: "anthropic", model: MODEL },
+              { protocol: "responses", model: "gpt-test" },
+            ],
+          });
         }
         if (method === "POST" && path === "/api/scenes") {
-          createdBody = JSON.parse(String(init?.body));
+          createBody = JSON.parse(String(init?.body));
           return jsonResponse(created, 201);
         }
         throw new Error(`Unexpected request: ${method} ${path}`);
@@ -388,99 +268,295 @@ describe("App", () => {
     app.mount(container);
     await flush();
 
-    const select = container.querySelector(
-      "#new-scene-model",
-    ) as HTMLSelectElement;
-    expect(select.value).toBe("");
-    expect(select.textContent).toContain(`Claude — ${ANTHROPIC_MODEL}`);
-    expect(select.textContent).toContain(`Responses — ${RESPONSES_MODEL}`);
     const name = container.querySelector(
       "#new-scene-name",
     ) as HTMLInputElement;
-    name.value = "雨夜港口";
-    name.dispatchEvent(new Event("input", { bubbles: true }));
-    select.value = RESPONSES_MODEL;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
-    (
-      container.querySelector(".create-button") as HTMLButtonElement
-    ).click();
-    await flush();
-
-    expect(createdBody).toEqual({
-      name: "雨夜港口",
-      model: RESPONSES_MODEL,
-    });
-    expect(container.textContent).toContain(
-      `Responses — ${RESPONSES_MODEL}`,
-    );
-    expect(container.querySelector("#legacy-scene-model")).toBeNull();
-  });
-
-  it("binds a legacy scene once and then renders the model read-only", async () => {
-    const scene = makeScene(null);
-    const bound = makeScene(RESPONSES_MODEL);
-    const fetchMock = await mountOpenedScene({
-      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
-      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
-      [`PUT /api/scenes/${scene.id}/model`]: jsonResponse(bound),
-    });
-
-    expect(container.textContent).toContain("旧场景尚未绑定模型");
-    const select = container.querySelector(
-      "#legacy-scene-model",
+    const model = container.querySelector(
+      '[aria-label="新场景模型"]',
     ) as HTMLSelectElement;
-    expect(select.value).toBe("");
-    select.value = RESPONSES_MODEL;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+    name.value = "新场景";
+    name.dispatchEvent(new Event("input", { bubbles: true }));
+    model.value = "gpt-test";
+    model.dispatchEvent(new Event("change", { bubbles: true }));
     await nextTick();
-    (
-      [...container.querySelectorAll("button")].find((button) =>
-        button.textContent?.includes("确认绑定"),
-      ) as HTMLButtonElement
-    ).click();
+    findButton(container, "创建").click();
     await flush();
 
-    const bindingCall = fetchMock.mock.calls.find(
-      ([input, init]) =>
-        String(input) === `/api/scenes/${scene.id}/model` &&
-        init?.method === "PUT",
-    );
-    expect(JSON.parse(String(bindingCall?.[1]?.body))).toEqual({
-      model: RESPONSES_MODEL,
-    });
-    expect(container.querySelector("#legacy-scene-model")).toBeNull();
-    expect(container.textContent).toContain(
-      `Responses — ${RESPONSES_MODEL}`,
-    );
-    expect(container.textContent).toContain("创建后固定，不可切换");
+    expect(createBody).toEqual({ name: "新场景", model: "gpt-test" });
+    expect(container.textContent).toContain("gpt-test");
   });
 
-  it("keeps manual messaging enabled when the bound model is unavailable", async () => {
-    const scene = makeScene("gpt-retired");
-    await mountOpenedScene({
-      "GET /api/scenes": jsonResponse([{ id: scene.id, name: scene.name }]),
-      [`GET /api/scenes/${scene.id}`]: jsonResponse(scene),
+  it("binds an unbound scene once and then enables model operations", async () => {
+    const unbound = pendingScene();
+    unbound.model = null;
+    const bound = pendingScene();
+    let bindingBody: unknown;
+    await mountOpenedScene(unbound, {
+      [`PUT /api/scenes/${SCENE_ID}/model`]: (init) => {
+        bindingBody = JSON.parse(String(init?.body));
+        return jsonResponse(bound);
+      },
     });
 
-    expect(container.textContent).toContain("当前配置不再提供此模型");
-    const generate = [...container.querySelectorAll("button")].find(
-      (button) => button.textContent?.includes("生成草稿"),
-    ) as HTMLButtonElement;
-    const preview = container.querySelector(
-      ".preview-button",
-    ) as HTMLButtonElement;
+    expect(container.textContent).toContain("尚未绑定模型");
+    expect(findButton(container, "生成内层草稿").disabled).toBe(true);
+    findButton(container, "永久绑定").click();
+    await flush();
+
+    expect(bindingBody).toEqual({ model: MODEL });
+    expect(container.textContent).not.toContain("模型调用已停用");
+    expect(findButton(container, "生成内层草稿").disabled).toBe(false);
+  });
+
+  it("keeps editing available while a bound model is unavailable", async () => {
+    const scene = pendingScene();
+    scene.model = "removed-model";
+    await mountOpenedScene(scene);
+
+    expect(container.textContent).toContain("removed-model 当前不可用");
+    expect(findButton(container, "生成内层草稿").disabled).toBe(true);
+    expect(findButton(container, "添加到队尾").disabled).toBe(false);
+    expect(findButton(container, "加载预览").disabled).toBe(true);
+  });
+
+  it("renders one mixed history with explicit neutral, inner, and outer labels", async () => {
+    await mountOpenedScene(completeScene());
+
+    const timeline = container.querySelector(".timeline") as HTMLElement;
+    expect(timeline.textContent).toContain("外部事件");
+    expect(timeline.textContent).toContain("内层输出");
+    expect(timeline.textContent).toContain("外层输出");
+    expect(timeline.querySelectorAll(".timeline-item--event")).toHaveLength(1);
+    expect(timeline.querySelectorAll(".timeline-item--inner")).toHaveLength(1);
+    expect(timeline.querySelectorAll(".timeline-item--outer")).toHaveLength(1);
+    expect(timeline.querySelectorAll(".call-input")).toHaveLength(2);
+    expect(
+      timeline.querySelector(".timeline-item--event article > p")
+        ?.textContent,
+    ).toBe("海面突然起雾。");
+
+    expect(container.querySelector("#agent-persona")).toBeNull();
+    expect(container.querySelector("#agent-desire")).toBeNull();
+    expect(container.querySelector("#agent-fear")).toBeNull();
+    expect(container.querySelector("#agent-memory")).toBeNull();
+    expect(container.querySelector("#message-content")).toBeNull();
+  });
+
+  it("edits and confirms an inner draft, then exposes only the outer stage", async () => {
+    const initial = pendingScene();
+    const confirmed = halfRoundScene();
+    let confirmationBody: unknown;
+    await mountOpenedScene(initial, {
+      [`POST /api/scenes/${SCENE_ID}/agents/A/inner-drafts`]:
+        jsonResponse(innerDraft()),
+      [`POST /api/scenes/${SCENE_ID}/agents/A/inner-confirmations`]: (
+        init,
+      ) => {
+        confirmationBody = JSON.parse(String(init?.body));
+        return jsonResponse(confirmed);
+      },
+    });
+
+    expect(findButton(container, "生成内层草稿").disabled).toBe(false);
+    findButton(container, "生成内层草稿").click();
+    await flush();
+
     const textarea = container.querySelector(
-      "#message-content",
+      "#layer-draft-content",
     ) as HTMLTextAreaElement;
-    expect(generate.disabled).toBe(true);
-    expect(preview.disabled).toBe(true);
-    expect(textarea.disabled).toBe(false);
-    textarea.value = "To B: 手工消息";
+    expect(textarea.value).toBe("先观察风向。");
+    expect(container.querySelector(".draft-reasoning")?.textContent).toContain(
+      "临时判断，不应持久化",
+    );
+    textarea.value = "先观察。\n也许只是天气。";
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
     await nextTick();
+    findButton(container, "确认内层").click();
+    await flush();
+
+    expect(confirmationBody).toEqual({
+      call_id: INNER_CALL_ID,
+      event_id: EVENT_ID,
+      content: "先观察。\n也许只是天气。",
+      state_token: STATE_TOKEN,
+    });
+    expect(container.textContent).toContain("等待外层人格");
+    expect(container.querySelector(".draft-reasoning")).toBeNull();
+    expect(findButton(container, "生成外层草稿").disabled).toBe(false);
     expect(
-      (container.querySelector(".message-send-button") as HTMLButtonElement)
-        .disabled,
+      [...container.querySelectorAll("button")].some((button) =>
+        button.textContent?.includes("确认发送"),
+      ),
     ).toBe(false);
+  });
+
+  it("keeps the edited draft when regeneration fails", async () => {
+    let generationCount = 0;
+    await mountOpenedScene(pendingScene(), {
+      [`POST /api/scenes/${SCENE_ID}/agents/A/inner-drafts`]: () => {
+        generationCount += 1;
+        return generationCount === 1
+          ? jsonResponse(innerDraft())
+          : jsonResponse({ detail: "Model request failed." }, 502);
+      },
+    });
+
+    findButton(container, "生成内层草稿").click();
+    await flush();
+    const textarea = container.querySelector(
+      "#layer-draft-content",
+    ) as HTMLTextAreaElement;
+    textarea.value = "用户保留的修改";
+    textarea.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    findButton(container, "重新生成").click();
+    await flush();
+
+    expect(textarea.value).toBe("用户保留的修改");
+    expect(container.textContent).toContain("Model request failed.");
+    expect(generationCount).toBe(2);
+  });
+
+  it("creates, edits, and deletes only manual queued events", async () => {
+    const scene = pendingScene();
+    const agentEvent: ExternalEvent = {
+      id: GENERATED_EVENT_ID,
+      sequence: 2,
+      kind: "agent_message",
+      content: "From B: 码头见。",
+      source_agent_id: "B",
+      source_call_id: OUTER_CALL_ID,
+    };
+    scene.agents[0].pending_events.push(agentEvent);
+    scene.next_sequence = 3;
+    const editedScene = structuredClone(scene);
+    editedScene.agents[0].pending_events[0].content = "修改后的雾情";
+    const deletedScene = structuredClone(editedScene);
+    deletedScene.agents[0].pending_events.shift();
+    const createdScene = structuredClone(deletedScene);
+    createdScene.agents[0].pending_events.push(
+      manualEvent(
+        "新增潮汐报告",
+        "66666666-6666-4666-8666-666666666666",
+        3,
+      ),
+    );
+    createdScene.next_sequence = 4;
+
+    let editedBody: unknown;
+    let createdBody: unknown;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await mountOpenedScene(scene, {
+      [`PUT /api/scenes/${SCENE_ID}/agents/A/events/${EVENT_ID}`]: (
+        init,
+      ) => {
+        editedBody = JSON.parse(String(init?.body));
+        return jsonResponse(editedScene);
+      },
+      [`DELETE /api/scenes/${SCENE_ID}/agents/A/events/${EVENT_ID}`]:
+        jsonResponse(deletedScene),
+      [`POST /api/scenes/${SCENE_ID}/agents/A/events`]: (init) => {
+        createdBody = JSON.parse(String(init?.body));
+        return jsonResponse(createdScene, 201);
+      },
+    });
+
+    expect(container.textContent).toContain("Agent 事件 · 不可修改");
+    expect(container.querySelectorAll(".queue-list textarea")).toHaveLength(1);
+    const editArea = container.querySelector(
+      ".queue-list textarea",
+    ) as HTMLTextAreaElement;
+    editArea.value = "修改后的雾情";
+    editArea.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    findButton(container, "保存修改").click();
+    await flush();
+    expect(editedBody).toEqual({ content: "修改后的雾情" });
+
+    findButton(container, "删除").click();
+    await flush();
+    expect(container.querySelectorAll(".queue-list textarea")).toHaveLength(0);
+
+    const createArea = container.querySelector(
+      "#new-event",
+    ) as HTMLTextAreaElement;
+    createArea.value = "新增潮汐报告";
+    createArea.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+    findButton(container, "添加到队尾").click();
+    await flush();
+    expect(createdBody).toEqual({ content: "新增潮汐报告" });
+  });
+
+  it("restores an outer half-round and previews its exact request as text or JSON", async () => {
+    const scene = halfRoundScene();
+    scene.model = "gpt-test";
+    const preview: ModelRequestPreviewResponse = {
+      layer: "outer",
+      event_id: EVENT_ID,
+      request: {
+        model: "gpt-test",
+        instructions: "OUTER A",
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text:
+                  "外部事件：\n海面突然起雾。\n\n" +
+                  "你内心有一个声音：\n先观察风向。\n别急着靠岸。",
+              },
+            ],
+          },
+        ],
+        max_output_tokens: 2048,
+        store: false,
+      },
+    };
+    await mountOpenedScene(scene, {
+      [`GET /api/scenes/${SCENE_ID}/agents/A/model-request-preview?layer=outer`]:
+        jsonResponse(preview),
+    });
+
+    expect(container.textContent).toContain("等待外层人格");
+    expect(findButton(container, "生成外层草稿").disabled).toBe(false);
+    const details = container.querySelector(
+      ".preview-card",
+    ) as HTMLDetailsElement;
+    details.open = true;
+    findButton(details, "加载预览").click();
+    await flush();
+
+    expect(details.textContent).toContain("OUTER A");
+    expect(details.textContent).toContain("你内心有一个声音");
+    findButton(details, "原始 JSON").click();
+    await nextTick();
+    expect(details.querySelector(".request-preview > pre")?.textContent).toBe(
+      JSON.stringify(preview.request, null, 2),
+    );
+  });
+
+  it("asks before rolling back and returns to the saved outer stage", async () => {
+    const scene = completeScene();
+    const rolledBack = halfRoundScene();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const fetchMock = await mountOpenedScene(scene, {
+      [`POST /api/scenes/${SCENE_ID}/rollback`]:
+        jsonResponse(rolledBack),
+    });
+
+    findButton(container, "回退最近确认").click();
+    await flush();
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining("Agent A · 外层"),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/scenes/${SCENE_ID}/rollback`,
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(container.textContent).toContain("等待外层人格");
+    expect(container.querySelectorAll(".timeline-item--outer")).toHaveLength(0);
   });
 });

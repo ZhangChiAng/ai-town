@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import {
   computed,
-  nextTick,
   onBeforeUnmount,
   onMounted,
   ref,
@@ -10,39 +9,54 @@ import {
 
 import {
   bindSceneModel,
-  composeSystemPrompt,
+  confirmLayerDraft,
+  createManualEvent,
   createScene,
-  deleteMessage,
-  generateMessageDraft,
+  deleteManualEvent,
+  editManualEvent,
+  generateLayerDraft,
   getModelOptions,
   getModelRequestPreview,
   getScene,
   listScenes,
+  rollbackLatestCall,
   saveScene,
-  sendMessage,
 } from "./api";
 import {
   AGENT_IDS,
+  type Agent,
   type AgentId,
-  type MessageTimelineRecord,
-  type MessageDraftUsage,
-  type ModelReasoningBlock,
+  type ExternalEvent,
+  type Layer,
+  type LayerDraftResponse,
   type ModelOption,
   type ModelRequest,
+  type ModelRequestPreviewResponse,
   type Scene,
   type SceneSummary,
   type SceneUpdate,
 } from "./types";
 
 type ListState = "loading" | "ready" | "error";
-type ModelOptionsState = "loading" | "ready" | "error";
-type SaveState = "idle" | "saving" | "success" | "error";
-interface MessageDraft {
-  content: string;
-  reasoning: ModelReasoningBlock[];
-  usage: MessageDraftUsage | null;
-}
 type PreviewMode = "readable" | "json";
+const LAYERS: Layer[] = ["inner", "outer"];
+
+interface TimelineItem {
+  key: string;
+  sequence: number;
+  rank: number;
+  kind: "event" | "inner" | "outer";
+  label: string;
+  content: string;
+  status?: string;
+  input?: string;
+  callId?: string;
+}
+
+interface ReadableBlock {
+  label: string;
+  text: string;
+}
 
 const sceneSummaries = ref<SceneSummary[]>([]);
 const currentScene = ref<Scene | null>(null);
@@ -50,75 +64,44 @@ const savedScene = ref<Scene | null>(null);
 const activeAgentId = ref<AgentId>("A");
 const newSceneName = ref("");
 const newSceneModel = ref("");
-const modelOptions = ref<ModelOption[]>([]);
-const modelOptionsState = ref<ModelOptionsState>("loading");
-const modelOptionsError = ref("");
 const bindingModel = ref("");
-const bindingError = ref("");
-const isBindingModel = ref(false);
+const modelOptions = ref<ModelOption[]>([]);
+const modelOptionsError = ref("");
+const newEventContent = ref<Record<AgentId, string>>({
+  A: "",
+  B: "",
+  C: "",
+});
+const eventEdits = ref<Record<string, string>>({});
+const drafts = ref<Record<AgentId, LayerDraftResponse | null>>({
+  A: null,
+  B: null,
+  C: null,
+});
 
 const listState = ref<ListState>("loading");
 const listError = ref("");
 const actionError = ref("");
-const createError = ref("");
+const draftErrors = ref<Record<AgentId, string>>({
+  A: "",
+  B: "",
+  C: "",
+});
+const eventError = ref("");
+const saveMessage = ref("");
 const openingSceneId = ref<string | null>(null);
 const isCreating = ref(false);
-const saveState = ref<SaveState>("idle");
-const saveError = ref("");
-const messageDrafts = ref<Record<AgentId, MessageDraft>>(
-  emptyMessageDrafts(),
-);
-const messageErrors = ref<Record<AgentId, string>>(
-  emptyMessageErrors(),
-);
-const sendingAgentId = ref<AgentId | null>(null);
-const deletingMessageId = ref<string | null>(null);
-const generatingAgentId = ref<AgentId | null>(null);
-const composingAgentId = ref<AgentId | null>(null);
-const requestPreviews = ref<Record<AgentId, ModelRequest | null>>(
-  emptyRequestPreviews(),
-);
-const previewErrors = ref<Record<AgentId, string>>(emptyMessageErrors());
-const previewingAgentId = ref<AgentId | null>(null);
-const previewMode = ref<PreviewMode>("readable");
-const timelineScroller = ref<HTMLElement | null>(null);
-const isTimelinePinned = ref(true);
-const hasNewTimelineUpdate = ref(false);
+const busyAction = ref<string | null>(null);
 
-let listRequestToken = 0;
-let summaryMutationVersion = 0;
-const TIMELINE_BOTTOM_THRESHOLD = 24;
+const previewLayer = ref<Layer>("inner");
+const previewMode = ref<PreviewMode>("readable");
+const previews = ref<
+  Record<string, ModelRequestPreviewResponse | undefined>
+>({});
+const previewError = ref("");
 
 function cloneScene(scene: Scene): Scene {
   return JSON.parse(JSON.stringify(scene)) as Scene;
-}
-
-function emptyMessageDrafts(): Record<AgentId, MessageDraft> {
-  return {
-    A: {
-      content: "",
-      reasoning: [],
-      usage: null,
-    },
-    B: {
-      content: "",
-      reasoning: [],
-      usage: null,
-    },
-    C: {
-      content: "",
-      reasoning: [],
-      usage: null,
-    },
-  };
-}
-
-function emptyMessageErrors(): Record<AgentId, string> {
-  return { A: "", B: "", C: "" };
-}
-
-function emptyRequestPreviews(): Record<AgentId, ModelRequest | null> {
-  return { A: null, B: null, C: null };
 }
 
 function errorMessage(error: unknown, fallback: string): string {
@@ -127,27 +110,46 @@ function errorMessage(error: unknown, fallback: string): string {
     : fallback;
 }
 
-function compareSummaries(
-  left: SceneSummary,
-  right: SceneSummary,
-): number {
-  if (left.name < right.name) return -1;
-  if (left.name > right.name) return 1;
-  return left.id.localeCompare(right.id);
+function stageFor(agent: Agent): Layer {
+  return agent.inner_context.turns.length >
+    agent.outer_context.turns.length
+    ? "outer"
+    : "inner";
 }
 
-function mergeSummaries(
-  summaries: SceneSummary[],
-  newerSummaries: SceneSummary[],
-): SceneSummary[] {
-  const summariesById = new Map(
-    summaries.map((summary) => [summary.id, summary]),
+const activeAgent = computed(() =>
+  currentScene.value?.agents.find(
+    (agent) => agent.id === activeAgentId.value,
+  ),
+);
+
+const activeStage = computed<Layer>(() =>
+  activeAgent.value ? stageFor(activeAgent.value) : "inner",
+);
+
+const activeDraft = computed(
+  () => drafts.value[activeAgentId.value],
+);
+
+const sceneModelAvailable = computed(() => {
+  const model = currentScene.value?.model;
+  return (
+    model !== null &&
+    model !== undefined &&
+    modelOptions.value.some((option) => option.model === model)
   );
-  for (const summary of newerSummaries) {
-    summariesById.set(summary.id, summary);
+});
+
+const sceneModelStatus = computed(() => {
+  const model = currentScene.value?.model;
+  if (model === null || model === undefined) {
+    return "此场景尚未绑定模型。绑定后不能更换。";
   }
-  return [...summariesById.values()].sort(compareSummaries);
-}
+  if (!sceneModelAvailable.value) {
+    return `绑定模型 ${model} 当前不可用。`;
+  }
+  return "";
+});
 
 const isDirty = computed(() => {
   if (currentScene.value === null || savedScene.value === null) {
@@ -159,336 +161,228 @@ const isDirty = computed(() => {
   );
 });
 
-const activeAgent = computed(() =>
-  currentScene.value?.agents.find(
-    (agent) => agent.id === activeAgentId.value,
-  ),
+const hasAnyDraft = computed(() =>
+  AGENT_IDS.some((agentId) => drafts.value[agentId] !== null),
 );
-
-const activeMessageDraft = computed(
-  () => messageDrafts.value[activeAgentId.value],
-);
-
-const hasMessageDrafts = computed(() =>
-  AGENT_IDS.some((agentId) => {
-    const draft = messageDrafts.value[agentId];
-    return draft.content !== "";
-  }),
-);
-
-const activeDraftHasContent = computed(() => {
-  return activeMessageDraft.value.content !== "";
-});
-
-const boundModelOption = computed(() => {
-  const model = currentScene.value?.model;
-  if (model === null || model === undefined) {
-    return undefined;
-  }
-  return modelOptions.value.find((option) => option.model === model);
-});
-
-const canUseBoundModel = computed(
-  () =>
-    currentScene.value?.model !== null &&
-    boundModelOption.value !== undefined,
-);
-
-const deletableMessageIds = computed(() => {
-  const scene = currentScene.value;
-  const deletableIds = new Set<string>();
-  if (scene === null) {
-    return deletableIds;
-  }
-
-  const recordsByMessageId = new Map<
-    string,
-    {
-      agentId: AgentId;
-      index: number;
-      record: MessageTimelineRecord;
-    }[]
-  >();
-  for (const agent of scene.agents) {
-    agent.timeline.forEach((record, index) => {
-      if (record.type !== "message") {
-        return;
-      }
-      const matches = recordsByMessageId.get(record.message_id) ?? [];
-      matches.push({ agentId: agent.id, index, record });
-      recordsByMessageId.set(record.message_id, matches);
-    });
-  }
-
-  for (const [messageId, matches] of recordsByMessageId) {
-    if (matches.length !== 2) {
-      continue;
-    }
-    const sent = matches.find(
-      ({ record }) => record.direction === "sent",
-    );
-    const received = matches.find(
-      ({ record }) => record.direction === "received",
-    );
-    if (sent === undefined || received === undefined) {
-      continue;
-    }
-    const sender = scene.agents.find(
-      (agent) => agent.id === sent.agentId,
-    );
-    const recipient = scene.agents.find(
-      (agent) => agent.id === received.agentId,
-    );
-    if (
-      sender === undefined ||
-      recipient === undefined ||
-      sent.agentId === received.agentId ||
-      sent.record.counterpart_id !== received.agentId ||
-      received.record.counterpart_id !== sent.agentId ||
-      !messagePairContentMatches(
-        sent.record.content,
-        received.record.content,
-        sent.agentId,
-        received.agentId,
-      ) ||
-      sent.index !== sender.timeline.length - 1 ||
-      received.index !== recipient.timeline.length - 1
-    ) {
-      continue;
-    }
-    deletableIds.add(messageId);
-  }
-  return deletableIds;
-});
 
 const editorLocked = computed(
   () =>
-    saveState.value === "saving" ||
-    sendingAgentId.value !== null ||
-    deletingMessageId.value !== null ||
-    generatingAgentId.value !== null ||
-    composingAgentId.value !== null ||
-    previewingAgentId.value !== null ||
-    isBindingModel.value ||
-    isCreating.value ||
-    openingSceneId.value !== null,
+    busyAction.value !== null ||
+    openingSceneId.value !== null ||
+    isCreating.value,
 );
 
-const canSendMessage = computed(
-  () =>
-    currentScene.value !== null &&
-    !isDirty.value &&
-    !editorLocked.value &&
-    activeMessageDraft.value.content.trim() !== "",
-);
+const canGenerate = computed(() => {
+  const agent = activeAgent.value;
+  if (
+    agent === undefined ||
+    !sceneModelAvailable.value ||
+    isDirty.value ||
+    editorLocked.value
+  ) {
+    return false;
+  }
+  return (
+    activeStage.value === "outer" ||
+    agent.pending_events.length > 0
+  );
+});
 
-const canGenerateMessageDraft = computed(
+const canConfirm = computed(
   () =>
-    currentScene.value !== null &&
-    canUseBoundModel.value &&
+    activeDraft.value !== null &&
+    activeDraft.value.layer === activeStage.value &&
+    activeDraft.value.content.trim() !== "" &&
+    sceneModelAvailable.value &&
     !isDirty.value &&
     !editorLocked.value,
 );
 
-const activeTimelineSnapshot = computed(() => ({
-  identity: currentScene.value
-    ? `${currentScene.value.id}:${activeAgentId.value}`
-    : "",
-  records:
-    activeAgent.value?.timeline
-      .map(
-        (record) =>
-          `message:${record.message_id}:${record.direction}:${record.content}`,
-      )
-      .join("\u0000") ?? "",
-}));
-
-function messagePairContentMatches(
-  sentContent: string,
-  receivedContent: string,
-  senderId: AgentId,
-  recipientId: AgentId,
-): boolean {
-  const sent = sentContent.match(
-    new RegExp(
-      `^To\\s+${recipientId}\\s*[:：]\\s*(\\S(?:[^\\r\\n]*\\S)?)\\s*$`,
-    ),
-  );
-  const received = receivedContent.match(
-    new RegExp(
-      `^From\\s+${senderId}\\s*[:：]\\s*(\\S(?:[^\\r\\n]*\\S)?)\\s*$`,
-    ),
-  );
-  return (
-    sent !== null &&
-    received !== null &&
-    sent[1] === received[1]
-  );
-}
-
-function timelineIsNearBottom(element: HTMLElement): boolean {
-  return (
-    element.scrollHeight - element.scrollTop - element.clientHeight <=
-    TIMELINE_BOTTOM_THRESHOLD
-  );
-}
-
-function handleTimelineScroll(): void {
-  const element = timelineScroller.value;
-  if (element === null) {
-    return;
+const stageTitle = computed(() => {
+  const agent = activeAgent.value;
+  if (agent === undefined) {
+    return "";
   }
-  isTimelinePinned.value = timelineIsNearBottom(element);
-  if (isTimelinePinned.value) {
-    hasNewTimelineUpdate.value = false;
+  if (activeStage.value === "outer") {
+    return "等待外层人格";
   }
-}
-
-async function scrollTimelineToLatest(): Promise<void> {
-  await nextTick();
-  const element = timelineScroller.value;
-  if (element === null) {
-    return;
+  if (agent.pending_events.length === 0) {
+    return "等待外部事件";
   }
-  element.scrollTop = element.scrollHeight;
-  isTimelinePinned.value = true;
-  hasNewTimelineUpdate.value = false;
-}
+  return "等待内层人格";
+});
 
-watch(
-  activeTimelineSnapshot,
-  (snapshot, previousSnapshot) => {
-    if (
-      previousSnapshot === undefined ||
-      snapshot.identity !== previousSnapshot.identity
-    ) {
-      void scrollTimelineToLatest();
-      return;
-    }
-    if (snapshot.records === previousSnapshot.records) {
-      return;
-    }
-    if (isTimelinePinned.value) {
-      void scrollTimelineToLatest();
-    } else {
-      hasNewTimelineUpdate.value = true;
-    }
-  },
-  { flush: "post" },
+const selectedPreview = computed(
+  () =>
+    previews.value[
+      `${activeAgentId.value}:${previewLayer.value}`
+    ],
 );
 
-function installScene(
-  scene: Scene,
-  desiredActiveAgentId: AgentId = "A",
-  preserveMessageDrafts = false,
-): void {
-  savedScene.value = cloneScene(scene);
-  currentScene.value = cloneScene(scene);
-  activeAgentId.value = desiredActiveAgentId;
-  if (!preserveMessageDrafts) {
-    messageDrafts.value = emptyMessageDrafts();
-    messageErrors.value = emptyMessageErrors();
+const mixedTimeline = computed<TimelineItem[]>(() => {
+  const agent = activeAgent.value;
+  if (agent === undefined) {
+    return [];
   }
-  requestPreviews.value = emptyRequestPreviews();
-  previewErrors.value = emptyMessageErrors();
-  bindingModel.value = "";
-  bindingError.value = "";
-  saveState.value = "idle";
-  saveError.value = "";
-  actionError.value = "";
+
+  const items: TimelineItem[] = [];
+  for (const turn of agent.inner_context.turns) {
+    items.push(eventTimelineItem(turn.consumed_event, "已处理"));
+    items.push({
+      key: `inner:${turn.call_id}`,
+      sequence: turn.sequence,
+      rank: 1,
+      kind: "inner",
+      label: "内层输出",
+      content: turn.output,
+      input: turn.input,
+      callId: turn.call_id,
+    });
+  }
+  for (const turn of agent.outer_context.turns) {
+    items.push({
+      key: `outer:${turn.call_id}`,
+      sequence: turn.sequence,
+      rank: 2,
+      kind: "outer",
+      label: "外层输出",
+      content: turn.output,
+      input: turn.input,
+      callId: turn.call_id,
+    });
+  }
+  for (const event of agent.pending_events) {
+    items.push(eventTimelineItem(event, "队列中"));
+  }
+  return items.sort(
+    (left, right) =>
+      left.sequence - right.sequence || left.rank - right.rank,
+  );
+});
+
+function eventTimelineItem(
+  event: ExternalEvent,
+  status: string,
+): TimelineItem {
+  return {
+    key: `event:${event.id}`,
+    sequence: event.sequence,
+    rank: 0,
+    kind: "event",
+    label: "外部事件",
+    content: event.content,
+    status,
+  };
+}
+
+function compareSummaries(
+  left: SceneSummary,
+  right: SceneSummary,
+): number {
+  return left.name.localeCompare(right.name) ||
+    left.id.localeCompare(right.id);
 }
 
 function upsertSummary(scene: Scene): void {
-  summaryMutationVersion += 1;
-  const summary = { id: scene.id, name: scene.name };
-  sceneSummaries.value = mergeSummaries(
-    sceneSummaries.value,
-    [summary],
+  const byId = new Map(
+    sceneSummaries.value.map((summary) => [summary.id, summary]),
   );
-  listState.value = "ready";
-  listError.value = "";
+  byId.set(scene.id, { id: scene.id, name: scene.name });
+  sceneSummaries.value = [...byId.values()].sort(compareSummaries);
+}
+
+function syncEventEdits(scene: Scene): void {
+  const next: Record<string, string> = {};
+  for (const agent of scene.agents) {
+    for (const event of agent.pending_events) {
+      if (event.kind === "manual") {
+        next[event.id] = event.content;
+      }
+    }
+  }
+  eventEdits.value = next;
+}
+
+function installScene(
+  scene: Scene,
+  options: {
+    activeAgentId?: AgentId;
+    preserveDrafts?: boolean;
+  } = {},
+): void {
+  savedScene.value = cloneScene(scene);
+  currentScene.value = cloneScene(scene);
+  activeAgentId.value = options.activeAgentId ?? activeAgentId.value;
+  if (!options.preserveDrafts) {
+    drafts.value = { A: null, B: null, C: null };
+    draftErrors.value = { A: "", B: "", C: "" };
+  }
+  syncEventEdits(scene);
+  previews.value = {};
+  previewError.value = "";
+  eventError.value = "";
+  saveMessage.value = "";
+  actionError.value = "";
+  upsertSummary(scene);
+  bindingModel.value = modelOptions.value[0]?.model ?? "";
 }
 
 function confirmDiscardChanges(): boolean {
-  if (
-    !isDirty.value &&
-    !hasMessageDrafts.value
-  ) {
+  if (!isDirty.value && !hasAnyDraft.value) {
     return true;
   }
   return window.confirm(
-    "当前场景有未保存的更改或消息草稿。确定要放弃吗？",
+    "当前场景有未保存修改或浏览器草稿。确定要放弃吗？",
   );
 }
 
 async function refreshScenes(): Promise<void> {
-  const requestToken = ++listRequestToken;
-  const mutationVersionAtRequestStart = summaryMutationVersion;
-  const summariesAtRequestStart = new Map(
-    sceneSummaries.value.map((summary) => [summary.id, summary.name]),
-  );
   listState.value = "loading";
   listError.value = "";
-
   try {
-    const summaries = await listScenes();
-    if (requestToken !== listRequestToken) {
-      return;
-    }
-    const summariesUpdatedWhileLoading = sceneSummaries.value.filter(
-      (summary) =>
-        summariesAtRequestStart.get(summary.id) !== summary.name,
-    );
-    sceneSummaries.value = mergeSummaries(
-      summaries,
-      summariesUpdatedWhileLoading,
-    );
+    sceneSummaries.value = (await listScenes()).sort(compareSummaries);
     listState.value = "ready";
   } catch (error) {
-    if (requestToken !== listRequestToken) {
-      return;
-    }
-    if (mutationVersionAtRequestStart !== summaryMutationVersion) {
-      return;
-    }
     listState.value = "error";
     listError.value = errorMessage(error, "无法加载场景列表。");
   }
 }
 
 async function refreshModelOptions(): Promise<void> {
-  modelOptionsState.value = "loading";
   modelOptionsError.value = "";
   try {
-    modelOptions.value = await getModelOptions();
-    modelOptionsState.value = "ready";
+    modelOptions.value = (await getModelOptions()).options;
+    if (
+      !modelOptions.value.some(
+        (option) => option.model === newSceneModel.value,
+      )
+    ) {
+      newSceneModel.value = modelOptions.value[0]?.model ?? "";
+    }
+    bindingModel.value = modelOptions.value[0]?.model ?? "";
   } catch (error) {
-    modelOptionsState.value = "error";
-    modelOptionsError.value = errorMessage(error, "无法加载模型选项。");
+    modelOptions.value = [];
+    modelOptionsError.value = errorMessage(
+      error,
+      "无法加载模型选项。",
+    );
   }
 }
 
 async function openScene(summary: SceneSummary): Promise<void> {
   if (
+    editorLocked.value ||
     summary.id === currentScene.value?.id ||
-    openingSceneId.value !== null ||
-    isCreating.value ||
-    saveState.value === "saving" ||
-    sendingAgentId.value !== null ||
-    generatingAgentId.value !== null
+    !confirmDiscardChanges()
   ) {
     return;
   }
-  if (!confirmDiscardChanges()) {
-    return;
-  }
-
   openingSceneId.value = summary.id;
   actionError.value = "";
-
   try {
     const scene = await getScene(summary.id);
-    installScene(scene);
+    activeAgentId.value = "A";
+    installScene(scene, { activeAgentId: "A" });
   } catch (error) {
     actionError.value = errorMessage(error, "无法打开场景。");
   } finally {
@@ -497,39 +391,27 @@ async function openScene(summary: SceneSummary): Promise<void> {
 }
 
 async function submitNewScene(): Promise<void> {
-  createError.value = "";
   const name = newSceneName.value.trim();
-  const model = newSceneModel.value;
-
   if (!name) {
-    createError.value = "请输入场景名称。";
+    actionError.value = "请输入场景名称。";
     return;
   }
-  if (!model) {
-    createError.value = "请选择这个场景使用的模型。";
+  if (!newSceneModel.value) {
+    actionError.value = "请选择模型。";
     return;
   }
-  if (
-    isCreating.value ||
-    openingSceneId.value !== null ||
-    saveState.value === "saving" ||
-    sendingAgentId.value !== null ||
-    generatingAgentId.value !== null ||
-    !confirmDiscardChanges()
-  ) {
+  if (editorLocked.value || !confirmDiscardChanges()) {
     return;
   }
-
   isCreating.value = true;
-
+  actionError.value = "";
   try {
-    const scene = await createScene(name, model);
-    upsertSummary(scene);
-    installScene(scene);
+    const scene = await createScene(name, newSceneModel.value);
     newSceneName.value = "";
-    newSceneModel.value = "";
+    activeAgentId.value = "A";
+    installScene(scene, { activeAgentId: "A" });
   } catch (error) {
-    createError.value = errorMessage(error, "无法创建场景。");
+    actionError.value = errorMessage(error, "无法创建场景。");
   } finally {
     isCreating.value = false;
   }
@@ -540,375 +422,371 @@ async function bindCurrentSceneModel(): Promise<void> {
   if (
     scene === null ||
     scene.model !== null ||
-    bindingModel.value === "" ||
+    !bindingModel.value ||
+    isDirty.value ||
     editorLocked.value
   ) {
     return;
   }
-
-  const selectedAgentId = activeAgentId.value;
-  isBindingModel.value = true;
-  bindingError.value = "";
+  busyAction.value = "bind-model";
+  actionError.value = "";
   try {
-    const bound = await bindSceneModel(scene.id, bindingModel.value);
-    installScene(bound, selectedAgentId, true);
+    const updated = await bindSceneModel(scene.id, bindingModel.value);
+    installScene(updated, { activeAgentId: activeAgentId.value });
   } catch (error) {
-    bindingError.value = errorMessage(error, "模型绑定失败，请重试。");
+    actionError.value = errorMessage(error, "无法绑定模型。");
   } finally {
-    isBindingModel.value = false;
-  }
-}
-
-function modelOptionLabel(option: ModelOption): string {
-  return `${option.protocol === "anthropic" ? "Claude" : "Responses"} — ${option.model}`;
-}
-
-function boundModelLabel(model: string): string {
-  const option = boundModelOption.value;
-  const protocol =
-    option?.protocol ??
-    (model.toLocaleLowerCase().includes("claude")
-      ? "anthropic"
-      : "responses");
-  return `${protocol === "anthropic" ? "Claude" : "Responses"} — ${model}`;
-}
-
-function markEdited(): void {
-  if (saveState.value === "success" || saveState.value === "error") {
-    saveState.value = "idle";
-    saveError.value = "";
+    busyAction.value = null;
   }
 }
 
 function sceneUpdate(scene: Scene): SceneUpdate {
   return {
     name: scene.name,
-    agents: scene.agents.map(
-      ({ id, name, persona, desire, fear, memory, system_prompt }) => ({
-        id,
-        name,
-        persona,
-        desire,
-        fear,
-        memory,
-        system_prompt,
-      }),
-    ),
+    agents: scene.agents.map((agent) => ({
+      id: agent.id,
+      name: agent.name,
+      inner_context: {
+        system_prompt: agent.inner_context.system_prompt,
+      },
+      outer_context: {
+        system_prompt: agent.outer_context.system_prompt,
+      },
+    })),
   };
 }
 
 async function saveCurrentScene(): Promise<void> {
   const scene = currentScene.value;
-  if (
-    scene === null ||
-    saveState.value === "saving" ||
-    sendingAgentId.value !== null ||
-    generatingAgentId.value !== null
-  ) {
+  if (scene === null || editorLocked.value || !isDirty.value) {
     return;
   }
-  const selectedAgentId = activeAgentId.value;
-
-  if (
-    !scene.name.trim() ||
-    scene.agents.some((agent) => !agent.name.trim())
-  ) {
-    saveState.value = "error";
-    saveError.value = "场景名称和三个 Agent 的显示名均不能为空。";
-    return;
-  }
-  if (scene.agents.some((agent) => !agent.system_prompt.trim())) {
-    saveState.value = "error";
-    saveError.value = "三个 Agent 的最终系统提示词均不能为空。";
-    return;
-  }
-
-  saveState.value = "saving";
-  saveError.value = "";
-
+  busyAction.value = "save";
+  saveMessage.value = "";
   try {
-    const saved = await saveScene(scene.id, sceneUpdate(scene));
-    upsertSummary(saved);
-    installScene(saved, selectedAgentId, true);
-    saveState.value = "success";
+    const updated = await saveScene(scene.id, sceneUpdate(scene));
+    installScene(updated, {
+      activeAgentId: activeAgentId.value,
+      preserveDrafts: true,
+    });
+    saveMessage.value = "已保存";
   } catch (error) {
-    saveState.value = "error";
-    saveError.value = errorMessage(error, "保存失败，请重试。");
+    saveMessage.value = errorMessage(error, "保存失败。");
+  } finally {
+    busyAction.value = null;
   }
 }
 
-function markMessageDraftEdited(): void {
-  messageErrors.value[activeAgentId.value] = "";
+async function addEvent(): Promise<void> {
+  const scene = currentScene.value;
+  const content = newEventContent.value[activeAgentId.value].trim();
+  if (
+    scene === null ||
+    !content ||
+    isDirty.value ||
+    editorLocked.value
+  ) {
+    if (!content) {
+      eventError.value = "请输入外部事件。";
+    }
+    return;
+  }
+  busyAction.value = "event-create";
+  eventError.value = "";
+  try {
+    const updated = await createManualEvent(
+      scene.id,
+      activeAgentId.value,
+      content,
+    );
+    newEventContent.value[activeAgentId.value] = "";
+    installScene(updated, {
+      activeAgentId: activeAgentId.value,
+      preserveDrafts: true,
+    });
+  } catch (error) {
+    eventError.value = errorMessage(error, "无法创建外部事件。");
+  } finally {
+    busyAction.value = null;
+  }
+}
+
+function updateEventEdit(eventId: string, event: Event): void {
+  eventEdits.value[eventId] = (
+    event.target as HTMLTextAreaElement
+  ).value;
+}
+
+async function saveEvent(event: ExternalEvent): Promise<void> {
+  const scene = currentScene.value;
+  const content = eventEdits.value[event.id]?.trim() ?? "";
+  if (
+    scene === null ||
+    !content ||
+    isDirty.value ||
+    editorLocked.value
+  ) {
+    if (!content) {
+      eventError.value = "外部事件不能为空。";
+    }
+    return;
+  }
+  busyAction.value = `event-edit:${event.id}`;
+  eventError.value = "";
+  try {
+    const updated = await editManualEvent(
+      scene.id,
+      activeAgentId.value,
+      event.id,
+      content,
+    );
+    installScene(updated, {
+      activeAgentId: activeAgentId.value,
+      preserveDrafts: true,
+    });
+  } catch (error) {
+    eventError.value = errorMessage(error, "无法修改外部事件。");
+  } finally {
+    busyAction.value = null;
+  }
+}
+
+async function removeEvent(event: ExternalEvent): Promise<void> {
+  const scene = currentScene.value;
+  if (
+    scene === null ||
+    isDirty.value ||
+    editorLocked.value ||
+    !window.confirm(`删除这条手工事件？\n\n${event.content}`)
+  ) {
+    return;
+  }
+  busyAction.value = `event-delete:${event.id}`;
+  eventError.value = "";
+  try {
+    const updated = await deleteManualEvent(
+      scene.id,
+      activeAgentId.value,
+      event.id,
+    );
+    installScene(updated, {
+      activeAgentId: activeAgentId.value,
+      preserveDrafts: true,
+    });
+  } catch (error) {
+    eventError.value = errorMessage(error, "无法删除外部事件。");
+  } finally {
+    busyAction.value = null;
+  }
 }
 
 async function generateDraft(): Promise<void> {
   const scene = currentScene.value;
-  const senderId = activeAgentId.value;
+  const agentId = activeAgentId.value;
+  const layer = activeStage.value;
+  if (scene === null || !canGenerate.value) {
+    return;
+  }
+  busyAction.value = `generate:${agentId}:${layer}`;
+  draftErrors.value[agentId] = "";
+  try {
+    drafts.value[agentId] = await generateLayerDraft(
+      scene.id,
+      agentId,
+      layer,
+    );
+  } catch (error) {
+    // The previous editable draft remains available after an upstream error.
+    draftErrors.value[agentId] = errorMessage(
+      error,
+      `无法生成${layer === "inner" ? "内层" : "外层"}草稿。`,
+    );
+  } finally {
+    busyAction.value = null;
+  }
+}
+
+function updateDraftContent(event: Event): void {
+  const draft = drafts.value[activeAgentId.value];
+  if (draft !== null) {
+    draft.content = (event.target as HTMLTextAreaElement).value;
+    draftErrors.value[activeAgentId.value] = "";
+  }
+}
+
+function discardDraft(): void {
+  drafts.value[activeAgentId.value] = null;
+  draftErrors.value[activeAgentId.value] = "";
+}
+
+async function confirmDraft(): Promise<void> {
+  const scene = currentScene.value;
+  const draft = activeDraft.value;
+  const agentId = activeAgentId.value;
+  if (scene === null || draft === null || !canConfirm.value) {
+    return;
+  }
+  busyAction.value = `confirm:${agentId}:${draft.layer}`;
+  draftErrors.value[agentId] = "";
+  try {
+    const updated = await confirmLayerDraft(
+      scene.id,
+      agentId,
+      draft.layer,
+      {
+        call_id: draft.call_id,
+        event_id: draft.event_id,
+        content: draft.content,
+        state_token: draft.state_token,
+      },
+    );
+    drafts.value[agentId] = null;
+    installScene(updated, {
+      activeAgentId: agentId,
+      preserveDrafts: true,
+    });
+  } catch (error) {
+    draftErrors.value[agentId] = errorMessage(
+      error,
+      "确认失败；草稿已保留。",
+    );
+  } finally {
+    busyAction.value = null;
+  }
+}
+
+async function rollback(): Promise<void> {
+  const scene = currentScene.value;
   if (
     scene === null ||
-    !canUseBoundModel.value ||
+    scene.rollback_stack.length === 0 ||
     isDirty.value ||
     editorLocked.value
   ) {
     return;
   }
-
-  generatingAgentId.value = senderId;
-  messageErrors.value[senderId] = "";
-
-  try {
-    const generated = await generateMessageDraft(scene.id, senderId);
-    messageDrafts.value[senderId] = {
-      content: generated.content,
-      reasoning: generated.reasoning,
-      usage: generated.usage,
-    };
-  } catch (error) {
-    messageErrors.value[senderId] = errorMessage(
-      error,
-      "草稿生成失败，请重试。",
-    );
-  } finally {
-    generatingAgentId.value = null;
-  }
-}
-
-async function confirmMessage(): Promise<void> {
-  const scene = currentScene.value;
-  const senderId = activeAgentId.value;
-  const draft = messageDrafts.value[senderId];
+  const latest = scene.rollback_stack.at(-1);
   if (
-    scene === null ||
-    isDirty.value ||
-    editorLocked.value ||
-    draft.content.trim() === ""
-  ) {
-    return;
-  }
-
-  sendingAgentId.value = senderId;
-  messageErrors.value[senderId] = "";
-
-  try {
-    const updated = await sendMessage(scene.id, {
-      sender_id: senderId,
-      content: draft.content,
-    });
-    installScene(updated, senderId, true);
-    messageDrafts.value[senderId] = {
-      content: "",
-      reasoning: [],
-      usage: null,
-    };
-  } catch (error) {
-    messageErrors.value[senderId] = errorMessage(
-      error,
-      "消息发送失败，请重试。",
-    );
-  } finally {
-    sendingAgentId.value = null;
-  }
-}
-
-async function confirmDeleteMessage(
-  record: MessageTimelineRecord,
-): Promise<void> {
-  const scene = currentScene.value;
-  const viewingAgentId = activeAgentId.value;
-  if (
-    scene === null ||
-    isDirty.value ||
-    editorLocked.value ||
-    !deletableMessageIds.value.has(record.message_id)
-  ) {
-    return;
-  }
-
-  const senderId =
-    record.direction === "sent"
-      ? viewingAgentId
-      : record.counterpart_id;
-  const recipientId =
-    record.direction === "sent"
-      ? record.counterpart_id
-      : viewingAgentId;
-  const sender = scene.agents.find((agent) => agent.id === senderId);
-  const recipient = scene.agents.find(
-    (agent) => agent.id === recipientId,
-  );
-  const confirmed = window.confirm(
-    [
-      "确定永久删除这条已确认消息吗？",
-      "",
-      `${sender?.name ?? senderId}（Agent ${senderId}） → ${recipient?.name ?? recipientId}（Agent ${recipientId}）`,
-      record.content,
-      "",
-      "删除不可撤销，且本次只删除这一条。",
-    ].join("\n"),
-  );
-  if (!confirmed) {
-    return;
-  }
-
-  deletingMessageId.value = record.message_id;
-  actionError.value = "";
-  try {
-    const updated = await deleteMessage(scene.id, record.message_id);
-    installScene(updated, viewingAgentId, true);
-  } catch (error) {
-    actionError.value = errorMessage(error, "消息删除失败，请重试。");
-  } finally {
-    deletingMessageId.value = null;
-  }
-}
-
-async function recomposeActiveSystemPrompt(): Promise<void> {
-  const agent = activeAgent.value;
-  if (agent === undefined || editorLocked.value) {
-    return;
-  }
-  if (
+    latest === undefined ||
     !window.confirm(
-      "这会用四个拼接素材覆盖当前最终系统提示词。确定继续吗？",
+      `回退全场景最近一次已确认调用？\n\nAgent ${latest.agent_id} · ${
+        latest.layer === "inner" ? "内层" : "外层"
+      }`,
     )
   ) {
     return;
   }
-
-  composingAgentId.value = agent.id;
-  saveError.value = "";
+  busyAction.value = "rollback";
+  actionError.value = "";
   try {
-    const candidate = await composeSystemPrompt({
-      persona: agent.persona,
-      desire: agent.desire,
-      fear: agent.fear,
-      memory: agent.memory,
+    const updated = await rollbackLatestCall(scene.id);
+    installScene(updated, {
+      activeAgentId: activeAgentId.value,
     });
-    agent.system_prompt = candidate;
-    markEdited();
   } catch (error) {
-    saveState.value = "error";
-    saveError.value = errorMessage(error, "系统提示词拼接失败。");
+    actionError.value = errorMessage(error, "无法回退最近调用。");
   } finally {
-    composingAgentId.value = null;
+    busyAction.value = null;
   }
 }
 
-async function loadRequestPreview(): Promise<void> {
+async function loadPreview(): Promise<void> {
   const scene = currentScene.value;
-  const agentId = activeAgentId.value;
-  if (scene === null || editorLocked.value || !canUseBoundModel.value) {
+  if (
+    scene === null ||
+    editorLocked.value ||
+    !sceneModelAvailable.value
+  ) {
     return;
   }
-
-  previewingAgentId.value = agentId;
-  previewErrors.value[agentId] = "";
+  const key = `${activeAgentId.value}:${previewLayer.value}`;
+  busyAction.value = `preview:${key}`;
+  previewError.value = "";
   try {
-    requestPreviews.value[agentId] = await getModelRequestPreview(
+    previews.value[key] = await getModelRequestPreview(
       scene.id,
-      agentId,
+      activeAgentId.value,
+      previewLayer.value,
     );
-    previewMode.value = "readable";
   } catch (error) {
-    previewErrors.value[agentId] = errorMessage(
-      error,
-      "无法加载请求预览。",
-    );
+    previewError.value = errorMessage(error, "无法加载请求预览。");
   } finally {
-    previewingAgentId.value = null;
+    busyAction.value = null;
   }
 }
 
-function discardActiveDraft(): void {
-  const agentId = activeAgentId.value;
-  messageDrafts.value[agentId] = {
-    content: "",
-    reasoning: [],
-    usage: null,
-  };
-  messageErrors.value[agentId] = "";
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function readableModelContext(request: ModelRequest): ReadableBlock[] {
+  const blocks: ReadableBlock[] = [];
+  if (typeof request.instructions === "string") {
+    blocks.push({ label: "instructions", text: request.instructions });
+  }
+  if (Array.isArray(request.system)) {
+    for (const block of request.system) {
+      if (isRecord(block) && typeof block.text === "string") {
+        blocks.push({ label: "system", text: block.text });
+      }
+    }
+  }
+  const messages = Array.isArray(request.messages)
+    ? request.messages
+    : Array.isArray(request.input)
+      ? request.input
+      : [];
+  if (messages.length === 0) {
+    return blocks;
+  }
+  for (const message of messages) {
+    if (
+      !isRecord(message) ||
+      typeof message.role !== "string" ||
+      !Array.isArray(message.content)
+    ) {
+      continue;
+    }
+    for (const block of message.content) {
+      if (isRecord(block) && typeof block.text === "string") {
+        blocks.push({
+          label: message.role,
+          text: block.text,
+        });
+      }
+    }
+  }
+  return blocks;
 }
 
 function prettyJson(value: unknown): string {
   return JSON.stringify(value, null, 2);
 }
 
-function reasoningLabel(type: ModelReasoningBlock["type"]): string {
-  if (type === "thinking") return "Claude thinking";
-  if (type === "summary_text") return "推理摘要";
-  return "思维链";
-}
-
-function readableModelContext(
-  request: ModelRequest,
-): { label: string; text: string }[] {
-  const context: { label: string; text: string }[] = [];
-  if (typeof request.instructions === "string") {
-    context.push({
-      label: "instructions",
-      text: request.instructions,
-    });
-  }
-  const system = request.system;
-  if (Array.isArray(system)) {
-    for (const block of system) {
-      if (
-        typeof block === "object" &&
-        block !== null &&
-        "text" in block &&
-        typeof block.text === "string"
-      ) {
-        context.push({ label: "system", text: block.text });
-      }
-    }
-  }
-
-  const turns = Array.isArray(request.messages)
-    ? request.messages
-    : request.input;
-  if (!Array.isArray(turns)) {
-    return context;
-  }
-  for (const message of turns) {
-    if (
-      typeof message !== "object" ||
-      message === null ||
-      !("role" in message) ||
-      typeof message.role !== "string" ||
-      !("content" in message) ||
-      !Array.isArray(message.content)
-    ) {
-      continue;
-    }
-    for (const block of message.content) {
-      if (
-        typeof block === "object" &&
-        block !== null &&
-        "text" in block &&
-        typeof block.text === "string"
-      ) {
-        context.push({ label: message.role, text: block.text });
-      }
-    }
-  }
-  return context;
-}
-
 function handleBeforeUnload(event: BeforeUnloadEvent): void {
-  if (
-    !isDirty.value &&
-    !hasMessageDrafts.value
-  ) {
-    return;
+  if (isDirty.value || hasAnyDraft.value) {
+    event.preventDefault();
   }
-  event.preventDefault();
-  event.returnValue = "";
 }
+
+watch(
+  activeAgentId,
+  () => {
+    previewLayer.value = activeStage.value;
+    previewMode.value = "readable";
+    previewError.value = "";
+    eventError.value = "";
+  },
+);
+
+watch(activeStage, (stage) => {
+  previewLayer.value = stage;
+});
 
 onMounted(() => {
-  void refreshScenes();
-  void refreshModelOptions();
   window.addEventListener("beforeunload", handleBeforeUnload);
+  void refreshModelOptions();
+  void refreshScenes();
 });
 
 onBeforeUnmount(() => {
@@ -919,706 +797,654 @@ onBeforeUnmount(() => {
 <template>
   <div class="app-shell">
     <header class="topbar">
-      <a class="brand" href="/" aria-label="AI 小镇首页">
-        <span class="brand-mark" aria-hidden="true">AT</span>
-        <span>
-          <strong>AI 小镇</strong>
-          <small>三智能体最小实验</small>
-        </span>
-      </a>
-      <p class="milestone">
-        <span aria-hidden="true"></span>
-        模型草稿 · 人工确认
+      <div>
+        <p class="eyebrow">TWO-LAYER PERSONA LAB</p>
+        <h1>AI 小镇</h1>
+      </div>
+      <p class="topbar-copy">
+        外部事件进入队列，内层先形成判断，外层再决定真正说出的话。
       </p>
     </header>
 
     <main class="workspace">
-      <aside class="scene-sidebar" aria-labelledby="scene-list-title">
-        <div class="sidebar-heading">
+      <aside class="scene-sidebar" aria-label="场景列表">
+        <form class="new-scene-form" @submit.prevent="submitNewScene">
+          <label for="new-scene-name">新场景</label>
           <div>
-            <p class="eyebrow">SCENES</p>
-            <h1 id="scene-list-title">场景</h1>
-          </div>
-          <span class="scene-count">{{ sceneSummaries.length }}</span>
-        </div>
-
-        <form class="create-form" @submit.prevent="submitNewScene">
-          <label for="new-scene-name">创建命名场景</label>
-          <div class="create-fields">
             <input
               id="new-scene-name"
               v-model="newSceneName"
-              name="new-scene-name"
               type="text"
-              autocomplete="off"
-              placeholder="例如：雨夜港口"
+              placeholder="例如：雨夜车站"
               :disabled="editorLocked"
-              @input="createError = ''"
             />
             <select
-              id="new-scene-model"
               v-model="newSceneModel"
-              name="new-scene-model"
-              aria-label="场景模型"
-              :disabled="editorLocked || modelOptionsState !== 'ready'"
-              @change="createError = ''"
+              aria-label="新场景模型"
+              :disabled="editorLocked || modelOptions.length === 0"
             >
-              <option value="" disabled>选择模型（创建后不可更改）</option>
               <option
                 v-for="option in modelOptions"
-                :key="option.protocol"
+                :key="option.model"
                 :value="option.model"
               >
-                {{ modelOptionLabel(option) }}
+                {{ option.protocol }} · {{ option.model }}
               </option>
             </select>
-            <button
-              class="primary-button create-button"
-              type="submit"
-              :disabled="editorLocked || modelOptionsState !== 'ready'"
-            >
+            <button type="submit" :disabled="editorLocked">
               {{ isCreating ? "创建中…" : "创建" }}
             </button>
           </div>
-          <p
-            v-if="modelOptionsState === 'error'"
-            class="form-error"
-            role="alert"
-          >
+          <p v-if="modelOptionsError" class="inline-error" role="alert">
             {{ modelOptionsError }}
-            <button class="text-button" type="button" @click="refreshModelOptions">
-              重试
-            </button>
-          </p>
-          <p v-if="createError" class="form-error" role="alert">
-            {{ createError }}
           </p>
         </form>
 
-        <div class="scene-list-region">
-          <div
-            v-if="listState === 'loading'"
-            class="sidebar-message"
-            role="status"
-          >
-            <span class="spinner" aria-hidden="true"></span>
-            正在加载场景…
-          </div>
-
-          <div
-            v-else-if="listState === 'error'"
-            class="sidebar-message sidebar-message--error"
-            role="alert"
-          >
-            <p>{{ listError }}</p>
+        <div class="scene-list-wrap">
+          <div class="sidebar-heading">
+            <h2>本机场景</h2>
             <button
-              class="text-button"
               type="button"
+              class="text-button"
+              :disabled="editorLocked"
               @click="refreshScenes"
             >
-              重新加载
+              刷新
             </button>
           </div>
-
-          <p
-            v-else-if="sceneSummaries.length === 0"
-            class="sidebar-message empty-list"
-          >
-            还没有场景。先给第一个实验场景起个名字。
+          <p v-if="listState === 'loading'" class="muted">正在加载…</p>
+          <div v-else-if="listState === 'error'" class="error-box">
+            {{ listError }}
+          </div>
+          <p v-else-if="sceneSummaries.length === 0" class="muted">
+            还没有场景。
           </p>
-
           <ul v-else class="scene-list">
             <li v-for="summary in sceneSummaries" :key="summary.id">
               <button
-                class="scene-list-button"
-                :class="{
-                  'scene-list-button--active':
-                    currentScene?.id === summary.id,
-                }"
                 type="button"
-                :aria-current="
-                  currentScene?.id === summary.id ? 'page' : undefined
-                "
+                :class="{ active: currentScene?.id === summary.id }"
                 :disabled="editorLocked"
                 @click="openScene(summary)"
               >
-                <span class="scene-list-name">{{ summary.name }}</span>
-                <span class="scene-list-meta">
-                  <span>{{ summary.id.slice(0, 8) }}</span>
-                  <span
-                    v-if="openingSceneId === summary.id"
-                    class="spinner spinner--small"
-                    aria-label="正在打开"
-                  ></span>
-                  <span
-                    v-else-if="currentScene?.id === summary.id"
-                    class="active-indicator"
-                    aria-label="当前场景"
-                  ></span>
-                </span>
+                <strong>{{ summary.name }}</strong>
+                <small>{{ summary.id.slice(0, 8) }}</small>
               </button>
             </li>
           </ul>
         </div>
 
         <p class="storage-note">
-          每个场景独立保存为本机 JSON 文件。已确认消息仅可从双方时间线栈顶逐条删除。
+          已确认状态写入本机 JSON；未确认草稿只在当前浏览器页面中存在。
         </p>
       </aside>
 
-      <section class="editor-region" aria-label="场景编辑区">
-        <div
-          v-if="actionError"
-          class="page-notice page-notice--error"
-          role="alert"
-        >
+      <section class="content-region">
+        <div v-if="actionError" class="page-error" role="alert">
           <span>{{ actionError }}</span>
           <button
             type="button"
-            aria-label="关闭错误提示"
+            aria-label="关闭错误"
             @click="actionError = ''"
           >
             ×
           </button>
         </div>
 
-        <div v-if="currentScene === null" class="welcome-panel">
-          <div class="welcome-illustration" aria-hidden="true">
-            <span>A</span>
-            <span>B</span>
-            <span>C</span>
+        <div v-if="currentScene === null" class="welcome-card">
+          <div class="layer-mark" aria-hidden="true">
+            <span>内</span><span>外</span>
           </div>
-          <p class="eyebrow">FIRST VERTICAL SLICE</p>
-          <h2>从一个命名场景开始</h2>
+          <p class="eyebrow">MANUAL STEP-BY-STEP</p>
+          <h2>选择或创建一个场景</h2>
           <p>
-            创建新场景，或从左侧打开已有场景。你可以分别编辑三个
-            Agent，所有后续修改只会在点击“保存场景”时写入磁盘。
+            每个 Agent 都有彼此隔离的内层与外层完整历史。系统不会自动推进。
           </p>
         </div>
 
         <template v-else>
-          <header class="editor-header">
-            <div class="scene-name-field">
-              <label for="scene-name">场景名称</label>
+          <header class="scene-toolbar">
+            <label for="scene-name">
+              <span>场景名称</span>
               <input
                 id="scene-name"
                 v-model="currentScene.name"
                 type="text"
-                autocomplete="off"
-                required
                 :disabled="editorLocked"
-                @input="markEdited"
               />
+            </label>
+            <div class="scene-model">
+              <span>场景模型</span>
+              <strong>{{ currentScene.model ?? "未绑定" }}</strong>
             </div>
-
-            <div class="save-controls">
-              <div class="save-status" aria-live="polite">
-                <span
-                  class="save-status-dot"
-                  :class="{
-                    'save-status-dot--dirty': isDirty,
-                    'save-status-dot--success':
-                      saveState === 'success' && !isDirty,
-                    'save-status-dot--error': saveState === 'error',
-                  }"
-                  aria-hidden="true"
-                ></span>
-                <span v-if="saveState === 'saving'">正在保存…</span>
-                <span v-else-if="saveState === 'error'">{{
-                  saveError
-                }}</span>
-                <span v-else-if="isDirty">有未保存的更改</span>
-                <span v-else-if="saveState === 'success'">保存成功</span>
-                <span v-else>当前内容已保存</span>
-              </div>
+            <div class="toolbar-actions">
+              <span
+                class="save-state"
+                :class="{ dirty: isDirty }"
+                aria-live="polite"
+              >
+                {{
+                  saveMessage ||
+                  (isDirty ? "有未保存修改" : "已与磁盘同步")
+                }}
+              </span>
               <button
-                class="primary-button save-button"
                 type="button"
+                class="secondary-button"
+                :disabled="
+                  currentScene.rollback_stack.length === 0 ||
+                  isDirty ||
+                  editorLocked
+                "
+                @click="rollback"
+              >
+                {{
+                  busyAction === "rollback"
+                    ? "回退中…"
+                    : "回退最近确认"
+                }}
+              </button>
+              <button
+                type="button"
+                class="primary-button"
                 :disabled="!isDirty || editorLocked"
                 @click="saveCurrentScene"
               >
-                {{ saveState === "saving" ? "保存中…" : "保存场景" }}
+                {{ busyAction === "save" ? "保存中…" : "保存设定" }}
               </button>
             </div>
           </header>
 
-          <section class="scene-model" aria-label="场景模型绑定">
+          <section
+            v-if="sceneModelStatus"
+            class="model-status"
+            role="status"
+          >
             <div>
-              <span class="scene-model-label">场景模型</span>
-              <template v-if="currentScene.model !== null">
-                <strong>{{ boundModelLabel(currentScene.model) }}</strong>
-                <small>创建后固定，不可切换</small>
-              </template>
-              <template v-else>
-                <strong>旧场景尚未绑定模型</strong>
-                <small>可选择一次；绑定后不可切换</small>
-              </template>
+              <strong>模型调用已停用</strong>
+              <p>{{ sceneModelStatus }}</p>
             </div>
-            <div v-if="currentScene.model === null" class="model-binding-controls">
+            <form
+              v-if="currentScene.model === null"
+              @submit.prevent="bindCurrentSceneModel"
+            >
               <select
-                id="legacy-scene-model"
                 v-model="bindingModel"
-                aria-label="为旧场景绑定模型"
-                :disabled="editorLocked || modelOptionsState !== 'ready'"
-                @change="bindingError = ''"
+                aria-label="绑定场景模型"
+                :disabled="editorLocked || modelOptions.length === 0"
               >
-                <option value="" disabled>选择模型</option>
                 <option
                   v-for="option in modelOptions"
-                  :key="option.protocol"
+                  :key="option.model"
                   :value="option.model"
                 >
-                  {{ modelOptionLabel(option) }}
+                  {{ option.protocol }} · {{ option.model }}
                 </option>
               </select>
               <button
+                type="submit"
                 class="secondary-button"
-                type="button"
-                :disabled="editorLocked || bindingModel === ''"
-                @click="bindCurrentSceneModel"
+                :disabled="editorLocked || isDirty || !bindingModel"
               >
-                {{ isBindingModel ? "绑定中…" : "确认绑定" }}
+                {{
+                  busyAction === "bind-model" ? "绑定中…" : "永久绑定"
+                }}
               </button>
-            </div>
-            <p v-if="bindingError" class="form-error" role="alert">
-              {{ bindingError }}
-            </p>
-            <p
-              v-if="
-                currentScene.model !== null &&
-                modelOptionsState === 'ready' &&
-                !canUseBoundModel
-              "
-              class="model-unavailable"
-              role="status"
-            >
-              当前配置不再提供此模型；仍可查看、编辑和人工发送消息，但不能预览或生成模型请求。
-            </p>
+            </form>
           </section>
 
           <nav class="agent-tabs" aria-label="选择 Agent">
             <button
-              v-for="agentId in AGENT_IDS"
-              :key="agentId"
-              class="agent-tab"
-              :class="{
-                'agent-tab--active': activeAgentId === agentId,
-              }"
+              v-for="agent in currentScene.agents"
+              :key="agent.id"
               type="button"
-              :aria-selected="activeAgentId === agentId"
-              role="tab"
+              :class="{ active: activeAgentId === agent.id }"
               :disabled="editorLocked"
-              @click="activeAgentId = agentId"
+              @click="activeAgentId = agent.id"
             >
-              <span class="agent-letter">{{ agentId }}</span>
-              <span class="agent-tab-copy">
-                <small>Agent {{ agentId }}</small>
-                <strong>{{
-                  currentScene.agents.find(
-                    (agent) => agent.id === agentId,
-                  )?.name
-                }}</strong>
+              <span class="agent-id">{{ agent.id }}</span>
+              <span>
+                <small>Agent {{ agent.id }}</small>
+                <strong>{{ agent.name }}</strong>
               </span>
+              <em>
+                {{
+                  stageFor(agent) === "outer"
+                    ? "待外层"
+                    : agent.pending_events.length
+                      ? `${agent.pending_events.length} 个事件`
+                      : "待事件"
+                }}
+              </em>
             </button>
           </nav>
 
-          <div v-if="activeAgent" class="agent-editor">
-            <section class="chat-panel" aria-labelledby="timeline-title">
-              <header class="chat-panel-heading">
+          <div v-if="activeAgent" class="agent-layout">
+            <section class="history-panel">
+              <header class="panel-heading">
                 <div>
                   <p class="eyebrow">AGENT {{ activeAgent.id }}</p>
-                  <h2 id="timeline-title">
-                    {{ activeAgent.name || "未命名 Agent" }}
-                  </h2>
-                  <p>私人时间线 · 仅这位 Agent 可见的已确认消息</p>
+                  <h2>{{ activeAgent.name }}</h2>
+                  <p>按发生顺序混合展示，只呈现这位 Agent 获得的信息。</p>
                 </div>
-                <div class="chat-heading-actions">
-                  <span class="chat-agent-id">
-                    固定身份 <strong>Agent {{ activeAgent.id }}</strong>
-                  </span>
-                </div>
+                <span
+                  class="stage-badge"
+                  :class="`stage-badge--${activeStage}`"
+                >
+                  {{ stageTitle }}
+                </span>
               </header>
 
-              <div
-                ref="timelineScroller"
-                class="chat-messages"
-                aria-live="polite"
-                @scroll="handleTimelineScroll"
-              >
-                <p
-                  v-if="activeAgent.timeline.length === 0"
-                  class="timeline-empty"
-                >
-                  时间线为空
+              <div class="timeline" aria-live="polite">
+                <p v-if="mixedTimeline.length === 0" class="timeline-empty">
+                  尚无外部事件或已确认调用。
                 </p>
-                <ol v-else class="chat-message-list">
+                <ol v-else>
                   <li
-                    v-for="record in activeAgent.timeline"
-                    :key="`message-${record.message_id}-${record.direction}`"
-                    class="chat-message"
-                    :class="`chat-message--${record.direction}`"
+                    v-for="item in mixedTimeline"
+                    :key="item.key"
+                    class="timeline-item"
+                    :class="`timeline-item--${item.kind}`"
                   >
-                    <article class="chat-bubble">
-                      <p class="chat-message-content">
-                        {{ record.content }}
-                      </p>
-                      <button
-                        v-if="deletableMessageIds.has(record.message_id)"
-                        class="timeline-delete-button"
-                        type="button"
-                        :disabled="isDirty || editorLocked"
-                        @click="confirmDeleteMessage(record)"
-                      >
-                        {{
-                          deletingMessageId === record.message_id
-                            ? "删除中…"
-                            : "删除"
-                        }}
-                      </button>
+                    <div class="timeline-rail">
+                      <span>{{ item.sequence }}</span>
+                    </div>
+                    <article>
+                      <header>
+                        <strong>{{ item.label }}</strong>
+                        <span v-if="item.status">{{ item.status }}</span>
+                      </header>
+                      <p>{{ item.content }}</p>
+                      <details v-if="item.input" class="call-input">
+                        <summary>查看本次实际输入</summary>
+                        <pre>{{ item.input }}</pre>
+                        <small>call {{ item.callId }}</small>
+                      </details>
                     </article>
                   </li>
                 </ol>
               </div>
 
-              <button
-                v-if="hasNewTimelineUpdate"
-                class="new-message-button"
-                type="button"
-                @click="scrollTimelineToLatest"
-              >
-                有新消息 · 回到最新
-              </button>
-
-              <footer class="chat-composer">
-                <div class="message-fields">
-                  <label class="message-content" for="message-content">
-                    <span>完整消息草稿</span>
-                    <textarea
-                      id="message-content"
-                      v-model="activeMessageDraft.content"
-                      rows="3"
-                      :disabled="editorLocked"
-                      placeholder="To B: 消息正文"
-                      @input="markMessageDraftEdited"
-                    ></textarea>
-                  </label>
+              <footer class="draft-panel">
+                <div class="draft-heading">
+                  <div>
+                    <p class="eyebrow">
+                      {{ activeStage === "inner" ? "INNER" : "OUTER" }}
+                      STEP
+                    </p>
+                    <h3>
+                      {{
+                        activeStage === "inner"
+                          ? "内层人格草稿"
+                          : "外层人格草稿"
+                      }}
+                    </h3>
+                  </div>
+                  <p>
+                    {{
+                      activeStage === "inner"
+                        ? "可使用多行自然文本；确认后消费队首事件。"
+                        : "必须为单行 To X: 正文；确认后才会路由事件。"
+                    }}
+                  </p>
                 </div>
 
-                <section
-                  v-if="activeMessageDraft.usage"
-                  class="reasoning-panel"
-                  aria-label="本次模型思维内容"
-                >
-                  <div class="reasoning-heading">
-                    <h3>模型思维</h3>
-                    <span>仅本次草稿 · 不保存</span>
-                  </div>
-                  <div
-                    v-if="activeMessageDraft.reasoning.length"
-                    class="reasoning-blocks"
-                  >
-                    <article
-                      v-for="(block, index) in activeMessageDraft.reasoning"
-                      :key="`${block.type}-${index}`"
-                      class="reasoning-block"
-                    >
-                      <h4>{{ reasoningLabel(block.type) }}</h4>
-                      <pre>{{ block.text }}</pre>
-                    </article>
-                  </div>
-                  <p v-else class="reasoning-empty">
-                    本次响应没有返回可读思维内容。
-                  </p>
-                </section>
+                <textarea
+                  id="layer-draft-content"
+                  :value="
+                    activeDraft?.layer === activeStage
+                      ? activeDraft.content
+                      : ''
+                  "
+                  :rows="activeStage === 'inner' ? 6 : 3"
+                  :placeholder="
+                    activeStage === 'inner'
+                      ? '先生成内层草稿'
+                      : 'To B: 正文'
+                  "
+                  :disabled="
+                    editorLocked ||
+                    activeDraft?.layer !== activeStage
+                  "
+                  @input="updateDraftContent"
+                ></textarea>
 
                 <dl
-                  v-if="activeMessageDraft.usage"
-                  class="usage-metrics"
-                  aria-label="本次草稿生成 token 用量"
+                  v-if="activeDraft?.layer === activeStage"
+                  class="usage-grid"
                 >
                   <div>
                     <dt>缓存写入</dt>
                     <dd>
                       {{
-                        activeMessageDraft.usage
-                          .cache_creation_input_tokens
+                        activeDraft.usage.cache_creation_input_tokens
                       }}
                     </dd>
                   </div>
                   <div>
                     <dt>缓存读取</dt>
-                    <dd>
-                      {{
-                        activeMessageDraft.usage.cache_read_input_tokens
-                      }}
-                    </dd>
+                    <dd>{{ activeDraft.usage.cache_read_input_tokens }}</dd>
                   </div>
                   <div>
                     <dt>未缓存输入</dt>
-                    <dd>{{ activeMessageDraft.usage.input_tokens }}</dd>
+                    <dd>{{ activeDraft.usage.input_tokens }}</dd>
                   </div>
                   <div>
                     <dt>输出</dt>
-                    <dd>{{ activeMessageDraft.usage.output_tokens }}</dd>
+                    <dd>{{ activeDraft.usage.output_tokens }}</dd>
                   </div>
                 </dl>
 
-                <div class="message-actions">
-                  <p v-if="isDirty" class="message-hint">
-                    请先保存场景，再生成或确认发送。
-                  </p>
-                  <p v-else-if="!canUseBoundModel" class="message-hint">
-                    场景模型未绑定或当前不可用；仍可手写并确认发送消息。
-                  </p>
-                  <p
-                    v-else-if="messageErrors[activeAgent.id]"
-                    class="form-error message-error"
-                    role="alert"
+                <details
+                  v-if="
+                    activeDraft?.layer === activeStage &&
+                    activeDraft.reasoning.length > 0
+                  "
+                  class="draft-reasoning"
+                >
+                  <summary>本次临时 reasoning</summary>
+                  <article
+                    v-for="(block, index) in activeDraft.reasoning"
+                    :key="`${block.type}:${index}`"
                   >
-                    {{ messageErrors[activeAgent.id] }}
-                  </p>
-                  <p v-else class="message-hint">
-                    只有确认后的消息才会进入双方个人时间线。
-                  </p>
-                  <div class="message-action-buttons">
-                    <button
-                      v-if="activeDraftHasContent"
-                      class="text-button discard-draft-button"
-                      type="button"
-                      :disabled="editorLocked"
-                      @click="discardActiveDraft"
-                    >
-                      放弃草稿
-                    </button>
-                    <button
-                      class="secondary-button message-generate-button"
-                      type="button"
-                      :disabled="!canGenerateMessageDraft"
-                      @click="generateDraft"
-                    >
-                      {{
-                        generatingAgentId === activeAgent.id
-                          ? "生成中…"
-                          : activeDraftHasContent
-                            ? "重新生成"
-                            : "生成草稿"
-                      }}
-                    </button>
-                    <button
-                      class="primary-button message-send-button"
-                      type="button"
-                      :disabled="!canSendMessage"
-                      @click="confirmMessage"
-                    >
-                      {{
-                        sendingAgentId === activeAgent.id
-                          ? "发送中…"
-                          : "确认发送"
-                      }}
-                    </button>
-                  </div>
+                    <strong>{{ block.type }}</strong>
+                    <pre>{{ block.text }}</pre>
+                  </article>
+                  <small>
+                    仅存在浏览器草稿中；确认后不会保存或回传模型。
+                  </small>
+                </details>
+
+                <details
+                  v-if="activeDraft?.layer === activeStage"
+                  class="draft-request"
+                >
+                  <summary>本次生成的实际请求快照</summary>
+                  <pre>{{ prettyJson(activeDraft.request_snapshot) }}</pre>
+                </details>
+
+                <p
+                  v-if="draftErrors[activeAgent.id]"
+                  class="inline-error"
+                  role="alert"
+                >
+                  {{ draftErrors[activeAgent.id] }}
+                </p>
+                <p v-else-if="!sceneModelAvailable" class="hint">
+                  场景模型未绑定或当前不可用，不能生成或确认草稿。
+                </p>
+                <p v-else-if="isDirty" class="hint">
+                  请先保存设定，再生成或确认。
+                </p>
+                <p
+                  v-else-if="
+                    activeStage === 'inner' &&
+                    activeAgent.pending_events.length === 0
+                  "
+                  class="hint"
+                >
+                  没有待处理事件，不能启动内层推理。
+                </p>
+                <p v-else class="hint">
+                  生成和重新生成各调用模型一次；确认不调用模型。
+                </p>
+
+                <div class="draft-actions">
+                  <button
+                    v-if="activeDraft?.layer === activeStage"
+                    type="button"
+                    class="text-button"
+                    :disabled="editorLocked"
+                    @click="discardDraft"
+                  >
+                    放弃草稿
+                  </button>
+                  <button
+                    type="button"
+                    class="secondary-button"
+                    :disabled="!canGenerate"
+                    @click="generateDraft"
+                  >
+                    {{
+                      busyAction?.startsWith("generate:")
+                        ? "生成中…"
+                        : activeDraft?.layer === activeStage
+                          ? "重新生成"
+                          : `生成${
+                              activeStage === "inner" ? "内层" : "外层"
+                            }草稿`
+                    }}
+                  </button>
+                  <button
+                    type="button"
+                    class="primary-button"
+                    :disabled="!canConfirm"
+                    @click="confirmDraft"
+                  >
+                    {{
+                      busyAction?.startsWith("confirm:")
+                        ? "确认中…"
+                        : `确认${
+                            activeStage === "inner" ? "内层" : "外层"
+                          }`
+                    }}
+                  </button>
                 </div>
               </footer>
             </section>
 
-            <details class="secondary-panel role-panel">
-              <summary>
-                <span>
-                  <strong>角色设定</strong>
-                  <small>显示名、角色提示词、欲望、恐惧与记忆</small>
-                </span>
-              </summary>
-              <div class="secondary-panel-body field-grid">
-                <label class="field field--wide" for="agent-name">
-                  <span>显示名</span>
-                  <small>可编辑；固定 ID 不会随名称改变</small>
-                  <input
-                    id="agent-name"
-                    v-model="activeAgent.name"
-                    type="text"
-                    autocomplete="off"
-                    required
-                    :disabled="editorLocked"
-                    @input="markEdited"
-                  />
-                </label>
+            <aside class="control-column">
+              <section class="queue-card">
+                <header>
+                  <div>
+                    <p class="eyebrow">FIFO QUEUE</p>
+                    <h3>待处理外部事件</h3>
+                  </div>
+                  <span>{{ activeAgent.pending_events.length }}</span>
+                </header>
 
-                <label
-                  class="field field--wide system-prompt-field"
-                  for="agent-system-prompt"
-                >
-                  <span>最终系统提示词</span>
-                  <small>
-                    权威角色提示；保存值会逐字成为模型请求中唯一的系统指令
-                  </small>
+                <form @submit.prevent="addEvent">
+                  <label for="new-event">给当前 Agent 添加手工事件</label>
                   <textarea
-                    id="agent-system-prompt"
-                    v-model="activeAgent.system_prompt"
-                    rows="15"
-                    :disabled="editorLocked"
-                    required
-                    @input="markEdited"
+                    id="new-event"
+                    v-model="newEventContent[activeAgent.id]"
+                    rows="3"
+                    placeholder="只进入当前 Agent 的队列"
+                    :disabled="editorLocked || isDirty"
                   ></textarea>
-                </label>
-
-                <label class="field field--wide" for="agent-persona">
-                  <span>人设</span>
-                  <small>身份、经历与相对稳定的性格描述</small>
-                  <textarea
-                    id="agent-persona"
-                    v-model="activeAgent.persona"
-                    rows="5"
-                    :disabled="editorLocked"
-                    placeholder="暂时可以留空"
-                    @input="markEdited"
-                  ></textarea>
-                </label>
-
-                <label class="field" for="agent-desire">
-                  <span>欲望</span>
-                  <small>用自然语言描述 Agent 想要什么</small>
-                  <textarea
-                    id="agent-desire"
-                    v-model="activeAgent.desire"
-                    rows="7"
-                    :disabled="editorLocked"
-                    placeholder="暂时可以留空"
-                    @input="markEdited"
-                  ></textarea>
-                </label>
-
-                <label class="field" for="agent-fear">
-                  <span>恐惧</span>
-                  <small>用自然语言描述 Agent 害怕什么</small>
-                  <textarea
-                    id="agent-fear"
-                    v-model="activeAgent.fear"
-                    rows="7"
-                    :disabled="editorLocked"
-                    placeholder="暂时可以留空"
-                    @input="markEdited"
-                  ></textarea>
-                </label>
-
-                <label class="field field--wide" for="agent-memory">
-                  <span>当前压缩记忆</span>
-                  <small>仅供人工编辑；本阶段不会自动更新</small>
-                  <textarea
-                    id="agent-memory"
-                    v-model="activeAgent.memory"
-                    rows="7"
-                    :disabled="editorLocked"
-                    placeholder="暂时可以留空"
-                    @input="markEdited"
-                  ></textarea>
-                </label>
-
-                <button
-                  class="secondary-button recompose-button"
-                  type="button"
-                  :disabled="editorLocked"
-                  @click="recomposeActiveSystemPrompt"
-                >
-                  {{
-                    composingAgentId === activeAgent.id
-                      ? "拼接中…"
-                      : "从槽位重新拼接"
-                  }}
-                </button>
-              </div>
-            </details>
-
-            <details class="secondary-panel observability-card">
-              <summary>
-                <span>
-                  <strong>模型请求预览</strong>
-                  <small>检查模型实际看到的文本与完整载荷</small>
-                </span>
-              </summary>
-              <div class="secondary-panel-body">
-                <div class="preview-actions">
                   <button
-                    class="secondary-button preview-button"
+                    type="submit"
+                    class="secondary-button"
+                    :disabled="editorLocked || isDirty"
+                  >
+                    添加到队尾
+                  </button>
+                </form>
+
+                <p
+                  v-if="eventError"
+                  class="inline-error"
+                  role="alert"
+                >
+                  {{ eventError }}
+                </p>
+
+                <ol v-if="activeAgent.pending_events.length" class="queue-list">
+                  <li
+                    v-for="(event, index) in activeAgent.pending_events"
+                    :key="event.id"
+                  >
+                    <header>
+                      <span>#{{ index + 1 }} {{ index === 0 ? "队首" : "" }}</span>
+                      <em>
+                        {{
+                          event.kind === "manual"
+                            ? "手工事件"
+                            : "Agent 事件 · 不可修改"
+                        }}
+                      </em>
+                    </header>
+                    <template v-if="event.kind === 'manual'">
+                      <textarea
+                        :value="eventEdits[event.id]"
+                        rows="3"
+                        :disabled="editorLocked || isDirty"
+                        @input="updateEventEdit(event.id, $event)"
+                      ></textarea>
+                      <div>
+                        <button
+                          type="button"
+                          class="text-button"
+                          :disabled="editorLocked || isDirty"
+                          @click="removeEvent(event)"
+                        >
+                          删除
+                        </button>
+                        <button
+                          type="button"
+                          class="small-button"
+                          :disabled="
+                            editorLocked ||
+                            isDirty ||
+                            eventEdits[event.id] === event.content
+                          "
+                          @click="saveEvent(event)"
+                        >
+                          保存修改
+                        </button>
+                      </div>
+                    </template>
+                    <p v-else>{{ event.content }}</p>
+                  </li>
+                </ol>
+                <p v-else class="muted">队列为空。</p>
+              </section>
+
+              <details class="settings-card">
+                <summary>
+                  <span>
+                    <strong>Agent 与双层提示词</strong>
+                    <small>两份完整文本分别保存，不做槽位拼接</small>
+                  </span>
+                </summary>
+                <div class="settings-body">
+                  <label for="agent-name">
+                    <span>显示名</span>
+                    <input
+                      id="agent-name"
+                      v-model="activeAgent.name"
+                      type="text"
+                      :disabled="editorLocked"
+                    />
+                  </label>
+                  <label for="inner-system-prompt">
+                    <span>内层 system prompt</span>
+                    <textarea
+                      id="inner-system-prompt"
+                      v-model="activeAgent.inner_context.system_prompt"
+                      rows="14"
+                      :disabled="editorLocked"
+                    ></textarea>
+                  </label>
+                  <label for="outer-system-prompt">
+                    <span>外层 system prompt</span>
+                    <textarea
+                      id="outer-system-prompt"
+                      v-model="activeAgent.outer_context.system_prompt"
+                      rows="16"
+                      :disabled="editorLocked"
+                    ></textarea>
+                  </label>
+                </div>
+              </details>
+
+              <details class="preview-card">
+                <summary>
+                  <span>
+                    <strong>模型请求预览</strong>
+                    <small>完整上下文与原始 JSON 来自同一快照</small>
+                  </span>
+                </summary>
+                <div class="preview-body">
+                  <div class="layer-switch" role="group" aria-label="预览层级">
+                    <button
+                      v-for="layer in LAYERS"
+                      :key="layer"
+                      type="button"
+                      :class="{ active: previewLayer === layer }"
+                      @click="previewLayer = layer"
+                    >
+                      {{ layer === "inner" ? "内层" : "外层" }}
+                    </button>
+                  </div>
+                  <button
                     type="button"
-                    :disabled="editorLocked || !canUseBoundModel"
-                    @click="loadRequestPreview"
+                    class="secondary-button"
+                    :disabled="editorLocked || !sceneModelAvailable"
+                    @click="loadPreview"
                   >
                     {{
-                      previewingAgentId === activeAgent.id
+                      busyAction?.startsWith("preview:")
                         ? "加载中…"
-                        : requestPreviews[activeAgent.id]
+                        : selectedPreview
                           ? "刷新预览"
                           : "加载预览"
                     }}
                   </button>
-                  <div
-                    v-if="requestPreviews[activeAgent.id]"
-                    class="preview-mode-switch"
-                    role="group"
-                    aria-label="请求预览模式"
-                  >
-                    <button
-                      type="button"
-                      :class="{ active: previewMode === 'readable' }"
-                      @click="previewMode = 'readable'"
-                    >
-                      可读模型上下文
-                    </button>
-                    <button
-                      type="button"
-                      :class="{ active: previewMode === 'json' }"
-                      @click="previewMode = 'json'"
-                    >
-                      原始 JSON
-                    </button>
-                  </div>
-                </div>
-                <p v-if="isDirty" class="stale-preview-notice">
-                  场景有未保存修改；下一次请求预览基于已保存版本，当前显示为旧版本。
-                  请先保存再刷新。
-                </p>
-                <p
-                  v-if="previewErrors[activeAgent.id]"
-                  class="form-error"
-                  role="alert"
-                >
-                  {{ previewErrors[activeAgent.id] }}
-                </p>
-                <div class="request-preview">
-                  <p
-                    v-if="requestPreviews[activeAgent.id] === null"
-                    class="request-empty"
-                  >
-                    尚未加载已保存场景的下一次请求。
+                  <p v-if="isDirty" class="hint">
+                    当前有未保存设定；接口预览仍基于磁盘版本。
                   </p>
-                  <div
-                    v-else-if="previewMode === 'readable'"
-                    class="readable-context"
+                  <p
+                    v-if="previewError"
+                    class="inline-error"
+                    role="alert"
                   >
-                    <article
-                      v-for="(block, index) in readableModelContext(
-                        requestPreviews[activeAgent.id]!,
-                      )"
-                      :key="`${block.label}-${index}`"
-                    >
-                      <strong>{{ block.label }}</strong>
-                      <pre>{{ block.text }}</pre>
-                    </article>
-                  </div>
-                  <pre v-else>{{
-                    prettyJson(requestPreviews[activeAgent.id])
-                  }}</pre>
+                    {{ previewError }}
+                  </p>
+
+                  <template v-if="selectedPreview">
+                    <div class="preview-mode-switch">
+                      <button
+                        type="button"
+                        :class="{ active: previewMode === 'readable' }"
+                        @click="previewMode = 'readable'"
+                      >
+                        可读上下文
+                      </button>
+                      <button
+                        type="button"
+                        :class="{ active: previewMode === 'json' }"
+                        @click="previewMode = 'json'"
+                      >
+                        原始 JSON
+                      </button>
+                    </div>
+                    <div class="request-preview">
+                      <div
+                        v-if="previewMode === 'readable'"
+                        class="readable-context"
+                      >
+                        <article
+                          v-for="(block, index) in readableModelContext(
+                            selectedPreview.request,
+                          )"
+                          :key="`${block.label}:${index}`"
+                        >
+                          <strong>{{ block.label }}</strong>
+                          <pre>{{ block.text }}</pre>
+                        </article>
+                      </div>
+                      <pre v-else>{{
+                        prettyJson(selectedPreview.request)
+                      }}</pre>
+                    </div>
+                  </template>
                 </div>
-                <p class="observability-note">
-                  两种视图来自同一次后端请求快照；可读视图逐字展示其中的
-                  系统指令、role 与文本块，原始 JSON 保留传输元数据。
-                </p>
-              </div>
-            </details>
+              </details>
+            </aside>
           </div>
         </template>
       </section>
     </main>
-
   </div>
 </template>
