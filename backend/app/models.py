@@ -511,7 +511,7 @@ class EventContentRequest(ApiModel):
 
 
 class LayerDraftResponse(ApiModel):
-    """Browser-only result of exactly one inner or outer model call."""
+    """Browser-only result and captured JSON body from one successful call."""
 
     layer: Layer
     call_id: UUID
@@ -544,12 +544,11 @@ class ModelRequestContextItem(ApiModel):
 
 
 class ModelRequestPreviewResponse(ApiModel):
-    """Readable context and exact request for one selected persona layer."""
+    """Protocol-neutral context for one selected persona layer."""
 
     layer: Layer
     event_id: UUID
     context: list[ModelRequestContextItem]
-    request: dict[str, Any]
 
 
 class SceneConflictError(RuntimeError):

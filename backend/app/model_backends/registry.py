@@ -54,7 +54,7 @@ class ModelBackendRegistry(Mapping[str, ModelBackend]):
         """Return exact model names in configuration order."""
         return tuple(self._backends)
 
-    def close(self) -> None:
+    async def aclose(self) -> None:
         """Close every owned backend once, in reverse creation order."""
         if self._closed:
             return
@@ -63,7 +63,7 @@ class ModelBackendRegistry(Mapping[str, ModelBackend]):
         first_error: BaseException | None = None
         for backend in reversed(tuple(self._backends.values())):
             try:
-                backend.close()
+                await backend.aclose()
             except BaseException as error:
                 # Continue cleanup so one broken backend cannot leak the rest.
                 if first_error is None:
@@ -72,7 +72,7 @@ class ModelBackendRegistry(Mapping[str, ModelBackend]):
             raise first_error
 
 
-def create_model_backend_registry(
+async def create_model_backend_registry(
     settings: Iterable[_RegistrySettings],
     factories: Mapping[str, BackendFactory],
 ) -> ModelBackendRegistry:
@@ -99,7 +99,7 @@ def create_model_backend_registry(
         backend: ModelBackend | None = None
         backend_model = ""
         try:
-            backend = factories[model_settings.protocol](model_settings)
+            backend = await factories[model_settings.protocol](model_settings)
             if not isinstance(backend, ModelBackend):
                 raise TypeError("factory returned an invalid backend")
             backend_model = backend.model
@@ -107,7 +107,7 @@ def create_model_backend_registry(
             cleanup_targets = [*backends]
             if backend is not None:
                 cleanup_targets.append(backend)
-            _close_after_failed_creation(cleanup_targets)
+            await _close_after_failed_creation(cleanup_targets)
             if not isinstance(error, Exception):
                 raise
             factory_failed = True
@@ -116,7 +116,7 @@ def create_model_backend_registry(
         assert backend is not None
         backends.append(backend)
         if backend_model != model_settings.model:
-            _close_after_failed_creation(backends)
+            await _close_after_failed_creation(backends)
             raise BackendRegistryError(
                 "Invalid backend registry: factory returned wrong model"
             ) from None
@@ -132,7 +132,7 @@ def create_model_backend_registry(
     try:
         registry = ModelBackendRegistry(backends)
     except BaseException as error:
-        _close_after_failed_creation(backends)
+        await _close_after_failed_creation(backends)
         if not isinstance(error, Exception):
             raise
         registry_failed = True
@@ -166,11 +166,11 @@ def _validate_settings(
             )
 
 
-def _close_after_failed_creation(backends: list[ModelBackend]) -> None:
+async def _close_after_failed_creation(backends: list[ModelBackend]) -> None:
     """Best-effort reverse cleanup without masking the creation failure."""
     for backend in reversed(backends):
         try:
-            backend.close()
+            await backend.aclose()
         except BaseException:
             # The active factory error is the actionable startup failure.
             continue

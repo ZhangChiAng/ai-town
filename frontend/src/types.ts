@@ -107,7 +107,7 @@ export interface SceneUpdate {
   agents: AgentUpdate[];
 }
 
-export type ModelRequest = Record<string, unknown>;
+export type JsonObject = Record<string, unknown>;
 
 export interface ModelRequestContextItem {
   role: "system" | "user" | "assistant";
@@ -121,7 +121,7 @@ export interface LayerDraftResponse {
   content: string;
   reasoning: ModelReasoningBlock[];
   usage: TokenUsage;
-  request_snapshot: ModelRequest;
+  request_snapshot: JsonObject;
   state_token: string;
 }
 
@@ -136,5 +136,4 @@ export interface ModelRequestPreviewResponse {
   layer: Layer;
   event_id: string;
   context: ModelRequestContextItem[];
-  request: ModelRequest;
 }

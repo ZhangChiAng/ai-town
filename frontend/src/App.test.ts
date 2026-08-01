@@ -403,6 +403,9 @@ describe("App", () => {
     expect(container.querySelector(".draft-reasoning")?.textContent).toContain(
       "临时判断，不应持久化",
     );
+    expect(container.querySelector(".draft-request pre")?.textContent).toBe(
+      JSON.stringify(innerDraft().request_snapshot, null, 2),
+    );
     textarea.value = "先观察。\n也许只是天气。";
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
     await nextTick();
@@ -576,7 +579,7 @@ describe("App", () => {
     expect(createdBody).toEqual({ content: "新增潮汐报告" });
   });
 
-  it("restores an outer half-round and previews its exact request as text or JSON", async () => {
+  it("restores an outer half-round and previews its neutral context", async () => {
     const scene = halfRoundScene();
     scene.model = "gpt-test";
     const preview: ModelRequestPreviewResponse = {
@@ -593,12 +596,6 @@ describe("App", () => {
             "你内心有一个声音：\n先观察风向。\n别急着靠岸。",
         },
       ],
-      request: {
-        opaque_adapter_envelope: {
-          nested_wire_value: "只应出现在原始 JSON",
-        },
-        engine_number: 7,
-      },
     };
     await mountOpenedScene(scene, {
       [`GET /api/scenes/${SCENE_ID}/agents/A/model-request-preview?layer=outer`]:
@@ -623,12 +620,7 @@ describe("App", () => {
         text: article.querySelector("pre")?.textContent,
       })),
     ).toEqual(preview.context);
-    expect(readable.textContent).not.toContain("只应出现在原始 JSON");
-    findButton(details, "原始 JSON").click();
-    await nextTick();
-    expect(details.querySelector(".request-preview > pre")?.textContent).toBe(
-      JSON.stringify(preview.request, null, 2),
-    );
+    expect(details.textContent).not.toContain("原始 JSON");
   });
 
   it("asks before rolling back and returns to the saved outer stage", async () => {

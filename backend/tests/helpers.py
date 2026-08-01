@@ -12,7 +12,6 @@ from app.model_backends import (
     ModelGeneration,
     ModelReasoning,
     ModelUsage,
-    PreparedModelRequest,
 )
 from app.models import ConfirmLayerRequest
 from app.storage import SceneStorage
@@ -77,31 +76,22 @@ class FakeBackend:
         self._outputs = list(outputs)
         self._payload_builder = payload_builder or neutral_payload
         self._events = events
-        self.conversations: list[ModelConversation] = []
-        self.generate_calls: list[PreparedModelRequest] = []
+        self.generate_calls: list[ModelConversation] = []
+        self.conversations = self.generate_calls
         self.close_calls = 0
+        self._closed = False
 
     @property
     def model(self) -> str:
         """Return the exact case-sensitive model identity."""
         return self._model
 
-    def prepare(
+    async def generate(
         self,
         conversation: ModelConversation,
-    ) -> PreparedModelRequest:
-        """Record one neutral conversation and return the prepared payload."""
-        self.conversations.append(conversation)
-        return PreparedModelRequest(
-            payload=self._payload_builder(conversation, self._model),
-        )
-
-    def generate(
-        self,
-        prepared: PreparedModelRequest,
     ) -> ModelGeneration:
         """Consume one queued result as a single upstream-equivalent call."""
-        self.generate_calls.append(prepared)
+        self.generate_calls.append(conversation)
         result = self._outputs.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -111,10 +101,17 @@ class FakeBackend:
             content=result,
             reasoning=(DEFAULT_REASONING,),
             usage=DEFAULT_USAGE,
+            request_snapshot=self._payload_builder(
+                conversation,
+                self._model,
+            ),
         )
 
-    def close(self) -> None:
-        """Record one lifecycle release and optionally announce it."""
+    async def aclose(self) -> None:
+        """Record one idempotent release and optionally announce it."""
+        if self._closed:
+            return
+        self._closed = True
         self.close_calls += 1
         if self._events is not None:
             self._events.append(f"close:{self._model}")

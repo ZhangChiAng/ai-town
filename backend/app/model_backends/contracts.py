@@ -66,17 +66,6 @@ class ModelConversation:
 
 
 @dataclass(frozen=True, slots=True)
-class PreparedModelRequest:
-    """Credential-free, JSON-safe request payload prepared for one backend."""
-
-    payload: JsonObject
-
-    def __post_init__(self) -> None:
-        """Keep preview and generation payloads safely serializable."""
-        _require_json_safe(self.payload)
-
-
-@dataclass(frozen=True, slots=True)
 class ModelReasoning:
     """One provider-approved, browser-only reasoning text block."""
 
@@ -117,10 +106,12 @@ class ModelGeneration:
     content: str
     reasoning: tuple[ModelReasoning, ...]
     usage: ModelUsage
+    request_snapshot: JsonObject
 
     def __post_init__(self) -> None:
-        """Require visible model output without changing it."""
+        """Require visible output and a safely serializable wire snapshot."""
         _require_non_blank(self.content, "content")
+        _require_json_safe(self.request_snapshot)
 
 
 @runtime_checkable
@@ -148,28 +139,22 @@ class ModelBackend(Protocol):
     def model(self) -> str:
         """Return the exact configured model name."""
 
-    def prepare(
+    async def generate(
         self,
         conversation: ModelConversation,
-    ) -> PreparedModelRequest:
-        """Purely prepare one credential-free provider payload."""
-
-    def generate(
-        self,
-        prepared: PreparedModelRequest,
     ) -> ModelGeneration:
-        """Call the upstream provider exactly once for the prepared payload."""
+        """Call upstream once and return its result plus captured JSON body."""
 
-    def close(self) -> None:
+    async def aclose(self) -> None:
         """Release resources owned by this backend."""
 
 
 class BackendFactory(Protocol):
     """Callable that creates one backend from resolved model settings."""
 
-    def __call__(
+    async def __call__(
         self,
         settings: ModelBackendSettings,
         /,
     ) -> ModelBackend:
-        """Create a backend for exactly one configured model."""
+        """Create a backend for exactly one configured model asynchronously."""

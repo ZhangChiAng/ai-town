@@ -9,11 +9,10 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from app.model_backends.contracts import (
-    JsonObject,
     ModelBackend,
     ModelConversation,
+    ModelGeneration,
     ModelTurn,
-    PreparedModelRequest,
 )
 from app.models import (
     AgentId,
@@ -53,22 +52,20 @@ class DraftContextItem:
 
 @dataclass(frozen=True, slots=True)
 class DraftPreview:
-    """Protocol-neutral readable context plus the exact backend payload."""
+    """Protocol-neutral readable context for one model request."""
 
     layer: Layer
     event_id: UUID
     context: tuple[DraftContextItem, ...]
-    request: JsonObject
 
 
 @dataclass(frozen=True, slots=True)
-class _PreparedDraft:
-    """Single preparation shared by one workflow preview or generation."""
+class _DraftCallContext:
+    """Protocol-neutral business context for one preview or generation."""
 
     event_id: UUID
     event: ExternalEvent
     conversation: ModelConversation
-    request: PreparedModelRequest
 
 
 class DraftWorkflow:
@@ -77,11 +74,12 @@ class DraftWorkflow:
     def __init__(self, backend: ModelBackend) -> None:
         """Bind the workflow to one immutable configured backend."""
         self._backend = backend
+        self._model = backend.model
 
     @property
     def model(self) -> str:
         """Return the exact model served by this workflow."""
-        return self._backend.model
+        return self._model
 
     def preview(
         self,
@@ -89,39 +87,45 @@ class DraftWorkflow:
         agent_id: AgentId,
         layer: Layer,
     ) -> DraftPreview:
-        """Prepare the next request without calling the model or storage."""
-        draft = self._prepare(scene, agent_id, layer)
+        """Build the next readable context without touching the backend."""
+        draft = self._build_call_context(scene, agent_id, layer)
         return DraftPreview(
             layer=layer,
             event_id=draft.event_id,
             context=build_readable_context(draft.conversation),
-            request=draft.request.payload,
         )
 
-    def generate(
+    async def generate(
         self,
         scene: Scene,
         agent_id: AgentId,
         layer: Layer,
     ) -> LayerDraftResponse:
-        """Prepare once, call once, and return an unpersisted browser draft."""
-        draft = self._prepare(scene, agent_id, layer)
-        generation = None
-        failure_message = None
+        """Build context, call once, and return an unpersisted browser draft."""
+        draft = self._build_call_context(scene, agent_id, layer)
+        generation: ModelGeneration | None = None
+        backend_failed = False
         try:
-            generation = self._backend.generate(draft.request)
-            if layer == "outer":
-                parse_addressed_message(generation.content, agent_id)
-        except ValueError:
-            failure_message = f"Model returned an invalid {layer} draft."
+            generation = await self._backend.generate(draft.conversation)
         except Exception:
             # Provider bodies and credentials never cross this boundary.
-            failure_message = "Model request failed."
+            backend_failed = True
 
-        if failure_message is not None:
+        if backend_failed or generation is None:
             # Raise outside the handler so no provider exception stays linked.
-            raise DraftGenerationError(failure_message) from None
-        assert generation is not None
+            raise DraftGenerationError("Model request failed.") from None
+
+        invalid_outer = False
+        if layer == "outer":
+            try:
+                parse_addressed_message(generation.content, agent_id)
+            except ValueError:
+                invalid_outer = True
+        if invalid_outer:
+            # Visible output validation is distinct from backend failures.
+            raise DraftGenerationError(
+                "Model returned an invalid outer draft."
+            ) from None
 
         usage = TokenUsage(
             input_tokens=generation.usage.input_tokens,
@@ -141,7 +145,7 @@ class DraftWorkflow:
                 for block in generation.reasoning
             ],
             usage=usage,
-            request_snapshot=draft.request.payload,
+            request_snapshot=generation.request_snapshot,
             state_token=_state_token(
                 scene.model,
                 agent_id,
@@ -153,24 +157,23 @@ class DraftWorkflow:
         _log_usage(scene.id, agent_id, layer, self.model, usage)
         return result
 
-    def _prepare(
+    def _build_call_context(
         self,
         scene: Scene,
         agent_id: AgentId,
         layer: Layer,
-    ) -> _PreparedDraft:
-        """Build one neutral conversation and prepare it exactly once."""
+    ) -> _DraftCallContext:
+        """Build one protocol-neutral conversation exactly once."""
         _require_matching_model(scene, self.model)
         event_id, event, conversation = build_model_conversation(
             scene,
             agent_id,
             layer,
         )
-        return _PreparedDraft(
+        return _DraftCallContext(
             event_id=event_id,
             event=event,
             conversation=conversation,
-            request=self._backend.prepare(conversation),
         )
 
 

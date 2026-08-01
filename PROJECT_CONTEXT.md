@@ -232,36 +232,63 @@ payload；请求字段、缓存传输元数据或 adapter 实现变化不会单�
 进程可按配置顺序注册一个或多个模型，也允许同一协议配置多个模型。场景只绑定
 大小写敏感的具体模型名；协议是后端内部 factory key，不出现在模型选择界面、
 scene 数据或 model-options API 中。所有后端使用同一份人格层隔离规则和逐字
-输入，但具体 adapter 保留自己的原生请求结构。
+输入。
 
-Anthropic 的内层和外层分别维护 block-level 5 分钟缓存断点：
+项目保留协议中性的异步 `ModelBackend` 端口，具体实现统一通过 Pydantic AI
+Direct 的公开 `model_request()`、消息类型、模型类型、provider 和 settings 做
+输入输出映射。每次生成只调用一次 Direct API，并显式关闭 instrumentation。
+Direct 只替换供应商协议序列化层；项目不使用 `Agent`、工具调用、自动历史、
+持久会话、回退模型、重试或自动压缩，也不把 Pydantic AI 的可选能力转化为新的
+产品行为。
 
-- 当前层 system prompt 之后一个断点；
-- 当前层历史非空时，最后一个已确认 output 之后一个滚动断点；
-- 当前未确认 user 输入不缓存。
+后端 factory、registry 创建和关闭均为异步。部分创建失败与正常 lifespan 退出
+都按创建逆序关闭已获得的资源；关闭幂等，并在单个资源关闭失败时继续清理其余
+资源。factory 自身在构造中途失败时也必须先关闭已创建的 HTTP client。
 
-Responses 使用 `instructions`、完整 `input`、`store=false` 与提供商自动缓存，
-不发送 `cache_control` 或其他 Anthropic 元数据。
+Anthropic 对当前层设置两个公开的 5 分钟 block-level 缓存断点：
+
+- `anthropic_cache_instructions='5m'` 缓存唯一的 system prompt；
+- `anthropic_cache_messages='5m'` 缓存始终位于末尾的本轮 current user；
+- 不再单独标记最后一条 assistant，不使用 `CachePoint` 或 1 小时缓存。
+
+current user 可能进入供应商的 5 分钟临时缓存，但在项目内仍是未确认、只由
+浏览器持有的输入；缓存传输元数据不得把它写入 scene 或改变确认语义。
+
+OpenAI Responses 使用 `instructions`、完整 `input`、`store=false`，禁用
+truncation，把 reasoning context 限制在当前轮，不回放 reasoning ID，也不发送
+conversation 或 previous response ID。它不发送 Anthropic 的缓存字段。
 
 生成结果展示提供商返回的缓存写入、缓存读取、未缓存输入和输出 token 数。
 缓存门槛与是否命中由模型提供商决定，系统不填充无意义文本。
 
 请求预览按 `inner|outer` 明确选择层级，不调用模型、不写 JSON。外层尚无已
-确认内层时拒绝预览。响应中的有序 `context` 固定为 system、完整历史的
-user/assistant 交替项和当前 user；可读视图只使用这份中性上下文。原始
-`request` JSON 保留任意 adapter payload，前端不解析供应商字段。界面不能生成
-模型未见的姓名、方向或解释文本，也不能隐藏模型已见的正文。
+确认内层时拒绝预览。预览响应只包含层级、事件 ID 和有序 `context`；context
+固定为 system、完整历史的 user/assistant 交替项和 current user，前端只用它
+展示调用前的协议无关完整上下文。预览不构造或声称展示供应商请求 JSON。
 
-两种协议统一返回缓存写入、缓存读取、未缓存输入和输出 token 数，并只提取
-提供商允许公开的 thinking、reasoning summary 或 reasoning text。签名、加密
-内容和 redacted thinking 不展示；所有 reasoning 都是未持久化的观察数据。
+成功生成后，响应中的 `request_snapshot` 才展示共享 HTTP client 的 request
+hook 从本次实际调用捕获的、已完成序列化且不含凭据的 JSON object body。捕获
+只读取 body，不记录 URL、headers、认证信息或 API key；并发调用相互隔离，
+缺失、重复、非对象或畸形快照都使调用失败，且绝不复用旧结果。失败请求不向
+浏览器提供调试 body。界面不能生成模型未见的姓名、方向或解释文本，也不能
+隐藏模型已见的正文。
+
+两种协议统一返回缓存写入、缓存读取、未缓存输入和输出 token 数；未缓存输入
+按 `input_tokens - cache_read_tokens - cache_write_tokens` 计算，负值属于协议
+错误。响应只接受恰好一个非空可见文本，允许额外的公开 thinking；工具、文件、
+压缩事件和多个可见输出都被拒绝。
+
+Anthropic 只展示公开 thinking 文本。OpenAI 展示公开 reasoning summary，并只
+对白名单中已文档化的 `raw_content` 形状映射现有 `reasoning_text`。签名、加密、
+redacted 及其他 provider details 不展示；所有 reasoning 都是未持久化的观察
+数据。
 
 ## 10. 技术与数据边界
 
 - 后端：Python + FastAPI；
 - 前端：Vue 3 + TypeScript + Vite；
 - 持久化：`data/scenes/<scene-id>.json`；
-- 模型调用：Anthropic Messages 与 OpenAI Responses 两种兼容端点；
+- 模型调用：Pydantic AI Direct 映射到 Anthropic Messages 与 OpenAI Responses；
 - 一个场景的三个 Agent、两个层级始终共用该场景绑定的同一模型；
 - Linux 开发，并可在安装 Python、uv、Node.js 与 npm 的 Windows 机器上
   本地运行。

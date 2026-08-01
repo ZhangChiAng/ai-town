@@ -8,7 +8,7 @@ from uuid import UUID
 import pytest
 
 from app.main import create_app
-from app.model_backends import JsonObject, ModelConversation, ModelTurn
+from app.model_backends import JsonObject, ModelConversation
 from app.storage import SceneStorage
 from tests import helpers
 from tests.client import TestClient
@@ -97,17 +97,6 @@ def _scene_update(scene: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _json_keys(value: Any) -> set[str]:
-    """Return every object key in a nested JSON-safe value."""
-    if isinstance(value, dict):
-        return set(value) | set().union(
-            *(_json_keys(item) for item in value.values())
-        )
-    if isinstance(value, list):
-        return set().union(*(_json_keys(item) for item in value))
-    return set()
-
-
 def _new_pending_inner_draft(
     tmp_path: Path,
     *,
@@ -187,20 +176,17 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
             "model-request-preview?layer=inner"
         )
     )
+    assert set(first_preview) == {"layer", "event_id", "context"}
     assert first_preview["context"] == [
         {"role": "system", "text": "A INNER SYSTEM"},
         {"role": "user", "text": "外部事件：\nA FIRST EVENT"},
     ]
-    assert first_preview["request"] == _fake_payload(
-        first_conversation,
-        FAKE_MODEL,
-        1,
-    )
     assert backend.generate_calls == []
 
     calls_before = len(backend.generate_calls)
     inner = _generate(client, scene["id"], "A", "inner")
     assert len(backend.generate_calls) == calls_before + 1
+    assert backend.generate_calls[-1] == first_conversation
     assert inner["request_snapshot"] == _fake_payload(
         first_conversation,
         FAKE_MODEL,
@@ -239,19 +225,17 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
             "model-request-preview?layer=outer"
         )
     )
+    assert set(outer_preview) == {"layer", "event_id", "context"}
     assert outer_preview["context"] == [
         {"role": "system", "text": "A OUTER SYSTEM"},
         {"role": "user", "text": outer_input},
     ]
-    assert outer_preview["request"] == _fake_payload(
-        outer_conversation,
-        FAKE_MODEL,
-        1,
-    )
+    assert len(backend.generate_calls) == 1
 
     calls_before = len(backend.generate_calls)
     outer = _generate(client, scene["id"], "A", "outer")
     assert len(backend.generate_calls) == calls_before + 1
+    assert backend.generate_calls[-1] == outer_conversation
     calls_before = len(backend.generate_calls)
     completed = _require_json(
         _confirm(client, scene["id"], "A", "outer", outer)
@@ -274,38 +258,23 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
         "外层人格上一轮对 Agent B（OBSERVER AGENT B NAME）说：\n"
         "PUBLIC OUTER OUTPUT\n\n外部事件：\nA SECOND EVENT"
     )
-    later_conversation = ModelConversation(
-        system_prompt="A INNER SYSTEM",
-        turns=(
-            ModelTurn(
-                input="外部事件：\nA FIRST EVENT",
-                output="INNER CONFIRMED EDIT",
-            ),
-        ),
-        current_input=later_input,
-    )
     later_preview = _require_json(
         client.get(
             f"/api/scenes/{scene['id']}/agents/A/"
             "model-request-preview?layer=inner"
         )
     )
+    assert set(later_preview) == {"layer", "event_id", "context"}
     assert later_preview["context"] == [
         {"role": "system", "text": "A INNER SYSTEM"},
         {"role": "user", "text": "外部事件：\nA FIRST EVENT"},
         {"role": "assistant", "text": "INNER CONFIRMED EDIT"},
         {"role": "user", "text": later_input},
     ]
-    assert later_preview["request"] == _fake_payload(
-        later_conversation,
-        FAKE_MODEL,
-        1,
-    )
-    assert backend.conversations[-1] == later_conversation
     assert len(backend.generate_calls) == 2
 
-    serialized_request = json.dumps(
-        later_preview["request"], ensure_ascii=False
+    serialized_context = json.dumps(
+        later_preview["context"], ensure_ascii=False
     )
     forbidden_values = [
         "OBSERVER SCENE NAME",
@@ -324,16 +293,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
         *(event["id"] for event in completed["agents"][1]["pending_events"]),
         *(event["id"] for event in completed["agents"][2]["pending_events"]),
     ]
-    assert all(value not in serialized_request for value in forbidden_values)
-    assert _json_keys(later_preview["request"]) == {
-        "axiom",
-        "echoes",
-        "machine",
-        "pending",
-        "reply",
-        "ritual",
-        "stimulus",
-    }
+    assert all(value not in serialized_context for value in forbidden_values)
 
 
 def test_valid_draft_confirms_after_restart_without_bound_model(
@@ -369,6 +329,49 @@ def test_valid_draft_confirms_after_restart_without_bound_model(
         confirmed["agents"][0]["inner_context"]["turns"][0]["output"]
         == "pending inner answer"
     )
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
+def test_failed_generation_is_sanitized_and_returns_no_snapshot(
+    tmp_path: Path,
+    error_type: type[Exception],
+) -> None:
+    """Transport and protocol errors expose only the stable 502 detail."""
+    leaked_detail = (
+        "body=provider-secret-response "
+        "url=https://secret.example/v1 "
+        "Authorization=Bearer-secret-key header=x-secret"
+    )
+    backend = FakeBackend(
+        [error_type(leaked_detail)],
+        model=FAKE_MODEL,
+    )
+    scene_directory = tmp_path / "scenes"
+    client = TestClient(
+        create_app(SceneStorage(scene_directory), {FAKE_MODEL: backend})
+    )
+    scene = _post_scene(client)
+    scene = _post_event(client, scene["id"], "A", "pending event")
+    scene_path = scene_directory / f"{scene['id']}.json"
+    before_generation = scene_path.read_bytes()
+
+    response = client.post(f"/api/scenes/{scene['id']}/agents/A/inner-drafts")
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Model request failed."}
+    assert "request_snapshot" not in response.text
+    assert all(
+        marker not in response.text
+        for marker in (
+            "provider-secret-response",
+            "secret.example",
+            "Authorization",
+            "secret-key",
+            "x-secret",
+        )
+    )
+    assert len(backend.generate_calls) == 1
+    assert scene_path.read_bytes() == before_generation
 
 
 def _mutate_event(

@@ -209,11 +209,11 @@ function isPreview(
 ): value is ModelRequestPreviewResponse {
   return (
     isRecord(value) &&
+    Object.keys(value).length === 3 &&
     isLayer(value.layer) &&
     typeof value.event_id === "string" &&
     Array.isArray(value.context) &&
-    value.context.every(isModelRequestContextItem) &&
-    isRecord(value.request)
+    value.context.every(isModelRequestContextItem)
   );
 }
 

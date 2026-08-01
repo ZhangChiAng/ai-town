@@ -164,15 +164,14 @@ input/output turns，以及上面的本轮输入。另一层 system prompt、另
 历史、上述接收者 ID 与当前姓名以外的其他 Agent 状态、回退元数据和未确认
 草稿都不会进入请求。
 
-“模型请求预览”可明确选择内层或外层，并展示可读上下文与同一份原始 JSON。
-有序可读 `context` 固定为 system、完整历史的 user/assistant 交替项和当前
-user；前端不从供应商 payload 反推上下文。外层没有对应已确认内层时，预览和
-生成都会返回 `409`。
+“模型请求预览”可明确选择内层或外层，并只展示协议无关的完整上下文。有序
+`context` 固定为 system、完整历史的 user/assistant 交替项和 current user；
+前端不从供应商 payload 反推上下文。外层没有对应已确认内层时，预览和生成
+都会返回 `409`。
 
-Anthropic adapter 的原始请求使用 `system/messages` 和两个缓存断点；Responses
-adapter 使用 `instructions/input/store=false` 且不发送 Anthropic 缓存字段。
-原始 `request` JSON 可以保留任意 adapter payload，可读视图只使用中性
-`context`，不增加运行时发信提示或其他模型未见的文本。
+成功生成后，草稿区才展示本次 HTTP 调用实际发送的无凭据 JSON body 快照。
+快照来自共享 client 的 request hook，不记录 URL、headers 或认证信息；失败
+调用不返回调试 body。界面不增加运行时发信提示或其他模型未见的文本。
 
 ## 确认、冲突与回退
 
@@ -195,21 +194,30 @@ adapter payload。因此事件、prompt、同层历史、模型或阶段变化�
 调用模型；模型从配置移除后，已有且业务状态仍有效的浏览器草稿仍可确认。
 未绑定 v6 场景可通过界面或 `PUT /api/scenes/{scene_id}/model` 永久绑定一次。
 
-## 双协议与独立 prompt cache
+## Pydantic AI Direct 与独立 prompt cache
 
-Anthropic 的两层分别使用原生 block-level
-`{"type":"ephemeral","ttl":"5m"}` 缓存：
+项目保留自己的协议中性 `ModelBackend`，并通过 Pydantic AI Direct 每次恰好
+发起一次请求。它不使用 `Agent`、工具、自动历史、持久会话、回退、重试或自动
+压缩。
 
-- 当前层 system prompt 后有一个断点；
-- 当前层历史非空时，最后一个已确认 output 后有一个滚动断点；
-- 当前未确认输入不缓存。
+Anthropic 的两层分别使用公开的 5 分钟 block-level 缓存设置：
 
-Responses 使用提供商自动缓存，请求中不发送 Anthropic 的缓存元数据。两种
-协议每次仍发送当前层完整历史，不做截断或摘要，并统一展示缓存写入、缓存
-读取、未缓存输入和输出 token 指标；短上下文指标为 0 属于正常情况。
+- `anthropic_cache_instructions='5m'` 标记当前层 system prompt；
+- `anthropic_cache_messages='5m'` 标记末尾的 current user；
+- 不标记最后一条 assistant，不使用 `CachePoint` 或 1 小时缓存。
 
-后端按 TOML 顺序创建模型 backend，并在部分启动失败或正常退出时逆序关闭已
-创建资源。新增正式协议只需实现 adapter、注册 factory 并通过共享 contract
+current user 即使进入供应商临时缓存，在项目内仍是未确认、只由浏览器持有的
+输入，不会写入场景或改变确认规则。
+
+Responses 使用 `store=false`、禁用 truncation、仅当前轮 reasoning context，
+不回放 reasoning ID，也不发送 conversation、previous response ID 或 Anthropic
+缓存元数据。两种协议每次仍发送当前层完整历史，不做截断或摘要，并统一展示
+缓存写入、缓存读取、未缓存输入和输出 token 指标；短上下文指标为 0 属于正常
+情况。
+
+后端按 TOML 顺序异步创建模型 backend，并在部分启动失败或正常退出时逆序、
+幂等地关闭已创建资源；factory 构造中途失败也会先关闭 HTTP client。新增正式
+协议只需实现 adapter、注册 factory 并通过共享 contract
 tests，不需要修改业务 workflow、API 路由或前端。
 
 ## Scene schema v6

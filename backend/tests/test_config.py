@@ -31,7 +31,7 @@ def test_lifespan_builds_toml_order_and_closes_backends_in_reverse(
     configured = tuple(_settings(model) for model in ("one", "two", "three"))
     events: list[str] = []
 
-    def factory(settings: ModelBackendSettings) -> FakeBackend:
+    async def factory(settings: ModelBackendSettings) -> FakeBackend:
         events.append(f"create:{settings.model}")
         return FakeBackend([], model=settings.model, events=events)
 

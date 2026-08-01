@@ -1,5 +1,6 @@
 """Tests for the protocol-neutral two-layer draft workflow."""
 
+import asyncio
 from copy import deepcopy
 from typing import Any
 
@@ -12,6 +13,10 @@ from app.draft_workflow import (
     draft_state_token,
 )
 from app.models import (
+    AgentId,
+    Layer,
+    LayerDraftResponse,
+    Scene,
     SceneConflictError,
     UpdateSceneRequest,
     add_manual_event,
@@ -28,6 +33,16 @@ from tests.helpers import (
 MODEL = "fake/model-Case"
 
 
+def _generate(
+    workflow: DraftWorkflow,
+    scene: Scene,
+    agent_id: AgentId,
+    layer: Layer,
+) -> LayerDraftResponse:
+    """Run one async workflow generation without an async pytest plugin."""
+    return asyncio.run(workflow.generate(scene, agent_id, layer))
+
+
 def _versioned_workflow(
     output: str,
     version: int,
@@ -42,8 +57,8 @@ def _versioned_workflow(
     )
 
 
-def test_preview_exposes_neutral_context_and_exact_fake_payload() -> None:
-    """Readable preview never interprets backend-specific request fields."""
+def test_preview_exposes_neutral_context_without_backend_call() -> None:
+    """Readable preview builds only neutral context and never calls backend."""
     scene = add_manual_event(
         create_scene("Preview", MODEL),
         "A",
@@ -53,35 +68,31 @@ def test_preview_exposes_neutral_context_and_exact_fake_payload() -> None:
 
     preview = DraftWorkflow(backend).preview(scene, "A", "inner")
 
-    assert len(backend.conversations) == 1
+    assert backend.conversations == []
     assert backend.generate_calls == []
     assert [(item.role, item.text) for item in preview.context] == [
         ("system", scene.agents[0].inner_context.system_prompt),
         ("user", "外部事件：\na private event"),
     ]
-    assert preview.request == {
-        "engine": MODEL,
-        "version": 1,
-        "dialogue": {
-            "rulebook": scene.agents[0].inner_context.system_prompt,
-            "past": [],
-            "next": "外部事件：\na private event",
-        },
-    }
+    assert preview.layer == "inner"
+    assert preview.event_id == scene.agents[0].pending_events[0].id
 
 
-def test_generation_prepares_once_calls_once_and_maps_observer_metadata() -> (
+def test_generation_calls_once_and_maps_snapshot_and_observer_metadata() -> (
     None
 ):
-    """One browser generation is one preparation and one backend call."""
+    """One browser generation maps one backend call and its wire snapshot."""
     scene = add_manual_event(create_scene("Generate", MODEL), "C", "event")
     backend = FakeBackend(["inner answer"], model=MODEL)
 
-    draft = DraftWorkflow(backend).generate(scene, "C", "inner")
+    draft = _generate(DraftWorkflow(backend), scene, "C", "inner")
 
     assert len(backend.conversations) == 1
     assert len(backend.generate_calls) == 1
-    assert backend.generate_calls[0].payload == draft.request_snapshot
+    assert draft.request_snapshot == neutral_payload(
+        backend.generate_calls[0],
+        MODEL,
+    )
     assert draft.content == "inner answer"
     assert [block.model_dump() for block in draft.reasoning] == [
         {"type": "summary_text", "text": "observer-only fake reasoning"}
@@ -98,7 +109,7 @@ def test_confirmation_has_no_backend_dependency_or_model_call() -> None:
     """A valid browser draft confirms after its backend is unavailable."""
     scene = add_manual_event(create_scene("Confirm", MODEL), "A", "event")
     backend = FakeBackend(["inner answer"], model=MODEL)
-    draft = DraftWorkflow(backend).generate(scene, "A", "inner")
+    draft = _generate(DraftWorkflow(backend), scene, "A", "inner")
     calls_before = len(backend.generate_calls)
 
     confirmed = confirm_draft(
@@ -117,8 +128,8 @@ def test_confirmation_has_no_backend_dependency_or_model_call() -> None:
 def test_backend_payload_changes_do_not_change_state_token() -> None:
     """Transport-only adapter changes cannot make a browser draft stale."""
     scene = add_manual_event(create_scene("Stable", MODEL), "B", "event")
-    first = _versioned_workflow("answer", 1).generate(scene, "B", "inner")
-    second = _versioned_workflow("answer", 2).generate(scene, "B", "inner")
+    first = _generate(_versioned_workflow("answer", 1), scene, "B", "inner")
+    second = _generate(_versioned_workflow("answer", 2), scene, "B", "inner")
 
     assert first.request_snapshot != second.request_snapshot
     assert first.state_token == second.state_token
@@ -128,9 +139,12 @@ def test_backend_payload_changes_do_not_change_state_token() -> None:
 def test_event_prompt_history_or_model_changes_make_token_stale() -> None:
     """Every frozen business-context input participates in the state hash."""
     scene = add_manual_event(create_scene("Stale", MODEL), "A", "event one")
-    draft = DraftWorkflow(
-        FakeBackend(["inner one"], model=MODEL),
-    ).generate(scene, "A", "inner")
+    draft = _generate(
+        DraftWorkflow(FakeBackend(["inner one"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
+    )
 
     changed_event = edit_manual_event(
         scene,
@@ -159,9 +173,12 @@ def test_event_prompt_history_or_model_changes_make_token_stale() -> None:
         "inner",
         confirmation(draft),
     )
-    outer_draft = DraftWorkflow(
-        FakeBackend(["To B: first outer"], model=MODEL),
-    ).generate(confirmed_inner, "A", "outer")
+    outer_draft = _generate(
+        DraftWorkflow(FakeBackend(["To B: first outer"], model=MODEL)),
+        confirmed_inner,
+        "A",
+        "outer",
+    )
     completed = confirm_draft(
         confirmed_inner,
         "A",
@@ -177,13 +194,19 @@ def test_event_prompt_history_or_model_changes_make_token_stale() -> None:
 def test_readable_context_contains_complete_alternating_layer_history() -> None:
     """Preview derives every readable item from the neutral conversation."""
     scene = add_manual_event(create_scene("History", MODEL), "A", "first")
-    inner = DraftWorkflow(
-        FakeBackend(["inner one"], model=MODEL),
-    ).generate(scene, "A", "inner")
+    inner = _generate(
+        DraftWorkflow(FakeBackend(["inner one"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
+    )
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
-    outer = DraftWorkflow(
-        FakeBackend(["To B: outer one"], model=MODEL),
-    ).generate(scene, "A", "outer")
+    outer = _generate(
+        DraftWorkflow(FakeBackend(["To B: outer one"], model=MODEL)),
+        scene,
+        "A",
+        "outer",
+    )
     scene = confirm_draft(scene, "A", "outer", confirmation(outer))
     scene = add_manual_event(scene, "A", "second")
 
@@ -207,17 +230,26 @@ def test_readable_context_contains_complete_alternating_layer_history() -> None:
 def test_recipient_rename_invalidates_later_inner_draft() -> None:
     """A recipient display-name change makes the routed-speech draft stale."""
     scene = add_manual_event(create_scene("Rename stale", MODEL), "A", "first")
-    inner = DraftWorkflow(FakeBackend(["inner one"], model=MODEL)).generate(
-        scene, "A", "inner"
+    inner = _generate(
+        DraftWorkflow(FakeBackend(["inner one"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
     )
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
-    outer = DraftWorkflow(
-        FakeBackend(["To B: outer one"], model=MODEL)
-    ).generate(scene, "A", "outer")
+    outer = _generate(
+        DraftWorkflow(FakeBackend(["To B: outer one"], model=MODEL)),
+        scene,
+        "A",
+        "outer",
+    )
     scene = confirm_draft(scene, "A", "outer", confirmation(outer))
     scene = add_manual_event(scene, "A", "second")
-    draft = DraftWorkflow(FakeBackend(["inner two"], model=MODEL)).generate(
-        scene, "A", "inner"
+    draft = _generate(
+        DraftWorkflow(FakeBackend(["inner two"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
     )
     update = UpdateSceneRequest.model_validate(
         {
@@ -255,20 +287,23 @@ def test_generation_errors_are_sanitized_and_never_retried() -> None:
     transport = FakeBackend([RuntimeError("secret provider body")], model=MODEL)
 
     with pytest.raises(DraftGenerationError) as caught:
-        DraftWorkflow(transport).generate(scene, "A", "inner")
+        _generate(DraftWorkflow(transport), scene, "A", "inner")
 
     assert str(caught.value) == "Model request failed."
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     assert len(transport.generate_calls) == 1
     invalid_outer = FakeBackend(["not addressed"], model=MODEL)
-    inner = DraftWorkflow(
-        FakeBackend(["inner"], model=MODEL),
-    ).generate(scene, "A", "inner")
+    inner = _generate(
+        DraftWorkflow(FakeBackend(["inner"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
+    )
     half_round = confirm_draft(scene, "A", "inner", confirmation(inner))
 
     with pytest.raises(DraftGenerationError, match="invalid outer draft"):
-        DraftWorkflow(invalid_outer).generate(half_round, "A", "outer")
+        _generate(DraftWorkflow(invalid_outer), half_round, "A", "outer")
 
     assert len(invalid_outer.generate_calls) == 1
 
@@ -281,7 +316,7 @@ def test_workflow_rejects_backend_for_a_different_scene_model() -> None:
     )
 
     with pytest.raises(SceneConflictError, match="different"):
-        workflow.generate(scene, "A", "inner")
+        _generate(workflow, scene, "A", "inner")
 
 
 def _replace_inner_prompt(scene: Any, prompt: str) -> Any:

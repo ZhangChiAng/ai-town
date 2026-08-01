@@ -1,5 +1,6 @@
 """Product-boundary tests for isolated inner and outer model context."""
 
+import asyncio
 import json
 
 import pytest
@@ -10,6 +11,10 @@ from app.draft_workflow import (
     confirm_draft,
 )
 from app.models import (
+    AgentId,
+    Layer,
+    LayerDraftResponse,
+    Scene,
     SceneConflictError,
     UpdateSceneRequest,
     add_manual_event,
@@ -19,6 +24,16 @@ from app.models import (
 from tests.helpers import FakeBackend, confirmation
 
 MODEL = "fake/protocol-neutral"
+
+
+def _generate(
+    workflow: DraftWorkflow,
+    scene: Scene,
+    agent_id: AgentId,
+    layer: Layer,
+) -> LayerDraftResponse:
+    """Run one async workflow generation without an async pytest plugin."""
+    return asyncio.run(workflow.generate(scene, agent_id, layer))
 
 
 def test_first_inner_and_outer_inputs_are_exact() -> None:
@@ -34,13 +49,13 @@ def test_first_inner_and_outer_inputs_are_exact() -> None:
     )
     workflow = DraftWorkflow(backend)
 
-    inner = workflow.generate(scene, "A", "inner")
+    inner = _generate(workflow, scene, "A", "inner")
     assert backend.conversations[0].current_input == (
         "外部事件：\n门外传来两声敲门。"
     )
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
 
-    outer = workflow.generate(scene, "A", "outer")
+    outer = _generate(workflow, scene, "A", "outer")
     assert backend.conversations[1].current_input == (
         "外部事件：\n门外传来两声敲门。\n\n"
         "你内心有一个声音：\n先别开门。\n问清楚是谁。"
@@ -59,9 +74,9 @@ def test_later_inner_input_names_recipient_and_uses_only_message_body(
         model=MODEL,
     )
     workflow = DraftWorkflow(backend)
-    inner = workflow.generate(scene, "A", "inner")
+    inner = _generate(workflow, scene, "A", "inner")
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
-    outer = workflow.generate(scene, "A", "outer")
+    outer = _generate(workflow, scene, "A", "outer")
     scene = confirm_draft(scene, "A", "outer", confirmation(outer))
     recipient = next(
         agent for agent in scene.agents if agent.id == recipient_id
@@ -90,9 +105,9 @@ def test_later_inner_input_uses_recipient_current_name() -> None:
     workflow = DraftWorkflow(
         FakeBackend(["内层一", "To B: 外层一"], model=MODEL)
     )
-    inner = workflow.generate(scene, "A", "inner")
+    inner = _generate(workflow, scene, "A", "inner")
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
-    outer = workflow.generate(scene, "A", "outer")
+    outer = _generate(workflow, scene, "A", "outer")
     scene = confirm_draft(scene, "A", "outer", confirmation(outer))
     update = UpdateSceneRequest.model_validate(
         {
@@ -150,9 +165,9 @@ def test_two_layers_send_only_their_own_complete_history() -> None:
         ["A inner secret", "To B: A public text"], model=MODEL
     )
     workflow = DraftWorkflow(backend)
-    inner = workflow.generate(scene, "A", "inner")
+    inner = _generate(workflow, scene, "A", "inner")
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
-    outer = workflow.generate(scene, "A", "outer")
+    outer = _generate(workflow, scene, "A", "outer")
     scene = confirm_draft(scene, "A", "outer", confirmation(outer))
     scene = add_manual_event(scene, "A", "A second event")
     scene = add_manual_event(scene, "B", "B private pending event")
@@ -164,9 +179,11 @@ def test_two_layers_send_only_their_own_complete_history() -> None:
     )
 
     assert preview.context[0].text == "INNER A"
-    assert [
-        (turn.input, turn.output) for turn in backend.conversations[-1].turns
-    ] == [("外部事件：\nA first event", "A inner secret")]
+    assert [(item.role, item.text) for item in preview.context[1:3]] == [
+        ("user", "外部事件：\nA first event"),
+        ("assistant", "A inner secret"),
+    ]
+    assert len(backend.generate_calls) == 2
     assert "OUTER A" not in serialized
     assert "INNER B" not in serialized
     assert "B private pending event" not in serialized
@@ -183,48 +200,55 @@ def test_each_layer_keeps_every_confirmed_turn_without_truncation() -> None:
 
     for index in range(4):
         scene = add_manual_event(scene, "A", f"EVENT-{index}")
-        inner = workflow.generate(scene, "A", "inner")
+        inner = _generate(workflow, scene, "A", "inner")
         scene = confirm_draft(scene, "A", "inner", confirmation(inner))
-        outer = workflow.generate(scene, "A", "outer")
+        outer = _generate(workflow, scene, "A", "outer")
         scene = confirm_draft(scene, "A", "outer", confirmation(outer))
 
     scene = add_manual_event(scene, "A", "EVENT-next")
     backend = FakeBackend([], model=MODEL)
-    DraftWorkflow(backend).preview(scene, "A", "inner")
+    preview = DraftWorkflow(backend).preview(scene, "A", "inner")
 
-    assert len(backend.conversations[-1].turns) == 4
-    for index, turn in enumerate(backend.conversations[-1].turns):
-        assert turn.input.endswith(f"EVENT-{index}")
-        assert turn.output == f"INNER-{index}"
+    assert backend.generate_calls == []
+    assert len(preview.context) == 10
+    for index in range(4):
+        user_item = preview.context[1 + index * 2]
+        assistant_item = preview.context[2 + index * 2]
+        assert user_item.role == "user"
+        assert user_item.text.endswith(f"EVENT-{index}")
+        assert assistant_item.role == "assistant"
+        assert assistant_item.text == f"INNER-{index}"
 
 
 def test_reasoning_is_observer_only_and_never_persisted_or_reused() -> None:
     """Temporary reasoning disappears at the confirmation boundary."""
     scene = add_manual_event(create_scene("Reasoning", MODEL), "C", "event")
     backend = FakeBackend(["inner answer"], model=MODEL)
-    draft = DraftWorkflow(backend).generate(scene, "C", "inner")
+    draft = _generate(DraftWorkflow(backend), scene, "C", "inner")
     assert draft.reasoning[0].text == "observer-only fake reasoning"
 
     scene = confirm_draft(scene, "C", "inner", confirmation(draft))
     next_backend = FakeBackend([], model=MODEL)
-    DraftWorkflow(next_backend).preview(scene, "C", "outer")
     serialized_scene = json.dumps(scene.model_dump(mode="json"))
-    serialized_context = repr(next_backend.conversations[-1])
+    serialized_context = repr(
+        DraftWorkflow(next_backend).preview(scene, "C", "outer").context
+    )
 
     assert "observer-only fake reasoning" not in serialized_scene
     assert "observer-only fake reasoning" not in serialized_context
+    assert next_backend.generate_calls == []
 
 
 def test_invalid_outer_generation_fails_after_exactly_one_call() -> None:
     """A malformed visible outer result is rejected without retry."""
     scene = add_manual_event(create_scene("坏外层", MODEL), "A", "event")
     inner_backend = FakeBackend(["inner"], model=MODEL)
-    inner = DraftWorkflow(inner_backend).generate(scene, "A", "inner")
+    inner = _generate(DraftWorkflow(inner_backend), scene, "A", "inner")
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
     invalid_backend = FakeBackend(["not addressed"], model=MODEL)
 
     with pytest.raises(DraftGenerationError, match="invalid outer draft"):
-        DraftWorkflow(invalid_backend).generate(scene, "A", "outer")
+        _generate(DraftWorkflow(invalid_backend), scene, "A", "outer")
 
     assert len(invalid_backend.generate_calls) == 1
 

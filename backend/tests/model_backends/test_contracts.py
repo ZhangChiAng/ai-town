@@ -1,10 +1,11 @@
 """Contract tests using a deliberately provider-unlike fake backend."""
 
+import asyncio
 from dataclasses import dataclass
 
 import pytest
 
-from app.model_backends import (
+from app.model_backends.contracts import (
     BackendFactory,
     ModelBackend,
     ModelBackendSettings,
@@ -13,7 +14,6 @@ from app.model_backends import (
     ModelReasoning,
     ModelTurn,
     ModelUsage,
-    PreparedModelRequest,
 )
 from tests.model_backends.contract import (
     BackendContractCase,
@@ -50,6 +50,7 @@ EXPECTED_GENERATION = ModelGeneration(
         cache_creation_input_tokens=2,
         cache_read_input_tokens=3,
     ),
+    request_snapshot=EXPECTED_PAYLOAD,
 )
 
 
@@ -68,21 +69,26 @@ class FakeBackend:
     def __init__(self, settings: ModelBackendSettings) -> None:
         """Capture only initialization data needed after client creation."""
         self._model = settings.model
-        self.upstream_requests: list[PreparedModelRequest] = []
+        self.conversations: list[ModelConversation] = []
         self.close_calls = 0
+        self._closed = False
 
     @property
     def model(self) -> str:
         """Return the configured model name exactly."""
         return self._model
 
-    def prepare(
+    async def generate(
         self,
         conversation: ModelConversation,
-    ) -> PreparedModelRequest:
-        """Map neutral conversation fields to an unrelated fake envelope."""
-        return PreparedModelRequest(
-            payload={
+    ) -> ModelGeneration:
+        """Represent one and only one upstream interaction."""
+        self.conversations.append(conversation)
+        return ModelGeneration(
+            content=EXPECTED_GENERATION.content,
+            reasoning=EXPECTED_GENERATION.reasoning,
+            usage=EXPECTED_GENERATION.usage,
+            request_snapshot={
                 "engine": self.model,
                 "envelope": {
                     "rules": conversation.system_prompt,
@@ -91,24 +97,19 @@ class FakeBackend:
                     ],
                     "next": conversation.current_input,
                 },
-            }
+            },
         )
 
-    def generate(
-        self,
-        prepared: PreparedModelRequest,
-    ) -> ModelGeneration:
-        """Represent one and only one upstream interaction."""
-        self.upstream_requests.append(prepared)
-        return EXPECTED_GENERATION
-
-    def close(self) -> None:
+    async def aclose(self) -> None:
         """Record one resource-release request."""
+        if self._closed:
+            return
+        self._closed = True
         self.close_calls += 1
 
 
-def fake_backend_factory(settings: ModelBackendSettings) -> ModelBackend:
-    """Create one fake backend through the frozen factory signature."""
+async def fake_backend_factory(settings: ModelBackendSettings) -> ModelBackend:
+    """Create one fake backend through the frozen async factory signature."""
     return FakeBackend(settings)
 
 
@@ -125,11 +126,10 @@ def build_contract_case() -> BackendContractCase:
         backend=backend,
         expected_model=MODEL,
         conversation=CONVERSATION,
-        expected_payload=EXPECTED_PAYLOAD,
         expected_generation=EXPECTED_GENERATION,
-        upstream_call_count=lambda: len(backend.upstream_requests),
+        upstream_call_count=lambda: len(backend.conversations),
         close_call_count=lambda: backend.close_calls,
-        forbidden_payload_values=(SECRET,),
+        forbidden_snapshot_values=(SECRET,),
     )
 
 
@@ -142,32 +142,47 @@ class TestFakeBackendContract(BackendContractTests):
 def test_factory_and_backend_protocols_are_structurally_satisfied() -> None:
     """Plain callables and classes can implement the frozen ports."""
     factory: BackendFactory = fake_backend_factory
-    backend = factory(
-        FakeSettings(
-            model=MODEL,
-            base_url="https://fake.example/api",
-            api_key=SECRET,
-        )
+    settings = FakeSettings(
+        model=MODEL,
+        base_url="https://fake.example/api",
+        api_key=SECRET,
     )
 
-    assert isinstance(backend, ModelBackend)
+    async def create_and_close() -> None:
+        backend = await factory(settings)
+        try:
+            assert isinstance(backend, ModelBackend)
+        finally:
+            await backend.aclose()
+
+    asyncio.run(create_and_close())
     assert isinstance(
-        FakeSettings(MODEL, "https://fake.example/api", SECRET),
+        settings,
         ModelBackendSettings,
     )
 
 
 @pytest.mark.parametrize(
-    "payload",
+    "snapshot",
     [
         {"bad": float("nan")},
         {"bad": ("tuple",)},
         {1: "non-string key"},
     ],
 )
-def test_prepared_request_rejects_non_json_safe_values(
-    payload: object,
+def test_generation_rejects_non_json_safe_snapshot(
+    snapshot: object,
 ) -> None:
-    """The request wrapper rejects values JSON would coerce or distort."""
+    """Generation snapshots reject values JSON would coerce or distort."""
     with pytest.raises(ValueError, match="payload"):
-        PreparedModelRequest(payload=payload)  # type: ignore[arg-type]
+        ModelGeneration(
+            content="visible",
+            reasoning=(),
+            usage=ModelUsage(
+                input_tokens=0,
+                output_tokens=0,
+                cache_creation_input_tokens=0,
+                cache_read_input_tokens=0,
+            ),
+            request_snapshot=snapshot,  # type: ignore[arg-type]
+        )

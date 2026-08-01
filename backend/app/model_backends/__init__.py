@@ -1,7 +1,6 @@
 """Protocol-neutral model backend ports and concrete adapters."""
 
 from app.model_backends.anthropic_messages import (
-    AnthropicMessagesBackend,
     create_anthropic_messages_backend,
 )
 from app.model_backends.contracts import (
@@ -15,12 +14,14 @@ from app.model_backends.contracts import (
     ModelReasoning,
     ModelTurn,
     ModelUsage,
-    PreparedModelRequest,
     ReasoningType,
 )
 from app.model_backends.openai_responses import (
-    OpenAIResponsesBackend,
     create_openai_responses_backend,
+)
+from app.model_backends.pydantic_ai_backend import (
+    PydanticAIBackend,
+    create_request_capture_client,
 )
 from app.model_backends.registry import (
     BackendRegistryError,
@@ -31,7 +32,6 @@ from app.model_backends.registry import (
 __all__ = [
     "BackendFactory",
     "BackendRegistryError",
-    "AnthropicMessagesBackend",
     "JsonObject",
     "JsonValue",
     "ModelBackend",
@@ -42,10 +42,10 @@ __all__ = [
     "ModelReasoning",
     "ModelTurn",
     "ModelUsage",
-    "OpenAIResponsesBackend",
-    "PreparedModelRequest",
+    "PydanticAIBackend",
     "ReasoningType",
     "create_anthropic_messages_backend",
     "create_model_backend_registry",
     "create_openai_responses_backend",
+    "create_request_capture_client",
 ]

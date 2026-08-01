@@ -1065,8 +1065,7 @@ pre {
   padding-top: 14px;
 }
 
-.layer-switch,
-.preview-mode-switch {
+.layer-switch {
   display: grid;
   grid-template-columns: 1fr 1fr;
   padding: 3px;
@@ -1074,8 +1073,7 @@ pre {
   background: #e9eeea;
 }
 
-.layer-switch button,
-.preview-mode-switch button {
+.layer-switch button {
   min-height: 30px;
   color: var(--muted);
   border: 0;
@@ -1085,8 +1083,7 @@ pre {
   font-weight: 750;
 }
 
-.layer-switch button.active,
-.preview-mode-switch button.active {
+.layer-switch button.active {
   color: var(--deep);
   background: white;
   box-shadow: 0 2px 6px rgb(28 49 43 / 10%);
@@ -1098,13 +1095,6 @@ pre {
   border: 1px solid #d8ded9;
   border-radius: 8px;
   background: #f6f8f5;
-}
-
-.request-preview > pre {
-  padding: 11px;
-  font-family: ui-monospace, monospace;
-  font-size: 9px;
-  line-height: 1.5;
 }
 
 .readable-context {

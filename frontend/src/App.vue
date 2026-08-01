@@ -37,7 +37,6 @@ import {
 } from "./types";
 
 type ListState = "loading" | "ready" | "error";
-type PreviewMode = "readable" | "json";
 const LAYERS: Layer[] = ["inner", "outer"];
 
 interface TimelineItem {
@@ -88,7 +87,6 @@ const isCreating = ref(false);
 const busyAction = ref<string | null>(null);
 
 const previewLayer = ref<Layer>("inner");
-const previewMode = ref<PreviewMode>("readable");
 const previews = ref<
   Record<string, ModelRequestPreviewResponse | undefined>
 >({});
@@ -735,7 +733,6 @@ watch(
   activeAgentId,
   () => {
     previewLayer.value = activeStage.value;
-    previewMode.value = "readable";
     previewError.value = "";
     eventError.value = "";
   },
@@ -1324,7 +1321,7 @@ onBeforeUnmount(() => {
                 <summary>
                   <span>
                     <strong>模型请求预览</strong>
-                    <small>完整上下文与原始 JSON 来自同一快照</small>
+                    <small>调用前的协议无关完整上下文</small>
                   </span>
                 </summary>
                 <div class="preview-body">
@@ -1365,27 +1362,8 @@ onBeforeUnmount(() => {
                   </p>
 
                   <template v-if="selectedPreview">
-                    <div class="preview-mode-switch">
-                      <button
-                        type="button"
-                        :class="{ active: previewMode === 'readable' }"
-                        @click="previewMode = 'readable'"
-                      >
-                        可读上下文
-                      </button>
-                      <button
-                        type="button"
-                        :class="{ active: previewMode === 'json' }"
-                        @click="previewMode = 'json'"
-                      >
-                        原始 JSON
-                      </button>
-                    </div>
                     <div class="request-preview">
-                      <div
-                        v-if="previewMode === 'readable'"
-                        class="readable-context"
-                      >
+                      <div class="readable-context">
                         <article
                           v-for="(block, index) in selectedPreview.context"
                           :key="`${block.role}:${index}`"
@@ -1394,9 +1372,6 @@ onBeforeUnmount(() => {
                           <pre>{{ block.text }}</pre>
                         </article>
                       </div>
-                      <pre v-else>{{
-                        prettyJson(selectedPreview.request)
-                      }}</pre>
                     </div>
                   </template>
                 </div>

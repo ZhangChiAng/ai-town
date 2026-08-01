@@ -80,7 +80,7 @@ def create_app(
             return
 
         settings = load_model_settings()
-        registry = create_model_backend_registry(
+        registry = await create_model_backend_registry(
             settings,
             BACKEND_FACTORIES,
         )
@@ -88,7 +88,7 @@ def create_app(
             install_model_backends(application, registry)
             yield
         finally:
-            registry.close()
+            await registry.aclose()
 
     application = FastAPI(title="AI Town API", lifespan=lifespan)
     application.state.scene_storage = scene_storage or SceneStorage(
@@ -325,7 +325,7 @@ def create_app(
         request: Request,
     ) -> LayerDraftResponse:
         scene = storage(request).get(scene_id)
-        return drafts_for_scene(scene, request).generate(
+        return await drafts_for_scene(scene, request).generate(
             scene,
             agent_id,
             "inner",
@@ -338,7 +338,7 @@ def create_app(
         request: Request,
     ) -> LayerDraftResponse:
         scene = storage(request).get(scene_id)
-        return drafts_for_scene(scene, request).generate(
+        return await drafts_for_scene(scene, request).generate(
             scene,
             agent_id,
             "outer",
@@ -404,7 +404,6 @@ def create_app(
                 ModelRequestContextItem(role=item.role, text=item.text)
                 for item in preview.context
             ],
-            request=preview.request,
         )
 
     @application.post("/api/scenes/{scene_id}/rollback")

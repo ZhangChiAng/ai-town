@@ -1,14 +1,16 @@
-"""Tests for the protocol-specific OpenAI Responses backend."""
+"""Captured-wire tests for the OpenAI Responses Pydantic AI adapter."""
 
+import asyncio
+import json
 from copy import deepcopy
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from app.model_backends import (
-    BackendFactory,
+    JsonObject,
     ModelBackend,
     ModelConversation,
     ModelGeneration,
@@ -16,8 +18,8 @@ from app.model_backends import (
     ModelTurn,
     ModelUsage,
 )
+from app.model_backends import openai_responses as adapter_module
 from app.model_backends.openai_responses import (
-    OpenAIResponsesBackend,
     create_openai_responses_backend,
 )
 from tests.model_backends.contract import (
@@ -25,104 +27,100 @@ from tests.model_backends.contract import (
     BackendContractTests,
 )
 
-MODEL = "vendor/GPT-Case-Sensitive"
-BASE_URL = "https://responses.example/v1"
-SECRET = "responses-secret-never-preview"
+MODEL = "gpt-5.4"
+BASE_URL = "https://openai.example/v1"
+API_KEY = "openai-secret-never-preview"
+SYSTEM_PROMPT = "SYSTEM exact\nsecond line"
 CONVERSATION = ModelConversation(
-    system_prompt="SYSTEM exact\nsecond line",
+    system_prompt=SYSTEM_PROMPT,
     turns=(
         ModelTurn(input="first user", output="first assistant"),
         ModelTurn(input="second user", output="second assistant"),
     ),
     current_input="current user\nexact",
 )
-EXPECTED_PAYLOAD = {
-    "model": MODEL,
-    "instructions": "SYSTEM exact\nsecond line",
+EXPECTED_PAYLOAD: JsonObject = {
+    "include": ["reasoning.encrypted_content"],
     "input": [
-        {
-            "role": "user",
-            "content": [{"type": "input_text", "text": "first user"}],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "input_text", "text": "first assistant"}],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "input_text", "text": "second user"}],
-        },
-        {
-            "role": "assistant",
-            "content": [{"type": "input_text", "text": "second assistant"}],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "input_text", "text": "current user\nexact"}],
-        },
+        {"role": "user", "content": "first user"},
+        {"role": "assistant", "content": "first assistant"},
+        {"role": "user", "content": "second user"},
+        {"role": "assistant", "content": "second assistant"},
+        {"role": "user", "content": "current user\nexact"},
     ],
+    "instructions": SYSTEM_PROMPT,
     "max_output_tokens": 2048,
+    "model": MODEL,
+    "reasoning": {"context": "current_turn"},
     "store": False,
+    "stream": False,
+    "truncation": "disabled",
 }
-EXPECTED_GENERATION = ModelGeneration(
-    content="visible answer",
-    reasoning=(
-        ModelReasoning(type="summary_text", text="short summary"),
-        ModelReasoning(type="reasoning_text", text="readable reasoning"),
-    ),
-    usage=ModelUsage(
-        input_tokens=12,
-        output_tokens=7,
-        cache_creation_input_tokens=3,
-        cache_read_input_tokens=5,
-    ),
-)
 
 
 @dataclass(frozen=True, slots=True)
 class FakeSettings:
-    """Resolved settings passed to the adapter factory."""
+    """Resolved settings for one isolated adapter test."""
 
     model: str = MODEL
     base_url: str = BASE_URL
-    api_key: str = SECRET
+    api_key: str = API_KEY
 
 
-class FakeResponsesResource:
-    """Capture calls and return one configured provider result."""
+class RecordingTransport(httpx.MockTransport):
+    """Record decoded request bodies and lifecycle calls."""
 
-    def __init__(self, response: Any) -> None:
-        """Store the response or exception returned by create."""
-        self.response = response
-        self.requests: list[dict[str, Any]] = []
-
-    def create(self, **kwargs: Any) -> Any:
-        """Record exactly one request before returning its result."""
-        self.requests.append(deepcopy(kwargs))
-        if isinstance(self.response, Exception):
-            raise self.response
-        return self.response
-
-
-class FakeClient:
-    """Minimal OpenAI client double with lifecycle counters."""
-
-    def __init__(self, response: Any) -> None:
-        """Expose the fake Responses resource."""
-        self.responses = FakeResponsesResource(response)
+    def __init__(
+        self,
+        response_body: JsonObject,
+        *,
+        status_code: int = 200,
+    ) -> None:
+        """Configure one repeatable JSON response."""
+        self.response_body = response_body
+        self.status_code = status_code
+        self.requests: list[httpx.Request] = []
+        self.request_bodies: list[JsonObject] = []
         self.close_calls = 0
+        super().__init__(self._handle_request)
 
-    def close(self) -> None:
-        """Record one close operation."""
+    async def _handle_request(
+        self,
+        request: httpx.Request,
+    ) -> httpx.Response:
+        """Record the completed wire body and return configured JSON."""
+        value = json.loads(await request.aread())
+        assert type(value) is dict
+        self.requests.append(request)
+        self.request_bodies.append(value)
+        return httpx.Response(
+            self.status_code,
+            json=deepcopy(self.response_body),
+        )
+
+    async def aclose(self) -> None:
+        """Record closure of the shared HTTP transport."""
         self.close_calls += 1
+        await super().aclose()
 
 
-def valid_response() -> dict[str, Any]:
-    """Return a strict completed response with reasoning and usage."""
+def _successful_response() -> JsonObject:
+    """Return a realistic OpenAI Responses SDK response body."""
     return {
+        "id": "resp_123",
+        "object": "response",
+        "created_at": 1_750_000_000.0,
         "status": "completed",
+        "background": False,
+        "error": None,
+        "incomplete_details": None,
+        "instructions": None,
+        "max_output_tokens": 2048,
+        "max_tool_calls": None,
+        "model": MODEL,
         "output": [
             {
+                "id": "rs_123",
                 "type": "reasoning",
                 "summary": [{"type": "summary_text", "text": "short summary"}],
                 "content": [
@@ -131,317 +129,331 @@ def valid_response() -> dict[str, Any]:
                         "text": "readable reasoning",
                     }
                 ],
+                "encrypted_content": "private-encrypted-reasoning",
+                "status": None,
             },
             {
+                "id": "msg_123",
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "visible answer"}],
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "visible answer",
+                        "annotations": [],
+                        "logprobs": [],
+                    }
+                ],
             },
         ],
+        "parallel_tool_calls": True,
+        "previous_response_id": None,
+        "prompt_cache_key": None,
+        "reasoning": {"effort": "medium", "summary": "auto"},
+        "safety_identifier": None,
+        "service_tier": "default",
+        "store": False,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_logprobs": 0,
+        "top_p": 1.0,
+        "truncation": "disabled",
         "usage": {
             "input_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 5},
             "output_tokens": 7,
+            "output_tokens_details": {"reasoning_tokens": 2},
             "total_tokens": 27,
-            "input_tokens_details": {
-                "cache_write_tokens": 3,
-                "cached_tokens": 5,
-            },
         },
+        "user": None,
+        "metadata": {},
     }
 
 
-def build_contract_case() -> BackendContractCase:
-    """Create one isolated Responses backend for the shared contract suite."""
-    client = FakeClient(valid_response())
-    backend = OpenAIResponsesBackend(MODEL, client)
+async def _make_backend(
+    transport: RecordingTransport,
+) -> ModelBackend:
+    """Create the public adapter with an isolated mock network."""
+    return await create_openai_responses_backend(
+        FakeSettings(),
+        transport=transport,
+    )
+
+
+def _expected_generation() -> ModelGeneration:
+    """Return the projected result for the successful wire fixture."""
+    return ModelGeneration(
+        content="visible answer",
+        reasoning=(
+            ModelReasoning(type="summary_text", text="short summary"),
+            ModelReasoning(
+                type="reasoning_text",
+                text="readable reasoning",
+            ),
+        ),
+        usage=ModelUsage(
+            input_tokens=15,
+            output_tokens=7,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=5,
+        ),
+        request_snapshot=deepcopy(EXPECTED_PAYLOAD),
+    )
+
+
+def _contract_case() -> BackendContractCase:
+    """Build a fresh real-SDK OpenAI contract fixture."""
+    transport = RecordingTransport(_successful_response())
     return BackendContractCase(
-        backend=backend,
+        backend=asyncio.run(_make_backend(transport)),
         expected_model=MODEL,
         conversation=CONVERSATION,
-        expected_payload=EXPECTED_PAYLOAD,
-        expected_generation=EXPECTED_GENERATION,
-        upstream_call_count=lambda: len(client.responses.requests),
-        close_call_count=lambda: client.close_calls,
-        forbidden_payload_values=(SECRET, BASE_URL),
+        expected_generation=_expected_generation(),
+        upstream_call_count=lambda: len(transport.request_bodies),
+        close_call_count=lambda: transport.close_calls,
+        forbidden_snapshot_values=(
+            API_KEY,
+            BASE_URL,
+            "private-encrypted-reasoning",
+        ),
     )
 
 
 class TestOpenAIResponsesBackendContract(BackendContractTests):
-    """Apply the reusable backend contract to OpenAI Responses."""
+    """Apply the neutral async backend contract to OpenAI Responses."""
 
-    contract_case_factory = staticmethod(build_contract_case)
-
-
-def generate_response(response: Any) -> ModelGeneration:
-    """Generate once using a standard prepared request and fake client."""
-    backend = OpenAIResponsesBackend(MODEL, FakeClient(response))
-    return backend.generate(backend.prepare(CONVERSATION))
+    contract_case_factory = staticmethod(_contract_case)
 
 
-def test_prepare_preserves_full_history_without_anthropic_fields() -> None:
-    """Preparation maps every turn verbatim into the Responses wire shape."""
-    backend = OpenAIResponsesBackend(MODEL, FakeClient(valid_response()))
+def test_backend_structurally_satisfies_frozen_port() -> None:
+    """The assembled Direct backend implements the neutral port."""
+    transport = RecordingTransport(_successful_response())
 
-    payload = backend.prepare(CONVERSATION).payload
+    async def create_and_close() -> None:
+        backend = await _make_backend(transport)
+        try:
+            assert isinstance(backend, ModelBackend)
+        finally:
+            await backend.aclose()
 
-    assert payload == EXPECTED_PAYLOAD
-    assert {"messages", "system", "cache_control"}.isdisjoint(payload)
-    assert all(
-        block["type"] == "input_text"
-        for message in payload["input"]
-        for block in message["content"]
-    )
+    asyncio.run(create_and_close())
 
 
-def test_factory_uses_exact_bounded_client_parameters() -> None:
-    """The factory initializes one client without retries or hidden defaults."""
-    received: list[dict[str, Any]] = []
-    client = FakeClient(valid_response())
+def test_wire_preserves_full_history_and_stateless_boundaries() -> None:
+    """The actual body is complete, stateless, and OpenAI-specific."""
+    transport = RecordingTransport(_successful_response())
 
-    def client_factory(**kwargs: Any) -> FakeClient:
-        received.append(kwargs)
-        return client
+    async def generate_and_close() -> ModelGeneration:
+        backend = await _make_backend(transport)
+        try:
+            return await backend.generate(CONVERSATION)
+        finally:
+            await backend.aclose()
 
-    factory: BackendFactory = create_openai_responses_backend
-    backend = create_openai_responses_backend(
-        FakeSettings(),
-        client_factory=client_factory,
-    )
+    generation = asyncio.run(generate_and_close())
 
-    assert factory is create_openai_responses_backend
-    assert isinstance(backend, ModelBackend)
-    assert backend.model == MODEL
-    assert received == [
-        {
-            "api_key": SECRET,
-            "base_url": BASE_URL,
-            "timeout": 60.0,
-            "max_retries": 0,
-        }
+    assert transport.request_bodies == [EXPECTED_PAYLOAD]
+    assert generation.request_snapshot == transport.request_bodies[0]
+    body = transport.request_bodies[0]
+    assert body["input"] == [
+        {"role": "user", "content": "first user"},
+        {"role": "assistant", "content": "first assistant"},
+        {"role": "user", "content": "second user"},
+        {"role": "assistant", "content": "second assistant"},
+        {"role": "user", "content": "current user\nexact"},
     ]
-    assert client.responses.requests == []
-
-
-def test_upstream_error_is_sanitized_without_retry() -> None:
-    """Provider failures escape once through a credential-free error."""
-    client = FakeClient(RuntimeError(f"body contains {SECRET}"))
-    backend = OpenAIResponsesBackend(MODEL, client)
-
-    with pytest.raises(RuntimeError) as raised:
-        backend.generate(backend.prepare(CONVERSATION))
-
-    assert str(raised.value) == "OpenAI Responses request failed"
-    assert SECRET not in str(raised.value)
-    assert raised.value.__cause__ is None
-    assert raised.value.__context__ is None
-    assert len(client.responses.requests) == 1
-
-
-def test_client_creation_error_is_sanitized() -> None:
-    """Factory failures cannot expose the secret passed during setup."""
-
-    def failing_client_factory(**_kwargs: Any) -> FakeClient:
-        raise RuntimeError(f"initialization included {SECRET}")
-
-    with pytest.raises(RuntimeError) as raised:
-        create_openai_responses_backend(
-            FakeSettings(),
-            client_factory=failing_client_factory,
-        )
-
-    assert str(raised.value) == "OpenAI Responses client creation failed"
-    assert SECRET not in str(raised.value)
-    assert raised.value.__cause__ is None
-    assert raised.value.__context__ is None
-
-
-def test_reasoning_exposes_only_non_blank_readable_blocks() -> None:
-    """Empty readable fields are omitted while provider text is preserved."""
-    response = valid_response()
-    response["output"][0]["summary"].append(
-        {"type": "summary_text", "text": " \n"}
+    assert all(
+        "id" not in item and item.get("type") != "reasoning"
+        for item in body["input"]
     )
-    response["output"][0]["content"].append(
-        {"type": "reasoning_text", "text": "second thought"}
+    assert set(body).isdisjoint(
+        {
+            "anthropic_cache",
+            "cache_control",
+            "context_management",
+            "conversation",
+            "messages",
+            "previous_response_id",
+            "system",
+            "tools",
+        }
     )
+    assert body["include"] == ["reasoning.encrypted_content"]
+    assert transport.requests[0].extensions["timeout"] == {
+        "connect": 60.0,
+        "read": 60.0,
+        "write": 60.0,
+        "pool": 60.0,
+    }
 
-    generation = generate_response(response)
+
+def test_response_exposes_only_public_readable_reasoning() -> None:
+    """Summary and documented raw text survive; encryption does not."""
+    transport = RecordingTransport(_successful_response())
+
+    async def generate_and_close() -> ModelGeneration:
+        backend = await _make_backend(transport)
+        try:
+            return await backend.generate(CONVERSATION)
+        finally:
+            await backend.aclose()
+
+    generation = asyncio.run(generate_and_close())
 
     assert generation.reasoning == (
         ModelReasoning(type="summary_text", text="short summary"),
         ModelReasoning(type="reasoning_text", text="readable reasoning"),
-        ModelReasoning(type="reasoning_text", text="second thought"),
     )
+    assert "private-encrypted-reasoning" not in repr(generation)
 
 
-@pytest.mark.parametrize(
-    ("section", "block"),
-    [
-        ("summary", {"type": "reasoning_text", "text": "wrong list"}),
-        ("content", {"type": "summary_text", "text": "wrong list"}),
-        ("content", {"type": "tool_result", "text": "unknown"}),
-    ],
-)
-def test_unknown_or_misplaced_reasoning_blocks_are_rejected(
-    section: str,
-    block: dict[str, str],
-) -> None:
-    """Reasoning permits only each provider-defined readable block type."""
-    response = valid_response()
-    response["output"][0][section].append(block)
-
-    with pytest.raises(ValueError, match="reasoning block"):
-        generate_response(response)
-
-
-def test_encrypted_reasoning_is_ignored_without_exposure() -> None:
-    """Encrypted provider state is ignored while visible output stays valid."""
-    response = valid_response()
-    response["output"][0]["encrypted_content"] = "private-ciphertext"
-
-    generation = generate_response(response)
-
-    assert generation == EXPECTED_GENERATION
-    assert "private-ciphertext" not in repr(generation)
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda response: response.update(status="failed"),
-        lambda response: response["output"].append(
-            {"type": "tool_call", "name": "unknown"}
-        ),
-        lambda response: response["output"].append(
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "duplicate"}],
+def test_upstream_error_is_sanitized_and_not_retried() -> None:
+    """One failed SDK call exposes no provider body or credential."""
+    transport = RecordingTransport(
+        {
+            "error": {
+                "type": "server_error",
+                "message": f"{API_KEY} at {BASE_URL}",
             }
-        ),
-        lambda response: response["output"][1].update(role="user"),
-        lambda response: response["output"][1]["content"].append(
-            {"type": "output_text", "text": "duplicate"}
-        ),
-        lambda response: response["output"][1]["content"][0].update(
-            type="refusal"
-        ),
-        lambda response: response["output"][1]["content"][0].update(text="  "),
-    ],
-    ids=(
-        "incomplete",
-        "unknown-item",
-        "duplicate-message",
-        "non-assistant",
-        "duplicate-output-text",
-        "unknown-content-block",
-        "blank-output",
-    ),
-)
-def test_invalid_completed_response_shapes_raise_value_error(
-    mutate: Any,
+        },
+        status_code=500,
+    )
+
+    async def generate_and_close() -> None:
+        backend = await _make_backend(transport)
+        try:
+            await backend.generate(CONVERSATION)
+        finally:
+            await backend.aclose()
+
+    with pytest.raises(
+        RuntimeError,
+        match="^Pydantic AI model request failed$",
+    ) as exc_info:
+        asyncio.run(generate_and_close())
+
+    assert len(transport.request_bodies) == 1
+    assert API_KEY not in str(exc_info.value)
+    assert BASE_URL not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+
+
+def test_factory_error_before_client_is_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Malformed provider results fail locally instead of being normalized."""
-    response = valid_response()
-    mutate(response)
+    """A capture-client construction error has no sensitive context."""
 
-    with pytest.raises(ValueError):
-        generate_response(response)
+    def fail_creation(**_: Any) -> Any:
+        raise ValueError(f"leaked {API_KEY} at {BASE_URL}")
 
+    monkeypatch.setattr(
+        adapter_module,
+        "create_request_capture_client",
+        fail_creation,
+    )
 
-def test_usage_accepts_matching_compatible_locations() -> None:
-    """Equal cache counts may appear in details and compatibility fields."""
-    response = valid_response()
-    response["usage"].update(cache_write_tokens=3, cached_tokens=5)
+    with pytest.raises(
+        RuntimeError,
+        match="^OpenAI Responses client creation failed$",
+    ) as exc_info:
+        asyncio.run(create_openai_responses_backend(FakeSettings()))
 
-    generation = generate_response(response)
-
-    assert generation.usage == EXPECTED_GENERATION.usage
-
-
-def test_usage_accepts_top_level_compatibility_fields_without_details() -> None:
-    """Compatibility endpoints may place cache counts on usage itself."""
-    response = valid_response()
-    response["usage"].pop("input_tokens_details")
-    response["usage"].update(cache_write_tokens=3, cached_tokens=5)
-
-    generation = generate_response(response)
-
-    assert generation.usage == EXPECTED_GENERATION.usage
-
-
-def test_usage_accepts_missing_optional_total_tokens() -> None:
-    """Compatibility endpoints may omit the otherwise validated total."""
-    response = valid_response()
-    response["usage"].pop("total_tokens")
-
-    generation = generate_response(response)
-
-    assert generation.usage == EXPECTED_GENERATION.usage
+    assert API_KEY not in str(exc_info.value)
+    assert BASE_URL not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
 
 @pytest.mark.parametrize(
-    "mutate",
+    "failing_symbol",
     [
-        lambda usage: usage.update(cache_write_tokens=4),
-        lambda usage: usage.update(total_tokens=28),
-        lambda usage: usage.update(input_tokens=True),
-        lambda usage: usage.update(output_tokens=-1, total_tokens=19),
-        lambda usage: usage["input_tokens_details"].update(cached_tokens=21),
-        lambda usage: usage.update(input_tokens_details=None),
-        lambda usage: usage.update(input_tokens_details="invalid"),
+        "AsyncOpenAI",
+        "OpenAIProvider",
+        "OpenAIResponsesModel",
+        "PydanticAIBackend",
     ],
-    ids=(
-        "conflicting-location",
-        "inconsistent-total",
-        "bool-count",
-        "negative-count",
-        "cache-over-total",
-        "null-details",
-        "invalid-details",
-    ),
 )
-def test_invalid_usage_is_rejected(mutate: Any) -> None:
-    """Usage counts must be exact, non-negative, and internally consistent."""
-    response = valid_response()
-    mutate(response["usage"])
-
-    with pytest.raises(ValueError):
-        generate_response(response)
-
-
-@pytest.mark.parametrize("top_level_fallback", [None, 3])
-def test_nullable_optional_cache_count_uses_zero_or_other_location(
-    top_level_fallback: int | None,
+def test_factory_failure_closes_captured_client_once(
+    monkeypatch: pytest.MonkeyPatch,
+    failing_symbol: str,
 ) -> None:
-    """A null optional detail is absent and may fall back to usage itself."""
-    response = valid_response()
-    response["usage"]["input_tokens_details"]["cache_write_tokens"] = None
-    if top_level_fallback is not None:
-        response["usage"]["cache_write_tokens"] = top_level_fallback
+    """Every failure after HTTP client creation closes it before raising."""
 
-    generation = generate_response(response)
+    def fail_creation(*_args: Any, **_kwargs: Any) -> Any:
+        raise ValueError(f"leaked {API_KEY} at {BASE_URL}")
 
-    assert generation.usage == ModelUsage(
-        input_tokens=15 - (top_level_fallback or 0),
-        output_tokens=7,
-        cache_creation_input_tokens=top_level_fallback or 0,
-        cache_read_input_tokens=5,
-    )
+    monkeypatch.setattr(adapter_module, failing_symbol, fail_creation)
+    transport = RecordingTransport(_successful_response())
 
-
-def test_sdk_style_object_response_is_supported() -> None:
-    """Parsing reads SDK model attributes as well as test-friendly mappings."""
-
-    def to_object(value: Any) -> Any:
-        if isinstance(value, dict):
-            return SimpleNamespace(
-                **{key: to_object(item) for key, item in value.items()}
+    with pytest.raises(
+        RuntimeError,
+        match="^OpenAI Responses client creation failed$",
+    ) as exc_info:
+        asyncio.run(
+            create_openai_responses_backend(
+                FakeSettings(),
+                transport=transport,
             )
-        if isinstance(value, list):
-            return [to_object(item) for item in value]
-        return value
+        )
 
-    generation = generate_response(to_object(valid_response()))
+    assert transport.close_calls == 1
+    assert API_KEY not in str(exc_info.value)
+    assert BASE_URL not in str(exc_info.value)
+    assert exc_info.value.__cause__ is None
+    assert exc_info.value.__context__ is None
 
-    assert generation == EXPECTED_GENERATION
+
+def test_factory_cancellation_closes_client_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construction cancellation is cleaned up but never sanitized away."""
+
+    def cancel_creation(**_: Any) -> Any:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(adapter_module, "AsyncOpenAI", cancel_creation)
+    transport = RecordingTransport(_successful_response())
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            create_openai_responses_backend(
+                FakeSettings(),
+                transport=transport,
+            )
+        )
+
+    assert transport.close_calls == 1
+
+
+def test_factory_passes_bounded_official_sdk_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The thin adapter disables SDK retries and uses the shared client."""
+    real_constructor = adapter_module.AsyncOpenAI
+    constructor_kwargs: dict[str, Any] = {}
+
+    def capture_constructor(**kwargs: Any) -> Any:
+        constructor_kwargs.update(kwargs)
+        return real_constructor(**kwargs)
+
+    monkeypatch.setattr(adapter_module, "AsyncOpenAI", capture_constructor)
+    transport = RecordingTransport(_successful_response())
+
+    async def create_assert_and_close() -> None:
+        backend = await _make_backend(transport)
+        try:
+            assert constructor_kwargs["api_key"] == API_KEY
+            assert constructor_kwargs["base_url"] == BASE_URL
+            assert constructor_kwargs["timeout"] == 60.0
+            assert constructor_kwargs["max_retries"] == 0
+            assert isinstance(
+                constructor_kwargs["http_client"],
+                httpx.AsyncClient,
+            )
+        finally:
+            await backend.aclose()
+
+    asyncio.run(create_assert_and_close())

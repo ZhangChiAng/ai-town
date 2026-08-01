@@ -2,6 +2,7 @@
 
 import ast
 import re
+import tomllib
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -13,6 +14,7 @@ FRONTEND_ROOT = REPOSITORY_ROOT / "frontend" / "src"
 
 ANTHROPIC_ADAPTER = MODEL_BACKENDS_ROOT / "anthropic_messages.py"
 RESPONSES_ADAPTER = MODEL_BACKENDS_ROOT / "openai_responses.py"
+PYDANTIC_AI_BACKEND = MODEL_BACKENDS_ROOT / "pydantic_ai_backend.py"
 ADAPTER_PATHS = (ANTHROPIC_ADAPTER, RESPONSES_ADAPTER)
 SDK_OWNERS = {
     "anthropic": ANTHROPIC_ADAPTER,
@@ -80,6 +82,23 @@ def _condition_expressions(tree: ast.AST) -> Iterable[ast.AST]:
             yield node
 
 
+def _top_level_definition(
+    path: Path,
+    name: str,
+) -> ast.FunctionDef | ast.AsyncFunctionDef:
+    """Return one named top-level function from a Python module."""
+    for node in _parse(path).body:
+        if (
+            isinstance(
+                node,
+                (ast.FunctionDef, ast.AsyncFunctionDef),
+            )
+            and node.name == name
+        ):
+            return node
+    raise AssertionError(f"missing function {name}: {path}")
+
+
 def test_provider_sdk_imports_stay_in_their_concrete_adapters() -> None:
     """Neither SDK may cross from its adapter into neutral application code."""
     for path in APP_ROOT.rglob("*.py"):
@@ -113,6 +132,56 @@ def test_concrete_adapters_do_not_depend_on_business_or_storage_layers() -> (
                 for module in forbidden_modules
             ), f"adapter imports forbidden module {target}: {path}"
             assert symbol != "Scene", f"adapter imports Scene: {path}"
+
+
+def test_pydantic_ai_direct_is_confined_to_the_common_backend() -> None:
+    """Only the common adapter may invoke Direct; Agent APIs stay absent."""
+    for path in APP_ROOT.rglob("*.py"):
+        for target, symbol in _import_targets(_parse(path)):
+            if target == "pydantic_ai.direct" or target.startswith(
+                "pydantic_ai.direct."
+            ):
+                assert path == PYDANTIC_AI_BACKEND, (
+                    f"Pydantic AI Direct escaped common backend: {path}"
+                )
+            assert target != "pydantic_ai.agent"
+            assert not target.startswith("pydantic_ai.agent.")
+            assert not (
+                target == "pydantic_ai" and symbol in {"Agent", "CachePoint"}
+            )
+            if target.startswith("pydantic_ai."):
+                assert all(
+                    not segment.startswith("_")
+                    for segment in target.split(".")[1:]
+                ), f"private Pydantic AI API imported in {path}: {target}"
+
+
+def test_provider_factories_are_async_for_failure_cleanup() -> None:
+    """Factory construction can await cleanup of a partly built client."""
+    factory_names = {
+        ANTHROPIC_ADAPTER: "create_anthropic_messages_backend",
+        RESPONSES_ADAPTER: "create_openai_responses_backend",
+    }
+    for path, name in factory_names.items():
+        definition = _top_level_definition(path, name)
+        assert isinstance(definition, ast.AsyncFunctionDef), (
+            f"provider factory cannot await partial cleanup: {path}"
+        )
+
+
+def test_common_backend_has_no_business_or_storage_dependency() -> None:
+    """Wire capture and projection remain below the neutral business layer."""
+    forbidden_modules = {
+        "app.draft_workflow",
+        "app.main",
+        "app.models",
+        "app.storage",
+    }
+    for target, _symbol in _import_targets(_parse(PYDANTIC_AI_BACKEND)):
+        assert not any(
+            target == module or target.startswith(f"{module}.")
+            for module in forbidden_modules
+        ), f"common backend imports forbidden module: {target}"
 
 
 def test_draft_workflow_has_no_provider_routing_or_wire_vocabulary() -> None:
@@ -177,8 +246,35 @@ def test_removed_legacy_model_modules_do_not_return() -> None:
     assert not (APP_ROOT / "drafting.py").exists()
 
 
+def test_runtime_dependencies_keep_the_slim_direct_surface() -> None:
+    """Runtime uses slim provider extras without retry or agent bundles."""
+    configuration = tomllib.loads(
+        (BACKEND_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    runtime = configuration["project"]["dependencies"]
+    development = configuration["dependency-groups"]["dev"]
+
+    assert any(
+        dependency.startswith("pydantic-ai-slim[anthropic,openai]>=2.22.0")
+        for dependency in runtime
+    )
+    assert any(dependency.startswith("pydantic>=") for dependency in runtime)
+    assert any(dependency.startswith("httpx>=0.28.1") for dependency in runtime)
+    assert not any(
+        dependency.split("[", maxsplit=1)[0].split(">", maxsplit=1)[0]
+        == "pydantic-ai"
+        for dependency in runtime
+    )
+    forbidden = ("langchain", "litellm", "retry", "pytest-asyncio")
+    assert not any(
+        marker in dependency.casefold()
+        for dependency in (*runtime, *development)
+        for marker in forbidden
+    )
+
+
 def test_frontend_uses_neutral_model_options_and_preview_context() -> None:
-    """Frontend readable views use context, never provider request fields."""
+    """Preview uses neutral context; only successful drafts show wire JSON."""
     paths = {
         name: FRONTEND_ROOT / name for name in ("App.vue", "api.ts", "types.ts")
     }
@@ -203,16 +299,22 @@ def test_frontend_uses_neutral_model_options_and_preview_context() -> None:
         )
     assert re.search(r"selectedPreview\s*\.\s*context", app_source)
     assert re.search(
-        r"prettyJson\(\s*selectedPreview\s*\.\s*request\s*\)",
+        r"prettyJson\(\s*activeDraft\s*\.\s*request_snapshot\s*\)",
         app_source,
     )
+    assert re.search(r"selectedPreview\s*\.\s*request", app_source) is None
 
     api_source = sources["api.ts"]
     assert re.search(r"Array\.isArray\(\s*value\.context\s*\)", api_source)
     assert re.search(r"value\.context\.every\(", api_source)
+    assert re.search(r"value\s*\.\s*request\b", api_source) is None
 
     types_source = sources["types.ts"]
     assert re.search(
         r"context\s*:\s*ModelRequestContextItem\[\]",
         types_source,
     )
+    preview_type = types_source.split(
+        "export interface ModelRequestPreviewResponse", maxsplit=1
+    )[1].split("}", maxsplit=1)[0]
+    assert "request:" not in preview_type

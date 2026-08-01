@@ -1,6 +1,6 @@
 """Tests for the ordered model backend registry."""
 
-from collections.abc import Callable
+import asyncio
 
 import pytest
 
@@ -11,7 +11,6 @@ from app.model_backends.contracts import (
     ModelConversation,
     ModelGeneration,
     ModelUsage,
-    PreparedModelRequest,
 )
 from app.model_backends.registry import (
     BackendRegistryError,
@@ -34,21 +33,11 @@ class RecordingBackend:
         """Return the configured model exactly."""
         return self._model
 
-    def prepare(
+    async def generate(
         self,
         conversation: ModelConversation,
-    ) -> PreparedModelRequest:
-        """Provide the unused protocol method for structural compatibility."""
-        return PreparedModelRequest(
-            payload={"input": conversation.current_input}
-        )
-
-    def generate(
-        self,
-        prepared: PreparedModelRequest,
     ) -> ModelGeneration:
         """Provide the unused generation method without external I/O."""
-        del prepared
         return ModelGeneration(
             content="output",
             reasoning=(),
@@ -58,9 +47,10 @@ class RecordingBackend:
                 cache_creation_input_tokens=0,
                 cache_read_input_tokens=0,
             ),
+            request_snapshot={"input": conversation.current_input},
         )
 
-    def close(self) -> None:
+    async def aclose(self) -> None:
         """Record lifecycle cleanup."""
         self._events.append(f"close:{self.model}")
 
@@ -81,7 +71,7 @@ def _settings(
 def _recording_factory(events: list[str]) -> BackendFactory:
     """Return a factory that records ordered backend creation."""
 
-    def create(settings: ModelBackendSettings) -> ModelBackend:
+    async def create(settings: ModelBackendSettings) -> ModelBackend:
         events.append(f"create:{settings.model}")
         return RecordingBackend(settings.model, events)
 
@@ -101,7 +91,7 @@ def test_registry_preserves_order_with_shared_protocols() -> None:
         "other_protocol": _recording_factory(events),
     }
 
-    registry = create_model_backend_registry(configured, factories)
+    registry = asyncio.run(create_model_backend_registry(configured, factories))
 
     assert isinstance(registry, ModelBackendRegistry)
     assert registry.models == (
@@ -138,9 +128,11 @@ def test_unknown_protocol_is_rejected_before_any_factory_runs() -> None:
     with pytest.raises(
         BackendRegistryError, match="unknown protocol"
     ) as caught:
-        create_model_backend_registry(
-            configured,
-            {"shared_protocol": _recording_factory(events)},
+        asyncio.run(
+            create_model_backend_registry(
+                configured,
+                {"shared_protocol": _recording_factory(events)},
+            )
         )
 
     assert events == []
@@ -152,9 +144,11 @@ def test_duplicate_models_are_rejected_before_any_factory_runs() -> None:
     events: list[str] = []
 
     with pytest.raises(BackendRegistryError, match="duplicate model"):
-        create_model_backend_registry(
-            (_settings("duplicate"), _settings("duplicate")),
-            {"shared_protocol": _recording_factory(events)},
+        asyncio.run(
+            create_model_backend_registry(
+                (_settings("duplicate"), _settings("duplicate")),
+                {"shared_protocol": _recording_factory(events)},
+            )
         )
 
     assert events == []
@@ -165,7 +159,9 @@ def test_factory_failure_is_sanitized_after_reverse_cleanup() -> None:
     events: list[str] = []
     secret = "factory-exception-secret"
 
-    def fail_on_third(settings: ModelBackendSettings) -> ModelBackend:
+    async def fail_on_third(
+        settings: ModelBackendSettings,
+    ) -> ModelBackend:
         events.append(f"create:{settings.model}")
         if settings.model == "third":
             raise RuntimeError(secret)
@@ -176,9 +172,11 @@ def test_factory_failure_is_sanitized_after_reverse_cleanup() -> None:
     with pytest.raises(
         BackendRegistryError, match="backend factory failed"
     ) as caught:
-        create_model_backend_registry(
-            configured,
-            {"shared_protocol": fail_on_third},
+        asyncio.run(
+            create_model_backend_registry(
+                configured,
+                {"shared_protocol": fail_on_third},
+            )
         )
 
     error = caught.value
@@ -187,6 +185,47 @@ def test_factory_failure_is_sanitized_after_reverse_cleanup() -> None:
     assert "shared_protocol" not in str(error)
     assert error.__cause__ is None
     assert error.__context__ is None
+    assert events == [
+        "create:first",
+        "create:second",
+        "create:third",
+        "close:second",
+        "close:first",
+    ]
+
+
+def test_partial_failure_cleanup_attempts_every_backend() -> None:
+    """A cleanup error cannot leak an earlier backend or mask startup."""
+    events: list[str] = []
+
+    class FailingCleanupBackend(RecordingBackend):
+        """Backend that records cleanup before failing."""
+
+        async def aclose(self) -> None:
+            """Fail only after making the cleanup attempt observable."""
+            await super().aclose()
+            raise RuntimeError("cleanup secret")
+
+    async def factory(settings: ModelBackendSettings) -> ModelBackend:
+        events.append(f"create:{settings.model}")
+        if settings.model == "third":
+            raise RuntimeError("factory secret")
+        if settings.model == "second":
+            return FailingCleanupBackend(settings.model, events)
+        return RecordingBackend(settings.model, events)
+
+    with pytest.raises(
+        BackendRegistryError, match="backend factory failed"
+    ) as caught:
+        asyncio.run(
+            create_model_backend_registry(
+                tuple(_settings(name) for name in ("first", "second", "third")),
+                {"shared_protocol": factory},
+            )
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
     assert events == [
         "create:first",
         "create:second",
@@ -209,11 +248,11 @@ def test_invalid_factory_result_is_sanitized_and_reverse_cleaned() -> None:
             """Simulate a malformed adapter property with sensitive detail."""
             raise RuntimeError(secret)
 
-        def close(self) -> None:
+        async def aclose(self) -> None:
             """Record cleanup without reading the broken model property."""
             events.append("close:exploding")
 
-    def factory(settings: ModelBackendSettings) -> ModelBackend:
+    async def factory(settings: ModelBackendSettings) -> ModelBackend:
         events.append(f"create:{settings.model}")
         if settings.model == "second":
             return ExplodingIdentityBackend(settings.model, events)
@@ -222,9 +261,11 @@ def test_invalid_factory_result_is_sanitized_and_reverse_cleaned() -> None:
     with pytest.raises(
         BackendRegistryError, match="backend factory failed"
     ) as caught:
-        create_model_backend_registry(
-            (_settings("first"), _settings("second")),
-            {"shared_protocol": factory},
+        asyncio.run(
+            create_model_backend_registry(
+                (_settings("first"), _settings("second")),
+                {"shared_protocol": factory},
+            )
         )
 
     error = caught.value
@@ -243,16 +284,18 @@ def test_none_factory_result_closes_previously_created_backends() -> None:
     """A factory returning no backend is a sanitized partial failure."""
     events: list[str] = []
 
-    def factory(settings: ModelBackendSettings) -> ModelBackend:
+    async def factory(settings: ModelBackendSettings) -> ModelBackend:
         events.append(f"create:{settings.model}")
         if settings.model == "second":
             return None  # type: ignore[return-value]
         return RecordingBackend(settings.model, events)
 
     with pytest.raises(BackendRegistryError, match="backend factory failed"):
-        create_model_backend_registry(
-            (_settings("first"), _settings("second")),
-            {"shared_protocol": factory},
+        asyncio.run(
+            create_model_backend_registry(
+                (_settings("first"), _settings("second")),
+                {"shared_protocol": factory},
+            )
         )
 
     assert events == ["create:first", "create:second", "close:first"]
@@ -261,13 +304,15 @@ def test_none_factory_result_closes_previously_created_backends() -> None:
 def test_normal_close_is_reverse_order_and_idempotent() -> None:
     """The registry owns one reverse-order close pass on normal shutdown."""
     events: list[str] = []
-    registry = create_model_backend_registry(
-        tuple(_settings(name) for name in ("first", "second", "third")),
-        {"shared_protocol": _recording_factory(events)},
+    registry = asyncio.run(
+        create_model_backend_registry(
+            tuple(_settings(name) for name in ("first", "second", "third")),
+            {"shared_protocol": _recording_factory(events)},
+        )
     )
 
-    registry.close()
-    registry.close()
+    asyncio.run(registry.aclose())
+    asyncio.run(registry.aclose())
 
     assert events == [
         "create:first",
@@ -283,14 +328,18 @@ def test_factory_model_mismatch_is_closed_and_rejected() -> None:
     """A factory cannot silently register a backend under a false identity."""
     events: list[str] = []
 
-    def mismatched_factory(_settings: ModelBackendSettings) -> ModelBackend:
+    async def mismatched_factory(
+        _settings: ModelBackendSettings,
+    ) -> ModelBackend:
         events.append("create:configured")
         return RecordingBackend("different", events)
 
     with pytest.raises(BackendRegistryError, match="wrong model"):
-        create_model_backend_registry(
-            (_settings("configured"),),
-            {"shared_protocol": mismatched_factory},
+        asyncio.run(
+            create_model_backend_registry(
+                (_settings("configured"),),
+                {"shared_protocol": mismatched_factory},
+            )
         )
 
     assert events == ["create:configured", "close:different"]
@@ -303,25 +352,35 @@ def test_close_attempts_every_backend_when_one_close_fails() -> None:
     class FailingCloseBackend(RecordingBackend):
         """Backend double whose close records and then fails."""
 
-        def close(self) -> None:
+        async def aclose(self) -> None:
             """Record the attempted cleanup before raising."""
-            super().close()
+            await super().aclose()
             raise RuntimeError("close failed")
 
-    factories: dict[str, Callable[[ModelBackendSettings], ModelBackend]] = {
+    async def failing_factory(
+        settings: ModelBackendSettings,
+    ) -> ModelBackend:
+        return FailingCloseBackend(settings.model, events)
+
+    factories: dict[str, BackendFactory] = {
         "normal": _recording_factory(events),
-        "failing": lambda settings: FailingCloseBackend(settings.model, events),
+        "failing": failing_factory,
     }
-    registry = create_model_backend_registry(
-        (
-            _settings("first", protocol="normal"),
-            _settings("second", protocol="failing"),
-            _settings("third", protocol="normal"),
-        ),
-        factories,
+    registry = asyncio.run(
+        create_model_backend_registry(
+            (
+                _settings("first", protocol="normal"),
+                _settings("second", protocol="failing"),
+                _settings("third", protocol="normal"),
+            ),
+            factories,
+        )
     )
 
     with pytest.raises(RuntimeError, match="close failed"):
-        registry.close()
+        asyncio.run(registry.aclose())
 
     assert events[-3:] == ["close:third", "close:second", "close:first"]
+    events_after_failure = list(events)
+    asyncio.run(registry.aclose())
+    assert events == events_after_failure
