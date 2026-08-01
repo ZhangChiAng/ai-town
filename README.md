@@ -42,13 +42,13 @@ Copy-Item models.example.toml models.toml
 model = "anthropic/claude-haiku-4.5"
 protocol = "anthropic_messages"
 base_url = "https://api.example.com/anthropic"
-api_key_env = "AI_TOWN_ANTHROPIC_API_KEY"
+api_key_env = "ANTHROPIC_API_KEY"
 
 [[models]]
 model = "openai/gpt-5-mini"
 protocol = "openai_responses"
 base_url = "https://api.example.com/v1"
-api_key_env = "AI_TOWN_RESPONSES_API_KEY"
+api_key_env = "DeepSeek_API_KEY"
 ```
 
 请把占位 URL 和模型名替换为兼容端点的实际值。`model` 大小写敏感且全局
@@ -57,12 +57,14 @@ api_key_env = "AI_TOWN_RESPONSES_API_KEY"
 `openai_responses`。protocol、端点和密钥不会出现在模型选择、scene 数据或
 `GET /api/model-options` 中。
 
-`api_key_env` 只引用环境变量名，真实 key 不得写进 `models.toml`。可直接设置
+`api_key_env` 只引用环境变量名，真实 key 不得写进 `models.toml`。API key 按
+模型粒度存储：每个 `[[models]]` 通过自己的 `api_key_env` 引用独立的环境变量，
+多个模型可以复用同一个变量。可直接设置
 进程环境变量，也可选择复制 [`.env.example`](.env.example) 为 `.env` 并填写：
 
 ```dotenv
-AI_TOWN_ANTHROPIC_API_KEY=""
-AI_TOWN_RESPONSES_API_KEY=""
+ANTHROPIC_API_KEY=""
+DeepSeek_API_KEY=""
 ```
 
 进程环境优先于 `.env`；`.env` 文件本身可选，但每个 `api_key_env` 引用的值

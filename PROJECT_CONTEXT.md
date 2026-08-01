@@ -267,7 +267,7 @@ user/assistant 交替项和当前 user；可读视图只使用这份中性上下
 - `model`：大小写敏感且全局唯一的场景绑定标识；
 - `protocol`：只供注册表查找 factory 的内部 key；
 - `base_url`：有效的绝对 HTTP(S) URL；
-- `api_key_env`：保存真实密钥的环境变量名，而非密钥本身。
+- `api_key_env`：按模型粒度保存该模型真实密钥的环境变量名，而非密钥本身。
 
 当前正式 protocol key 为 `anthropic_messages` 和 `openai_responses`。
 配置层不硬编码协议枚举；注册表拒绝没有已注册 factory 的 key。TOML 声明顺序
