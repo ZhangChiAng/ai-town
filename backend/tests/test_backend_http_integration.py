@@ -271,7 +271,8 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
         "A SECOND EVENT",
     )
     later_input = (
-        "外层人格：\nTo B: PUBLIC OUTER OUTPUT\n\n外部事件：\nA SECOND EVENT"
+        "外层人格上一轮对 Agent B（OBSERVER AGENT B NAME）说：\n"
+        "PUBLIC OUTER OUTPUT\n\n外部事件：\nA SECOND EVENT"
     )
     later_conversation = ModelConversation(
         system_prompt="A INNER SYSTEM",
@@ -309,7 +310,6 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     forbidden_values = [
         "OBSERVER SCENE NAME",
         "OBSERVER AGENT A NAME",
-        "OBSERVER AGENT B NAME",
         "OBSERVER AGENT C NAME",
         "A OUTER SYSTEM",
         "B INNER PRIVATE SYSTEM",

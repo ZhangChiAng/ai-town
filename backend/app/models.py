@@ -722,7 +722,18 @@ def build_inner_input(scene: Scene, agent_id: AgentId) -> tuple[UUID, str]:
     event = agent.pending_events[0]
     sections: list[str] = []
     if agent.outer_context.turns:
-        sections.append("外层人格：\n" + agent.outer_context.turns[-1].output)
+        previous_outer = agent.outer_context.turns[-1]
+        recipient = get_agent(scene, previous_outer.recipient_id)
+        _parsed_recipient_id, body = parse_addressed_message(
+            previous_outer.output,
+            agent_id,
+        )
+        # Present the prior speech as routed dialogue, without its protocol tag.
+        sections.append(
+            "外层人格上一轮对 "
+            f"Agent {previous_outer.recipient_id}（{recipient.name}）说：\n"
+            f"{body}"
+        )
     sections.append("外部事件：\n" + event.content)
     return event.id, "\n\n".join(sections)
 

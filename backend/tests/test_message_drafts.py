@@ -11,8 +11,10 @@ from app.draft_workflow import (
 )
 from app.models import (
     SceneConflictError,
+    UpdateSceneRequest,
     add_manual_event,
     create_scene,
+    update_scene,
 )
 from tests.helpers import FakeBackend, confirmation
 
@@ -46,17 +48,28 @@ def test_first_inner_and_outer_inputs_are_exact() -> None:
     assert outer.event_id == inner.event_id
 
 
-def test_later_inner_input_includes_only_previous_outer_output_and_event() -> (
-    None
-):
-    """Cross-layer flow is limited to the fixed prior-output prefix."""
+@pytest.mark.parametrize("recipient_id", ["B", "C"])
+def test_later_inner_input_names_recipient_and_uses_only_message_body(
+    recipient_id: str,
+) -> None:
+    """Later inner input renders routed speech without its address prefix."""
     scene = add_manual_event(create_scene("后续", MODEL), "A", "第一件事")
-    backend = FakeBackend(["内层一", "To B: 外层一"], model=MODEL)
+    backend = FakeBackend(
+        ["内层一", f"To {recipient_id}: 外层一"],
+        model=MODEL,
+    )
     workflow = DraftWorkflow(backend)
     inner = workflow.generate(scene, "A", "inner")
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
     outer = workflow.generate(scene, "A", "outer")
     scene = confirm_draft(scene, "A", "outer", confirmation(outer))
+    recipient = next(
+        agent for agent in scene.agents if agent.id == recipient_id
+    )
+    assert scene.agents[0].outer_context.turns[-1].output == (
+        f"To {recipient_id}: 外层一"
+    )
+    assert recipient.pending_events[-1].content == "From A: 外层一"
     scene = add_manual_event(scene, "A", "第二件事")
 
     preview = DraftWorkflow(FakeBackend([], model=MODEL)).preview(
@@ -66,7 +79,49 @@ def test_later_inner_input_includes_only_previous_outer_output_and_event() -> (
     )
 
     assert preview.context[-1].text == (
-        "外层人格：\nTo B: 外层一\n\n外部事件：\n第二件事"
+        f"外层人格上一轮对 Agent {recipient_id}（{recipient_id}）说：\n"
+        "外层一\n\n外部事件：\n第二件事"
+    )
+
+
+def test_later_inner_input_uses_recipient_current_name() -> None:
+    """The speech direction reflects a recipient rename after the outer turn."""
+    scene = add_manual_event(create_scene("改名", MODEL), "A", "第一件事")
+    workflow = DraftWorkflow(
+        FakeBackend(["内层一", "To B: 外层一"], model=MODEL)
+    )
+    inner = workflow.generate(scene, "A", "inner")
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
+    outer = workflow.generate(scene, "A", "outer")
+    scene = confirm_draft(scene, "A", "outer", confirmation(outer))
+    update = UpdateSceneRequest.model_validate(
+        {
+            "name": scene.name,
+            "agents": [
+                {
+                    "id": agent.id,
+                    "name": "儿子" if agent.id == "B" else agent.name,
+                    "inner_context": {
+                        "system_prompt": agent.inner_context.system_prompt
+                    },
+                    "outer_context": {
+                        "system_prompt": agent.outer_context.system_prompt
+                    },
+                }
+                for agent in scene.agents
+            ],
+        }
+    )
+    scene = add_manual_event(update_scene(scene, update), "A", "第二件事")
+
+    preview = DraftWorkflow(FakeBackend([], model=MODEL)).preview(
+        scene,
+        "A",
+        "inner",
+    )
+
+    assert preview.context[-1].text == (
+        "外层人格上一轮对 Agent B（儿子）说：\n外层一\n\n外部事件：\n第二件事"
     )
 
 

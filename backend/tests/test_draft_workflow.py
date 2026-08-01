@@ -13,9 +13,11 @@ from app.draft_workflow import (
 )
 from app.models import (
     SceneConflictError,
+    UpdateSceneRequest,
     add_manual_event,
     create_scene,
     edit_manual_event,
+    update_scene,
 )
 from tests.helpers import (
     FakeBackend,
@@ -196,9 +198,55 @@ def test_readable_context_contains_complete_alternating_layer_history() -> None:
         ("assistant", "inner one"),
         (
             "user",
-            "外层人格：\nTo B: outer one\n\n外部事件：\nsecond",
+            "外层人格上一轮对 Agent B（B）说：\n"
+            "outer one\n\n外部事件：\nsecond",
         ),
     ]
+
+
+def test_recipient_rename_invalidates_later_inner_draft() -> None:
+    """A recipient display-name change makes the routed-speech draft stale."""
+    scene = add_manual_event(create_scene("Rename stale", MODEL), "A", "first")
+    inner = DraftWorkflow(FakeBackend(["inner one"], model=MODEL)).generate(
+        scene, "A", "inner"
+    )
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
+    outer = DraftWorkflow(
+        FakeBackend(["To B: outer one"], model=MODEL)
+    ).generate(scene, "A", "outer")
+    scene = confirm_draft(scene, "A", "outer", confirmation(outer))
+    scene = add_manual_event(scene, "A", "second")
+    draft = DraftWorkflow(FakeBackend(["inner two"], model=MODEL)).generate(
+        scene, "A", "inner"
+    )
+    update = UpdateSceneRequest.model_validate(
+        {
+            "name": scene.name,
+            "agents": [
+                {
+                    "id": agent.id,
+                    "name": "儿子" if agent.id == "B" else agent.name,
+                    "inner_context": {
+                        "system_prompt": agent.inner_context.system_prompt
+                    },
+                    "outer_context": {
+                        "system_prompt": agent.outer_context.system_prompt
+                    },
+                }
+                for agent in scene.agents
+            ],
+        }
+    )
+    renamed = update_scene(scene, update)
+
+    assert draft_state_token(renamed, "A", "inner") != draft.state_token
+    with pytest.raises(SceneConflictError, match="changed"):
+        confirm_draft(
+            renamed,
+            "A",
+            "inner",
+            confirmation(draft),
+        )
 
 
 def test_generation_errors_are_sanitized_and_never_retried() -> None:
