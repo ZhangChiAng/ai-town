@@ -1,0 +1,231 @@
+"""Shared test doubles and HTTP helpers for the backend test suite."""
+
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
+
+from app.main import create_app
+from app.model_backends import (
+    JsonObject,
+    ModelBackend,
+    ModelConversation,
+    ModelGeneration,
+    ModelReasoning,
+    ModelUsage,
+    PreparedModelRequest,
+)
+from app.models import ConfirmLayerRequest
+from app.storage import SceneStorage
+from tests.client import TestClient
+
+# Observer-only defaults reused across every fake generation so tests do not
+# invent ad-hoc reasoning text that could leak into persisted scene state.
+DEFAULT_REASONING = ModelReasoning(
+    type="summary_text",
+    text="observer-only fake reasoning",
+)
+DEFAULT_USAGE = ModelUsage(
+    input_tokens=10,
+    output_tokens=4,
+    cache_creation_input_tokens=2,
+    cache_read_input_tokens=3,
+)
+
+
+def neutral_payload(
+    conversation: ModelConversation,
+    model: str,
+    *,
+    version: int = 1,
+) -> JsonObject:
+    """Build a deliberately provider-unlike JSON-safe request envelope.
+
+    The shape is intentionally unrelated to any real adapter wire format so
+    preview and snapshot assertions stay protocol-neutral.
+    """
+    return {
+        "engine": model,
+        "version": version,
+        "dialogue": {
+            "rulebook": conversation.system_prompt,
+            "past": [[turn.input, turn.output] for turn in conversation.turns],
+            "next": conversation.current_input,
+        },
+    }
+
+
+class FakeBackend:
+    """Protocol-neutral backend double with observable call tracking.
+
+    ``outputs`` may hold plain strings (wrapped with the shared observer
+    defaults), full ``ModelGeneration`` values, or ``Exception`` instances
+    raised on generation. ``payload_builder`` lets a test supply its own
+    envelope shape while reusing the lifecycle and tracking plumbing.
+    """
+
+    def __init__(
+        self,
+        outputs: list[str | ModelGeneration | Exception],
+        *,
+        model: str,
+        payload_builder: Callable[[ModelConversation, str], JsonObject]
+        | None = None,
+        events: list[str] | None = None,
+    ) -> None:
+        """Bind one exact model, queued results, and an optional close sink."""
+        self._model = model
+        self._outputs = list(outputs)
+        self._payload_builder = payload_builder or neutral_payload
+        self._events = events
+        self.conversations: list[ModelConversation] = []
+        self.generate_calls: list[PreparedModelRequest] = []
+        self.close_calls = 0
+
+    @property
+    def model(self) -> str:
+        """Return the exact case-sensitive model identity."""
+        return self._model
+
+    def prepare(
+        self,
+        conversation: ModelConversation,
+    ) -> PreparedModelRequest:
+        """Record one neutral conversation and return the prepared payload."""
+        self.conversations.append(conversation)
+        return PreparedModelRequest(
+            payload=self._payload_builder(conversation, self._model),
+        )
+
+    def generate(
+        self,
+        prepared: PreparedModelRequest,
+    ) -> ModelGeneration:
+        """Consume one queued result as a single upstream-equivalent call."""
+        self.generate_calls.append(prepared)
+        result = self._outputs.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        if isinstance(result, ModelGeneration):
+            return result
+        return ModelGeneration(
+            content=result,
+            reasoning=(DEFAULT_REASONING,),
+            usage=DEFAULT_USAGE,
+        )
+
+    def close(self) -> None:
+        """Record one lifecycle release and optionally announce it."""
+        self.close_calls += 1
+        if self._events is not None:
+            self._events.append(f"close:{self._model}")
+
+
+def make_client(
+    scene_directory: Path,
+    backends: Mapping[str, ModelBackend] | ModelBackend | None = None,
+    *,
+    texts: list[str | ModelGeneration | Exception] | None = None,
+    model: str | None = None,
+) -> TestClient:
+    """Create a ``TestClient`` over isolated storage and one fake backend.
+
+    Pass ``backends`` to inject a pre-built backend or mapping. Pass
+    ``texts`` (with ``model``) to spin up a default ``FakeBackend``.
+    """
+    if backends is None:
+        if model is None:
+            raise TypeError("model is required when backends is None")
+        backends = FakeBackend(texts or [], model=model)
+    return TestClient(create_app(SceneStorage(scene_directory), backends))
+
+
+def require_json(
+    response: Any,
+    status_code: int = 200,
+) -> dict[str, Any]:
+    """Assert one response status and return its JSON object."""
+    assert response.status_code == status_code, response.text
+    body = response.json()
+    assert isinstance(body, dict)
+    return body
+
+
+def post_scene(
+    client: TestClient,
+    *,
+    model: str,
+    name: str = "HTTP integration",
+    expected_status: int = 201,
+) -> dict[str, Any]:
+    """Create one bound scene through the public API."""
+    return require_json(
+        client.post("/api/scenes", json={"name": name, "model": model}),
+        expected_status,
+    )
+
+
+def post_event(
+    client: TestClient,
+    scene_id: str,
+    agent_id: str,
+    content: str,
+    *,
+    expected_status: int = 201,
+) -> dict[str, Any]:
+    """Queue one manual event through the public API."""
+    return require_json(
+        client.post(
+            f"/api/scenes/{scene_id}/agents/{agent_id}/events",
+            json={"content": content},
+        ),
+        expected_status,
+    )
+
+
+def generate_draft(
+    client: TestClient,
+    scene_id: str,
+    agent_id: str,
+    layer: str,
+    *,
+    expected_status: int = 200,
+) -> dict[str, Any]:
+    """Generate one browser-held draft through the public API."""
+    return require_json(
+        client.post(f"/api/scenes/{scene_id}/agents/{agent_id}/{layer}-drafts"),
+        expected_status,
+    )
+
+
+def confirm_draft(
+    client: TestClient,
+    scene_id: str,
+    agent_id: str,
+    layer: str,
+    draft: dict[str, Any],
+    *,
+    content: str | None = None,
+) -> Any:
+    """Submit one browser draft; returns the raw response for status checks."""
+    return client.post(
+        f"/api/scenes/{scene_id}/agents/{agent_id}/{layer}-confirmations",
+        json={
+            "call_id": draft["call_id"],
+            "event_id": draft["event_id"],
+            "content": draft["content"] if content is None else content,
+            "state_token": draft["state_token"],
+        },
+    )
+
+
+def confirmation(
+    draft: Any,
+    content: str | None = None,
+) -> ConfirmLayerRequest:
+    """Convert one workflow draft object to the confirmation DTO."""
+    return ConfirmLayerRequest(
+        call_id=draft.call_id,
+        event_id=draft.event_id,
+        content=draft.content if content is None else content,
+        state_token=draft.state_token,
+    )

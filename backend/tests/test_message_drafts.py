@@ -1,7 +1,6 @@
 """Product-boundary tests for isolated inner and outer model context."""
 
 import json
-from typing import Any
 
 import pytest
 
@@ -10,90 +9,14 @@ from app.draft_workflow import (
     DraftWorkflow,
     confirm_draft,
 )
-from app.model_backends import (
-    ModelConversation,
-    ModelGeneration,
-    ModelReasoning,
-    ModelUsage,
-    PreparedModelRequest,
-)
 from app.models import (
-    ConfirmLayerRequest,
     SceneConflictError,
     add_manual_event,
     create_scene,
 )
+from tests.helpers import FakeBackend, confirmation
 
 MODEL = "fake/protocol-neutral"
-
-
-class RecordingBackend:
-    """Record neutral conversations and return queued visible outputs."""
-
-    def __init__(self, outputs: list[str]) -> None:
-        """Queue outputs for one exact fake model."""
-        self.outputs = outputs
-        self.conversations: list[ModelConversation] = []
-        self.calls: list[PreparedModelRequest] = []
-
-    @property
-    def model(self) -> str:
-        """Return the scene-bound fake model name."""
-        return MODEL
-
-    def prepare(
-        self,
-        conversation: ModelConversation,
-    ) -> PreparedModelRequest:
-        """Record the exact neutral context and return an arbitrary envelope."""
-        self.conversations.append(conversation)
-        return PreparedModelRequest(
-            payload={
-                "engine": self.model,
-                "envelope": {
-                    "rule": conversation.system_prompt,
-                    "history": [
-                        [turn.input, turn.output] for turn in conversation.turns
-                    ],
-                    "current": conversation.current_input,
-                },
-            }
-        )
-
-    def generate(
-        self,
-        prepared: PreparedModelRequest,
-    ) -> ModelGeneration:
-        """Represent one upstream call with temporary observer reasoning."""
-        self.calls.append(prepared)
-        return ModelGeneration(
-            content=self.outputs.pop(0),
-            reasoning=(
-                ModelReasoning(type="thinking", text="temporary thought"),
-            ),
-            usage=ModelUsage(
-                input_tokens=10,
-                output_tokens=5,
-                cache_creation_input_tokens=2,
-                cache_read_input_tokens=3,
-            ),
-        )
-
-    def close(self) -> None:
-        """Provide the lifecycle method required by the backend port."""
-
-
-def _confirmation(
-    draft: Any,
-    content: str | None = None,
-) -> ConfirmLayerRequest:
-    """Convert one browser draft to an editable confirmation payload."""
-    return ConfirmLayerRequest(
-        call_id=draft.call_id,
-        event_id=draft.event_id,
-        content=draft.content if content is None else content,
-        state_token=draft.state_token,
-    )
 
 
 def test_first_inner_and_outer_inputs_are_exact() -> None:
@@ -103,8 +26,9 @@ def test_first_inner_and_outer_inputs_are_exact() -> None:
         "A",
         "门外传来两声敲门。",
     )
-    backend = RecordingBackend(
-        ["先别开门。\n问清楚是谁。", "To B: 你在门外吗？"]
+    backend = FakeBackend(
+        ["先别开门。\n问清楚是谁。", "To B: 你在门外吗？"],
+        model=MODEL,
     )
     workflow = DraftWorkflow(backend)
 
@@ -112,7 +36,7 @@ def test_first_inner_and_outer_inputs_are_exact() -> None:
     assert backend.conversations[0].current_input == (
         "外部事件：\n门外传来两声敲门。"
     )
-    scene = confirm_draft(scene, "A", "inner", _confirmation(inner))
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
 
     outer = workflow.generate(scene, "A", "outer")
     assert backend.conversations[1].current_input == (
@@ -127,15 +51,15 @@ def test_later_inner_input_includes_only_previous_outer_output_and_event() -> (
 ):
     """Cross-layer flow is limited to the fixed prior-output prefix."""
     scene = add_manual_event(create_scene("后续", MODEL), "A", "第一件事")
-    backend = RecordingBackend(["内层一", "To B: 外层一"])
+    backend = FakeBackend(["内层一", "To B: 外层一"], model=MODEL)
     workflow = DraftWorkflow(backend)
     inner = workflow.generate(scene, "A", "inner")
-    scene = confirm_draft(scene, "A", "inner", _confirmation(inner))
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
     outer = workflow.generate(scene, "A", "outer")
-    scene = confirm_draft(scene, "A", "outer", _confirmation(outer))
+    scene = confirm_draft(scene, "A", "outer", confirmation(outer))
     scene = add_manual_event(scene, "A", "第二件事")
 
-    preview = DraftWorkflow(RecordingBackend([])).preview(
+    preview = DraftWorkflow(FakeBackend([], model=MODEL)).preview(
         scene,
         "A",
         "inner",
@@ -167,12 +91,14 @@ def test_two_layers_send_only_their_own_complete_history() -> None:
         }
     )
     scene = add_manual_event(scene, "A", "A first event")
-    backend = RecordingBackend(["A inner secret", "To B: A public text"])
+    backend = FakeBackend(
+        ["A inner secret", "To B: A public text"], model=MODEL
+    )
     workflow = DraftWorkflow(backend)
     inner = workflow.generate(scene, "A", "inner")
-    scene = confirm_draft(scene, "A", "inner", _confirmation(inner))
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
     outer = workflow.generate(scene, "A", "outer")
-    scene = confirm_draft(scene, "A", "outer", _confirmation(outer))
+    scene = confirm_draft(scene, "A", "outer", confirmation(outer))
     scene = add_manual_event(scene, "A", "A second event")
     scene = add_manual_event(scene, "B", "B private pending event")
 
@@ -198,17 +124,17 @@ def test_each_layer_keeps_every_confirmed_turn_without_truncation() -> None:
     outputs: list[str] = []
     for index in range(4):
         outputs.extend((f"INNER-{index}", f"To B: OUTER-{index}"))
-    workflow = DraftWorkflow(RecordingBackend(outputs))
+    workflow = DraftWorkflow(FakeBackend(outputs, model=MODEL))
 
     for index in range(4):
         scene = add_manual_event(scene, "A", f"EVENT-{index}")
         inner = workflow.generate(scene, "A", "inner")
-        scene = confirm_draft(scene, "A", "inner", _confirmation(inner))
+        scene = confirm_draft(scene, "A", "inner", confirmation(inner))
         outer = workflow.generate(scene, "A", "outer")
-        scene = confirm_draft(scene, "A", "outer", _confirmation(outer))
+        scene = confirm_draft(scene, "A", "outer", confirmation(outer))
 
     scene = add_manual_event(scene, "A", "EVENT-next")
-    backend = RecordingBackend([])
+    backend = FakeBackend([], model=MODEL)
     DraftWorkflow(backend).preview(scene, "A", "inner")
 
     assert len(backend.conversations[-1].turns) == 4
@@ -220,32 +146,32 @@ def test_each_layer_keeps_every_confirmed_turn_without_truncation() -> None:
 def test_reasoning_is_observer_only_and_never_persisted_or_reused() -> None:
     """Temporary reasoning disappears at the confirmation boundary."""
     scene = add_manual_event(create_scene("Reasoning", MODEL), "C", "event")
-    backend = RecordingBackend(["inner answer"])
+    backend = FakeBackend(["inner answer"], model=MODEL)
     draft = DraftWorkflow(backend).generate(scene, "C", "inner")
-    assert draft.reasoning[0].text == "temporary thought"
+    assert draft.reasoning[0].text == "observer-only fake reasoning"
 
-    scene = confirm_draft(scene, "C", "inner", _confirmation(draft))
-    next_backend = RecordingBackend([])
+    scene = confirm_draft(scene, "C", "inner", confirmation(draft))
+    next_backend = FakeBackend([], model=MODEL)
     DraftWorkflow(next_backend).preview(scene, "C", "outer")
     serialized_scene = json.dumps(scene.model_dump(mode="json"))
     serialized_context = repr(next_backend.conversations[-1])
 
-    assert "temporary thought" not in serialized_scene
-    assert "temporary thought" not in serialized_context
+    assert "observer-only fake reasoning" not in serialized_scene
+    assert "observer-only fake reasoning" not in serialized_context
 
 
 def test_invalid_outer_generation_fails_after_exactly_one_call() -> None:
     """A malformed visible outer result is rejected without retry."""
     scene = add_manual_event(create_scene("坏外层", MODEL), "A", "event")
-    inner_backend = RecordingBackend(["inner"])
+    inner_backend = FakeBackend(["inner"], model=MODEL)
     inner = DraftWorkflow(inner_backend).generate(scene, "A", "inner")
-    scene = confirm_draft(scene, "A", "inner", _confirmation(inner))
-    invalid_backend = RecordingBackend(["not addressed"])
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
+    invalid_backend = FakeBackend(["not addressed"], model=MODEL)
 
     with pytest.raises(DraftGenerationError, match="invalid outer draft"):
         DraftWorkflow(invalid_backend).generate(scene, "A", "outer")
 
-    assert len(invalid_backend.calls) == 1
+    assert len(invalid_backend.generate_calls) == 1
 
 
 def test_outer_preview_is_rejected_before_inner_confirmation() -> None:
@@ -253,4 +179,4 @@ def test_outer_preview_is_rejected_before_inner_confirmation() -> None:
     scene = add_manual_event(create_scene("阶段", MODEL), "A", "event")
 
     with pytest.raises(SceneConflictError, match="no confirmed inner"):
-        DraftWorkflow(RecordingBackend([])).preview(scene, "A", "outer")
+        DraftWorkflow(FakeBackend([], model=MODEL)).preview(scene, "A", "outer")

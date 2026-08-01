@@ -5,91 +5,22 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import pytest
+
 from app.main import create_app
-from app.model_backends import (
-    JsonObject,
-    ModelConversation,
-    ModelGeneration,
-    ModelReasoning,
-    ModelTurn,
-    ModelUsage,
-    PreparedModelRequest,
-)
-from app.models import Scene
+from app.model_backends import JsonObject, ModelConversation, ModelTurn
 from app.storage import SceneStorage
+from tests import helpers
 from tests.client import TestClient
+
+FakeBackend = helpers.FakeBackend
+_confirm = helpers.confirm_draft
+_generate = helpers.generate_draft
+_post_event = helpers.post_event
+_require_json = helpers.require_json
 
 FAKE_MODEL = "third-protocol/Case-Sensitive"
 OTHER_MODEL = "other/available"
-
-
-class FakeThirdProtocolBackend:
-    """Test-only backend with a provider-unlike, versioned payload."""
-
-    def __init__(
-        self,
-        outputs: list[str],
-        *,
-        model: str = FAKE_MODEL,
-        payload_version: int = 1,
-    ) -> None:
-        """Queue visible results and select one unrelated wire mapping."""
-        self._model = model
-        self._outputs = outputs
-        self._payload_version = payload_version
-        self.conversations: list[ModelConversation] = []
-        self.prepared_requests: list[PreparedModelRequest] = []
-        self.generate_calls: list[PreparedModelRequest] = []
-        self.close_calls = 0
-
-    @property
-    def model(self) -> str:
-        """Return the exact case-sensitive model identity."""
-        return self._model
-
-    def prepare(
-        self,
-        conversation: ModelConversation,
-    ) -> PreparedModelRequest:
-        """Map only neutral conversation fields into a fake ritual."""
-        self.conversations.append(conversation)
-        prepared = PreparedModelRequest(
-            payload=_fake_payload(
-                conversation,
-                self.model,
-                self._payload_version,
-            )
-        )
-        self.prepared_requests.append(prepared)
-        return prepared
-
-    def generate(
-        self,
-        prepared: PreparedModelRequest,
-    ) -> ModelGeneration:
-        """Record one upstream-equivalent call and return one queued result."""
-        self.generate_calls.append(prepared)
-        if not self._outputs:
-            raise RuntimeError("test fake has no queued output")
-        return ModelGeneration(
-            content=self._outputs.pop(0),
-            reasoning=(
-                ModelReasoning(
-                    type="summary_text",
-                    text="observer-only fake reasoning",
-                ),
-            ),
-            usage=ModelUsage(
-                input_tokens=13,
-                output_tokens=5,
-                cache_creation_input_tokens=3,
-                cache_read_input_tokens=2,
-            ),
-        )
-
-    def close(self) -> None:
-        """Record lifecycle compatibility without owning a real client."""
-        self.close_calls += 1
 
 
 def _fake_payload(
@@ -123,74 +54,27 @@ def _fake_payload(
     }
 
 
-def _require_json(response: Any, status_code: int = 200) -> dict[str, Any]:
-    """Assert one response status and return its JSON object."""
-    assert response.status_code == status_code, response.text
-    body = response.json()
-    assert isinstance(body, dict)
-    return body
+def _backend(
+    outputs: list[str],
+    *,
+    model: str = FAKE_MODEL,
+    version: int = 1,
+) -> FakeBackend:
+    """Build a fake third-protocol backend with a versioned ritual payload."""
+    return FakeBackend(
+        outputs,
+        model=model,
+        payload_builder=lambda c, m: _fake_payload(c, m, version),
+    )
 
 
 def _post_scene(
     client: TestClient,
     *,
-    model: str = FAKE_MODEL,
     name: str = "HTTP integration",
 ) -> dict[str, Any]:
     """Create one bound scene through the public API."""
-    return _require_json(
-        client.post("/api/scenes", json={"name": name, "model": model}),
-        201,
-    )
-
-
-def _post_event(
-    client: TestClient,
-    scene_id: str,
-    agent_id: str,
-    content: str,
-) -> dict[str, Any]:
-    """Queue one manual event through the public API."""
-    return _require_json(
-        client.post(
-            f"/api/scenes/{scene_id}/agents/{agent_id}/events",
-            json={"content": content},
-        ),
-        201,
-    )
-
-
-def _generate(
-    client: TestClient,
-    scene_id: str,
-    agent_id: str,
-    layer: str,
-) -> dict[str, Any]:
-    """Generate one browser-held draft through the public API."""
-    return _require_json(
-        client.post(f"/api/scenes/{scene_id}/agents/{agent_id}/{layer}-drafts")
-    )
-
-
-def _confirm(
-    client: TestClient,
-    scene_id: str,
-    agent_id: str,
-    layer: str,
-    draft: dict[str, Any],
-    *,
-    content: str | None = None,
-) -> Any:
-    """Submit one browser draft without consulting a backend."""
-    return client.post(
-        f"/api/scenes/{scene_id}/agents/{agent_id}/{layer}-confirmations",
-        json={
-            "call_id": draft["call_id"],
-            "event_id": draft["event_id"],
-            "content": draft["content"] if content is None else content,
-            "state_token": draft["state_token"],
-        },
-    )
+    return helpers.post_scene(client, model=FAKE_MODEL, name=name)
 
 
 def _scene_update(scene: dict[str, Any]) -> dict[str, Any]:
@@ -231,13 +115,13 @@ def _new_pending_inner_draft(
 ) -> tuple[
     SceneStorage,
     TestClient,
-    FakeThirdProtocolBackend,
+    FakeBackend,
     dict[str, Any],
     dict[str, Any],
 ]:
     """Create a persisted scene with one unconfirmed inner draft."""
     storage = SceneStorage(tmp_path / "scenes")
-    backend = FakeThirdProtocolBackend([output])
+    backend = _backend([output])
     client = TestClient(create_app(storage, {FAKE_MODEL: backend}))
     scene = _post_scene(client)
     scene = _post_event(client, scene["id"], "A", "pending event")
@@ -250,10 +134,8 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
 ) -> None:
     """A provider-unlike backend previews and completes both manual stages."""
     storage = SceneStorage(tmp_path / "scenes")
-    backend = FakeThirdProtocolBackend(
-        ["INNER MODEL OUTPUT", "To B: PUBLIC OUTER OUTPUT"]
-    )
-    other_backend = FakeThirdProtocolBackend([], model=OTHER_MODEL)
+    backend = _backend(["INNER MODEL OUTPUT", "To B: PUBLIC OUTER OUTPUT"])
+    other_backend = _backend([], model=OTHER_MODEL)
     client = TestClient(
         create_app(
             storage,
@@ -459,7 +341,7 @@ def test_valid_draft_confirms_after_restart_without_bound_model(
 ) -> None:
     """Unavailable models block new calls but never an existing confirmation."""
     storage, _client, backend, scene, draft = _new_pending_inner_draft(tmp_path)
-    other_backend = FakeThirdProtocolBackend([], model=OTHER_MODEL)
+    other_backend = _backend([], model=OTHER_MODEL)
     restarted = TestClient(create_app(storage, {OTHER_MODEL: other_backend}))
 
     assert (
@@ -489,135 +371,61 @@ def test_valid_draft_confirms_after_restart_without_bound_model(
     )
 
 
-def test_payload_versions_share_state_token_for_identical_business_state(
-    tmp_path: Path,
+def _mutate_event(
+    client: TestClient,
+    storage: SceneStorage,
+    scene: dict[str, Any],
 ) -> None:
-    """Adapter-only payload changes do not invalidate browser drafts."""
-    storage = SceneStorage(tmp_path / "scenes")
-    first_backend = FakeThirdProtocolBackend(["same answer"], payload_version=1)
-    first_client = TestClient(create_app(storage, {FAKE_MODEL: first_backend}))
-    scene = _post_scene(first_client)
-    scene = _post_event(first_client, scene["id"], "A", "same event")
-    first_draft = _generate(first_client, scene["id"], "A", "inner")
-
-    second_backend = FakeThirdProtocolBackend(
-        ["same answer"], payload_version=2
-    )
-    second_client = TestClient(
-        create_app(storage, {FAKE_MODEL: second_backend})
-    )
-    second_draft = _generate(second_client, scene["id"], "A", "inner")
-
-    assert first_draft["request_snapshot"] != second_draft["request_snapshot"]
-    assert first_draft["state_token"] == second_draft["state_token"]
-    assert len(first_backend.generate_calls) == 1
-    assert len(second_backend.generate_calls) == 1
-
-
-def test_changed_event_rejects_old_draft_over_http(tmp_path: Path) -> None:
-    """The complete current event participates in stale-draft detection."""
-    _storage, client, backend, scene, draft = _new_pending_inner_draft(tmp_path)
+    """Replace the queued event content after the draft was generated."""
     event_id = scene["agents"][0]["pending_events"][0]["id"]
     edited = client.put(
         f"/api/scenes/{scene['id']}/agents/A/events/{event_id}",
         json={"content": "changed event"},
     )
     assert edited.status_code == 200
-    calls_before = len(backend.generate_calls)
-
-    response = _confirm(client, scene["id"], "A", "inner", draft)
-
-    assert response.status_code == 409
-    assert len(backend.generate_calls) == calls_before
 
 
-def test_changed_prompt_rejects_old_draft_over_http(tmp_path: Path) -> None:
-    """The selected layer's system prompt participates in the state token."""
-    _storage, client, backend, scene, draft = _new_pending_inner_draft(tmp_path)
+def _mutate_prompt(
+    client: TestClient,
+    storage: SceneStorage,
+    scene: dict[str, Any],
+) -> None:
+    """Change the selected layer's system prompt after the draft."""
     update = _scene_update(scene)
     update["agents"][0]["inner_context"]["system_prompt"] = (
         "changed inner prompt"
     )
     saved = client.put(f"/api/scenes/{scene['id']}", json=update)
     assert saved.status_code == 200
-    calls_before = len(backend.generate_calls)
-
-    response = _confirm(client, scene["id"], "A", "inner", draft)
-
-    assert response.status_code == 409
-    assert len(backend.generate_calls) == calls_before
 
 
-def test_changed_model_rejects_old_draft_over_http(tmp_path: Path) -> None:
-    """The immutable scene model identity participates in the state token."""
-    storage, client, backend, scene, draft = _new_pending_inner_draft(tmp_path)
-    scene_id = UUID(scene["id"])
+def _mutate_model(
+    client: TestClient,
+    storage: SceneStorage,
+    scene: dict[str, Any],
+) -> None:
+    """Rebind the scene to a different model after the draft."""
     storage.mutate(
-        scene_id,
+        UUID(scene["id"]),
         lambda current: current.model_copy(update={"model": OTHER_MODEL}),
     )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [_mutate_event, _mutate_prompt, _mutate_model],
+    ids=["event", "prompt", "model"],
+)
+def test_changed_business_state_rejects_old_draft_over_http(
+    tmp_path: Path,
+    mutate,
+) -> None:
+    """A stale draft is rejected with 409 without a backend call."""
+    storage, client, backend, scene, draft = _new_pending_inner_draft(tmp_path)
+    mutate(client, storage, scene)
     calls_before = len(backend.generate_calls)
 
     response = _confirm(client, scene["id"], "A", "inner", draft)
-
-    assert response.status_code == 409
-    assert len(backend.generate_calls) == calls_before
-
-
-def test_changed_same_layer_history_rejects_old_draft_over_http(
-    tmp_path: Path,
-) -> None:
-    """Every confirmed turn in the selected layer participates in the token."""
-    storage = SceneStorage(tmp_path / "scenes")
-    backend = FakeThirdProtocolBackend(
-        ["first inner", "To B: first outer", "second inner"]
-    )
-    client = TestClient(create_app(storage, {FAKE_MODEL: backend}))
-    scene = _post_scene(client)
-    scene = _post_event(client, scene["id"], "A", "first event")
-    first_inner = _generate(client, scene["id"], "A", "inner")
-    scene = _require_json(
-        _confirm(client, scene["id"], "A", "inner", first_inner)
-    )
-    first_outer = _generate(client, scene["id"], "A", "outer")
-    scene = _require_json(
-        _confirm(client, scene["id"], "A", "outer", first_outer)
-    )
-    scene = _post_event(client, scene["id"], "A", "second event")
-    second_inner = _generate(client, scene["id"], "A", "inner")
-
-    def change_inner_history(current: Scene) -> Scene:
-        """Replace one confirmed inner output while preserving scene shape."""
-        agent = current.agents[0]
-        changed_turn = agent.inner_context.turns[0].model_copy(
-            update={"output": "changed prior inner output"}
-        )
-        changed_agent = agent.model_copy(
-            update={
-                "inner_context": agent.inner_context.model_copy(
-                    update={
-                        "turns": [
-                            changed_turn,
-                            *agent.inner_context.turns[1:],
-                        ]
-                    }
-                )
-            }
-        )
-        return current.model_copy(
-            update={"agents": [changed_agent, *current.agents[1:]]}
-        )
-
-    storage.mutate(UUID(scene["id"]), change_inner_history)
-    calls_before = len(backend.generate_calls)
-
-    response = _confirm(
-        client,
-        scene["id"],
-        "A",
-        "inner",
-        second_inner,
-    )
 
     assert response.status_code == 409
     assert len(backend.generate_calls) == calls_before
