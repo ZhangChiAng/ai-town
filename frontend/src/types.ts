@@ -35,16 +35,16 @@ export interface ExternalEvent {
 
 export interface InnerTurn {
   call_id: string;
-  event_id: string;
+  event_ids: string[];
   sequence: number;
   input: string;
   output: string;
-  consumed_event: ExternalEvent;
+  consumed_events: ExternalEvent[];
 }
 
 export interface OuterTurn {
   call_id: string;
-  event_id: string;
+  event_ids: string[];
   sequence: number;
   input: string;
   output: string;
@@ -77,7 +77,7 @@ export interface ConfirmedCallReference {
 }
 
 export interface Scene {
-  schema_version: 6;
+  schema_version: 7;
   id: string;
   name: string;
   model: string | null;
@@ -117,7 +117,7 @@ export interface ModelRequestContextItem {
 export interface LayerDraftResponse {
   layer: Layer;
   call_id: string;
-  event_id: string;
+  event_ids: string[];
   content: string;
   reasoning: ModelReasoningBlock[];
   usage: TokenUsage;
@@ -127,13 +127,13 @@ export interface LayerDraftResponse {
 
 export interface ConfirmLayerRequest {
   call_id: string;
-  event_id: string;
+  event_ids: string[];
   content: string;
   state_token: string;
 }
 
 export interface ModelRequestPreviewResponse {
   layer: Layer;
-  event_id: string;
+  event_ids: string[];
   context: ModelRequestContextItem[];
 }

@@ -1,6 +1,7 @@
 """Domain models and state transitions for two-layer AI Town scenes."""
 
 import re
+from copy import deepcopy
 from typing import Any, Literal, Self
 from uuid import UUID, uuid4
 
@@ -12,8 +13,9 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 AGENT_IDS = ("A", "B", "C")
+LEGACY_SCHEMA_VERSION = 6
 
 DEFAULT_INNER_SYSTEM_PROMPT = """\
 你是一个人的内层人格，是这个人内在更直接、感性和原始的一面。
@@ -187,31 +189,53 @@ class ExternalEvent(ApiModel):
 
 
 class InnerTurn(ApiModel):
-    """One confirmed inner-layer model call."""
+    """One confirmed inner-layer model call.
+
+    A single inner turn consumes every event that was queued for the Agent
+    at the start of the round, so it stores the full consumed batch and the
+    ids of those events in FIFO order. ``event_ids`` aligns 1:1 with
+    ``consumed_events``.
+    """
 
     call_id: UUID
-    event_id: UUID
+    event_ids: list[UUID]
     sequence: int = Field(ge=1)
     input: str
     output: str
-    consumed_event: ExternalEvent
+    consumed_events: list[ExternalEvent]
 
     _validate_input = field_validator("input")(_strip_non_blank)
     _validate_output = field_validator("output")(_strip_non_blank)
 
     @model_validator(mode="after")
-    def validate_event_reference(self) -> Self:
-        """Require the turn to reference its embedded consumed event."""
-        if self.event_id != self.consumed_event.id:
-            raise ValueError("inner turn event_id must match consumed_event")
+    def validate_event_references(self) -> Self:
+        """Require each turn to embed its full consumed event batch."""
+        if not self.event_ids or not self.consumed_events:
+            raise ValueError("inner turn must consume at least one event")
+        if len(self.event_ids) != len(self.consumed_events):
+            raise ValueError(
+                "inner turn event_ids and consumed_events must align"
+            )
+        for event_id, event in zip(
+            self.event_ids, self.consumed_events, strict=True
+        ):
+            if event_id != event.id:
+                raise ValueError(
+                    "inner turn event_ids must match consumed_events"
+                )
         return self
 
 
 class OuterTurn(ApiModel):
-    """One confirmed outer-layer model call and its routed event reference."""
+    """One confirmed outer-layer model call and its routed event reference.
+
+    ``event_ids`` mirrors the event batch consumed by the matching inner
+    turn. ``generated_event_id`` is the routed message that this outer turn
+    produces for its recipient's queue.
+    """
 
     call_id: UUID
-    event_id: UUID
+    event_ids: list[UUID]
     sequence: int = Field(ge=1)
     input: str
     output: str
@@ -267,7 +291,7 @@ class Agent(ApiModel):
             self.outer_context.turns,
             strict=False,
         ):
-            if inner_turn.event_id != outer_turn.event_id:
+            if inner_turn.event_ids != outer_turn.event_ids:
                 raise ValueError("inner and outer turn events must align")
         if any(
             left.sequence >= right.sequence
@@ -290,9 +314,14 @@ class ConfirmedCallReference(ApiModel):
 
 
 class Scene(ApiModel):
-    """A schema-v6 scene containing exactly three two-layer Agents."""
+    """A schema-v7 scene containing exactly three two-layer Agents.
 
-    schema_version: Literal[6] = SCHEMA_VERSION
+    Schema v6 raw files are migrated to v7 by ``migrate_v6_to_v7`` in the
+    storage layer before being validated as a ``Scene``. Earlier schemas
+    (v1-v5) are rejected without migration.
+    """
+
+    schema_version: Literal[7] = SCHEMA_VERSION
     id: UUID
     name: str
     model: str | None
@@ -328,7 +357,8 @@ class Scene(ApiModel):
                 _record_event(events, agent.id, event)
                 max_sequence = max(max_sequence, event.sequence)
             for turn in agent.inner_context.turns:
-                _record_event(events, agent.id, turn.consumed_event)
+                for consumed in turn.consumed_events:
+                    _record_event(events, agent.id, consumed)
                 reference = ConfirmedCallReference(
                     call_id=turn.call_id,
                     agent_id=agent.id,
@@ -341,11 +371,12 @@ class Scene(ApiModel):
                     turn.sequence,
                     reference,
                 )
-                max_sequence = max(
-                    max_sequence,
-                    turn.sequence,
-                    turn.consumed_event.sequence,
-                )
+                for consumed in turn.consumed_events:
+                    max_sequence = max(
+                        max_sequence,
+                        turn.sequence,
+                        consumed.sequence,
+                    )
             for turn in agent.outer_context.turns:
                 recipient_id, body = parse_addressed_message(
                     turn.output,
@@ -369,6 +400,8 @@ class Scene(ApiModel):
                     reference,
                 )
                 generated_events.append((agent.id, turn))
+                if not turn.event_ids:
+                    raise ValueError("outer turn must reference inner events")
                 max_sequence = max(max_sequence, turn.sequence)
 
         calls.sort(key=lambda item: item[0])
@@ -515,7 +548,7 @@ class LayerDraftResponse(ApiModel):
 
     layer: Layer
     call_id: UUID
-    event_id: UUID
+    event_ids: list[UUID]
     content: str
     reasoning: list[ModelReasoningBlock]
     usage: TokenUsage
@@ -526,10 +559,14 @@ class LayerDraftResponse(ApiModel):
 
 
 class ConfirmLayerRequest(ApiModel):
-    """Browser-held generation identity and editable confirmed output."""
+    """Browser-held generation identity and editable confirmed output.
+
+    ``event_ids`` is the ordered batch this confirmation must match against
+    the rebuilt ``build_inner_input`` / ``build_outer_input`` state.
+    """
 
     call_id: UUID
-    event_id: UUID
+    event_ids: list[UUID]
     content: str
     state_token: str = Field(min_length=64, max_length=64)
 
@@ -547,7 +584,7 @@ class ModelRequestPreviewResponse(ApiModel):
     """Protocol-neutral context for one selected persona layer."""
 
     layer: Layer
-    event_id: UUID
+    event_ids: list[UUID]
     context: list[ModelRequestContextItem]
 
 
@@ -567,8 +604,53 @@ class SceneModelBindingConflictError(RuntimeError):
     """Raised when replacing an existing scene model binding."""
 
 
+def _wrap_v6_inner_turn(raw: dict[str, Any]) -> dict[str, Any]:
+    """Convert one legacy single-event inner turn to the v7 batch form."""
+    if "consumed_events" in raw:
+        return raw
+    consumed = raw.pop("consumed_event", None)
+    event_id = raw.pop("event_id", None)
+    if consumed is None or event_id is None:
+        raise ValueError("legacy inner turn must have consumed_event")
+    raw["event_ids"] = [event_id]
+    raw["consumed_events"] = [consumed]
+    return raw
+
+
+def _wrap_v6_outer_turn(raw: dict[str, Any]) -> dict[str, Any]:
+    """Convert one legacy single-event outer turn to the v7 batch form."""
+    if "event_ids" in raw:
+        return raw
+    event_id = raw.pop("event_id", None)
+    if event_id is None:
+        raise ValueError("legacy outer turn must have event_id")
+    raw["event_ids"] = [event_id]
+    return raw
+
+
+def migrate_v6_to_v7(raw: dict[str, Any]) -> dict[str, Any]:
+    """Migrate one parsed schema-v6 raw scene to the schema-v7 batch form.
+
+    The migration is shallow and structural: it wraps each inner turn's
+    legacy ``consumed_event`` and ``event_id`` into single-element lists
+    and each outer turn's ``event_id`` into ``event_ids``. It does not
+    re-validate the scene; the caller (storage) runs ``Scene`` validation
+    on the migrated value. ``schema_version`` is set to 7.
+    """
+    migrated = deepcopy(raw)
+    for agent in migrated.get("agents", []):
+        inner_context = agent.get("inner_context", {})
+        for turn in inner_context.get("turns", []):
+            _wrap_v6_inner_turn(turn)
+        outer_context = agent.get("outer_context", {})
+        for turn in outer_context.get("turns", []):
+            _wrap_v6_outer_turn(turn)
+    migrated["schema_version"] = SCHEMA_VERSION
+    return migrated
+
+
 def create_scene(name: str, model: str) -> Scene:
-    """Create an empty schema-v6 scene bound to one configured model."""
+    """Create an empty schema-v7 scene bound to one configured model."""
     return Scene(
         id=uuid4(),
         name=name,
@@ -710,15 +792,30 @@ def delete_manual_event(
     return _replace_scene(scene, agents=agents)
 
 
-def build_inner_input(scene: Scene, agent_id: AgentId) -> tuple[UUID, str]:
-    """Build the exact next inner user text from the current FIFO head."""
+def _join_event_contents(events: list[ExternalEvent]) -> str:
+    """Render a FIFO event batch's contents joined by blank lines."""
+    return "\n\n".join(event.content for event in events)
+
+
+def build_inner_input(
+    scene: Scene,
+    agent_id: AgentId,
+) -> tuple[list[UUID], str]:
+    """Build the exact next inner user text from the current pending batch.
+
+    Every event currently in the queue is consumed in this round. Events are
+    presented in FIFO order under a single ``外部事件：`` block, separated
+    by blank lines. The optional prior outer-speech preamble is retained
+    verbatim and remains above the event block.
+    """
     agent = get_agent(scene, agent_id)
     if len(agent.inner_context.turns) != len(agent.outer_context.turns):
         raise SceneConflictError("The Agent is waiting for outer confirmation.")
     if not agent.pending_events:
         raise SceneConflictError("The Agent has no pending event.")
 
-    event = agent.pending_events[0]
+    events = list(agent.pending_events)
+    event_ids = [event.id for event in events]
     sections: list[str] = []
     if agent.outer_context.turns:
         previous_outer = agent.outer_context.turns[-1]
@@ -733,11 +830,13 @@ def build_inner_input(scene: Scene, agent_id: AgentId) -> tuple[UUID, str]:
             f"Agent {previous_outer.recipient_id}（{recipient.name}）说：\n"
             f"{body}"
         )
-    sections.append("外部事件：\n" + event.content)
-    return event.id, "\n\n".join(sections)
+    sections.append("外部事件：\n" + _join_event_contents(events))
+    return event_ids, "\n\n".join(sections)
 
 
-def build_outer_input(scene: Scene, agent_id: AgentId) -> tuple[UUID, str]:
+def build_outer_input(
+    scene: Scene, agent_id: AgentId
+) -> tuple[list[UUID], str]:
     """Build the exact outer user text for a confirmed inner half-round."""
     agent = get_agent(scene, agent_id)
     if len(agent.inner_context.turns) != len(agent.outer_context.turns) + 1:
@@ -746,10 +845,10 @@ def build_outer_input(scene: Scene, agent_id: AgentId) -> tuple[UUID, str]:
         )
     inner_turn = agent.inner_context.turns[-1]
     text = (
-        f"外部事件：\n{inner_turn.consumed_event.content}\n\n"
+        f"外部事件：\n{_join_event_contents(inner_turn.consumed_events)}\n\n"
         f"你内心有一个声音：\n{inner_turn.output}"
     )
-    return inner_turn.event_id, text
+    return inner_turn.event_ids, text
 
 
 def confirm_inner_turn(
@@ -758,21 +857,21 @@ def confirm_inner_turn(
     confirmation: ConfirmLayerRequest,
     actual_input: str,
 ) -> Scene:
-    """Consume the FIFO head and append one confirmed inner turn."""
-    event_id, expected_input = build_inner_input(scene, agent_id)
-    if confirmation.event_id != event_id or actual_input != expected_input:
+    """Consume the entire pending batch and append one confirmed inner turn."""
+    event_ids, expected_input = build_inner_input(scene, agent_id)
+    if confirmation.event_ids != event_ids or actual_input != expected_input:
         raise SceneConflictError("The inner draft is stale.")
     _require_new_call_id(scene, confirmation.call_id)
 
     agent = get_agent(scene, agent_id)
-    event = agent.pending_events[0]
+    events = list(agent.pending_events)
     turn = InnerTurn(
         call_id=confirmation.call_id,
-        event_id=event.id,
+        event_ids=[event.id for event in events],
         sequence=scene.next_sequence,
         input=actual_input,
         output=confirmation.content,
-        consumed_event=event,
+        consumed_events=events,
     )
     agents = [
         current.model_copy(
@@ -780,7 +879,7 @@ def confirm_inner_turn(
                 "inner_context": current.inner_context.model_copy(
                     update={"turns": [*current.inner_context.turns, turn]}
                 ),
-                "pending_events": current.pending_events[1:],
+                "pending_events": [],
             }
         )
         if current.id == agent_id
@@ -809,8 +908,8 @@ def confirm_outer_turn(
     actual_input: str,
 ) -> Scene:
     """Append one outer turn and atomically route its generated event."""
-    event_id, expected_input = build_outer_input(scene, agent_id)
-    if confirmation.event_id != event_id or actual_input != expected_input:
+    event_ids, expected_input = build_outer_input(scene, agent_id)
+    if confirmation.event_ids != event_ids or actual_input != expected_input:
         raise SceneConflictError("The outer draft is stale.")
     _require_new_call_id(scene, confirmation.call_id)
 
@@ -829,7 +928,7 @@ def confirm_outer_turn(
     )
     turn = OuterTurn(
         call_id=confirmation.call_id,
-        event_id=event_id,
+        event_ids=event_ids,
         sequence=scene.next_sequence,
         input=actual_input,
         output=canonical_output,
@@ -886,7 +985,7 @@ def _rollback_inner(
     scene: Scene,
     reference: ConfirmedCallReference,
 ) -> Scene:
-    """Remove the latest inner turn and restore its event at queue head."""
+    """Remove the latest inner turn and restore its consumed batch at queue head."""  # noqa: E501
     agent = get_agent(scene, reference.agent_id)
     if (
         not agent.inner_context.turns
@@ -896,6 +995,9 @@ def _rollback_inner(
         raise SceneConflictError("The rollback stack is inconsistent.")
     turn = agent.inner_context.turns[-1]
 
+    # Restore the consumed batch to the queue head, preserving its original
+    # FIFO order ahead of any events that arrived later.
+    restored = list(turn.consumed_events)
     agents = [
         current.model_copy(
             update={
@@ -903,7 +1005,7 @@ def _rollback_inner(
                     update={"turns": current.inner_context.turns[:-1]}
                 ),
                 "pending_events": [
-                    turn.consumed_event,
+                    *restored,
                     *current.pending_events,
                 ],
             }
@@ -986,8 +1088,9 @@ def _find_event(
             if event.id == event_id:
                 return agent.id, "pending", event
         for turn in agent.inner_context.turns:
-            if turn.consumed_event.id == event_id:
-                return agent.id, "consumed", turn.consumed_event
+            for consumed in turn.consumed_events:
+                if consumed.id == event_id:
+                    return agent.id, "consumed", consumed
     raise EventNotFoundError(f"Event '{event_id}' does not exist.")
 
 

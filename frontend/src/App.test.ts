@@ -35,7 +35,7 @@ type RouteHandler =
 
 function makeScene(): Scene {
   return {
-    schema_version: 6,
+    schema_version: 7,
     id: SCENE_ID,
     name: "海边小镇",
     model: MODEL,
@@ -83,11 +83,11 @@ function halfRoundScene(): Scene {
   const scene = makeScene();
   scene.agents[0].inner_context.turns.push({
     call_id: INNER_CALL_ID,
-    event_id: EVENT_ID,
+    event_ids: [EVENT_ID],
     sequence: 2,
     input: "外部事件：\n海面突然起雾。",
     output: "先观察风向。\n别急着靠岸。",
-    consumed_event: manualEvent(),
+    consumed_events: [manualEvent()],
   });
   scene.rollback_stack.push({
     call_id: INNER_CALL_ID,
@@ -102,7 +102,7 @@ function completeScene(): Scene {
   const scene = halfRoundScene();
   scene.agents[0].outer_context.turns.push({
     call_id: OUTER_CALL_ID,
-    event_id: EVENT_ID,
+    event_ids: [EVENT_ID],
     sequence: 3,
     input:
       "外部事件：\n海面突然起雾。\n\n" +
@@ -132,7 +132,7 @@ function innerDraft(): LayerDraftResponse {
   return {
     layer: "inner",
     call_id: INNER_CALL_ID,
-    event_id: EVENT_ID,
+    event_ids: [EVENT_ID],
     content: "先观察风向。",
     reasoning: [
       { type: "thinking", text: "临时判断，不应持久化" },
@@ -414,7 +414,7 @@ describe("App", () => {
 
     expect(confirmationBody).toEqual({
       call_id: INNER_CALL_ID,
-      event_id: EVENT_ID,
+      event_ids: [EVENT_ID],
       content: "先观察。\n也许只是天气。",
       state_token: STATE_TOKEN,
     });
@@ -501,7 +501,7 @@ describe("App", () => {
 
     expect(confirmationBody).toEqual({
       call_id: INNER_CALL_ID,
-      event_id: EVENT_ID,
+      event_ids: [EVENT_ID],
       content: "先观察风向。",
       state_token: STATE_TOKEN,
     });
@@ -584,7 +584,7 @@ describe("App", () => {
     scene.model = "gpt-test";
     const preview: ModelRequestPreviewResponse = {
       layer: "outer",
-      event_id: EVENT_ID,
+      event_ids: [EVENT_ID],
       context: [
         { role: "system", text: "OUTER A" },
         { role: "user", text: "上一轮外层输入" },
@@ -644,5 +644,58 @@ describe("App", () => {
     );
     expect(container.textContent).toContain("等待外层人格");
     expect(container.querySelectorAll(".timeline-item--outer")).toHaveLength(0);
+  });
+
+  it("sends batch event_ids when confirming an inner draft", async () => {
+    const firstEvent = manualEvent(
+      "第一件事",
+      EVENT_ID,
+      1,
+    );
+    const secondEvent = manualEvent(
+      "第二件事",
+      "77777777-7777-4777-8777-777777777777",
+      2,
+    );
+    const scene = pendingScene();
+    scene.agents[0].pending_events = [firstEvent, secondEvent];
+    scene.next_sequence = 3;
+    const innerBatchDraft: LayerDraftResponse = {
+      ...innerDraft(),
+      event_ids: [firstEvent.id, secondEvent.id],
+    };
+    const confirmedInner = halfRoundScene();
+    confirmedInner.agents[0].inner_context.turns[0].event_ids = [
+      firstEvent.id,
+      secondEvent.id,
+    ];
+    confirmedInner.agents[0].inner_context.turns[0].consumed_events = [
+      firstEvent,
+      secondEvent,
+    ];
+    confirmedInner.agents[0].pending_events = [];
+    let confirmationBody: unknown;
+    await mountOpenedScene(scene, {
+      [`POST /api/scenes/${SCENE_ID}/agents/A/inner-drafts`]:
+        jsonResponse(innerBatchDraft),
+      [`POST /api/scenes/${SCENE_ID}/agents/A/inner-confirmations`]: (
+        init,
+      ) => {
+        confirmationBody = JSON.parse(String(init?.body));
+        return jsonResponse(confirmedInner);
+      },
+    });
+
+    findButton(container, "生成内层草稿").click();
+    await flush();
+    findButton(container, "确认内层").click();
+    await flush();
+
+    expect(confirmationBody).toEqual({
+      call_id: INNER_CALL_ID,
+      event_ids: [firstEvent.id, secondEvent.id],
+      content: "先观察风向。",
+      state_token: STATE_TOKEN,
+    });
   });
 });

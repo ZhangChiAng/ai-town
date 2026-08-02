@@ -218,7 +218,13 @@ const mixedTimeline = computed<TimelineItem[]>(() => {
 
   const items: TimelineItem[] = [];
   for (const turn of agent.inner_context.turns) {
-    items.push(eventTimelineItem(turn.consumed_event, "已处理"));
+    // A single inner round now consumes the whole queued batch at once, so
+    // every consumed event is shown before its shared inner output. Event
+    // sequence order alone is enough because the batch only ever contains
+    // events that arrived before this turn's call sequence.
+    for (const consumed of turn.consumed_events) {
+      items.push(eventTimelineItem(consumed, "已处理"));
+    }
     items.push({
       key: `inner:${turn.call_id}`,
       sequence: turn.sequence,
@@ -633,7 +639,7 @@ async function confirmDraft(): Promise<void> {
       draft.layer,
       {
         call_id: draft.call_id,
-        event_id: draft.event_id,
+        event_ids: draft.event_ids,
         content: draft.content,
         state_token: draft.state_token,
       },
@@ -1042,7 +1048,7 @@ onBeforeUnmount(() => {
                   <p>
                     {{
                       activeStage === "inner"
-                        ? "可使用多行自然文本；确认后消费队首事件。"
+                        ? "可使用多行自然文本；确认后一次性消费本 Agent 队列中的全部待处理事件。"
                         : "必须为单行 To X: 正文；确认后才会路由事件。"
                     }}
                   </p>

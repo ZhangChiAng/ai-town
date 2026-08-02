@@ -55,7 +55,7 @@ class DraftPreview:
     """Protocol-neutral readable context for one model request."""
 
     layer: Layer
-    event_id: UUID
+    event_ids: tuple[UUID, ...]
     context: tuple[DraftContextItem, ...]
 
 
@@ -63,8 +63,8 @@ class DraftPreview:
 class _DraftCallContext:
     """Protocol-neutral business context for one preview or generation."""
 
-    event_id: UUID
-    event: ExternalEvent
+    event_ids: tuple[UUID, ...]
+    events: tuple[ExternalEvent, ...]
     conversation: ModelConversation
 
 
@@ -91,7 +91,7 @@ class DraftWorkflow:
         draft = self._build_call_context(scene, agent_id, layer)
         return DraftPreview(
             layer=layer,
-            event_id=draft.event_id,
+            event_ids=draft.event_ids,
             context=build_readable_context(draft.conversation),
         )
 
@@ -107,8 +107,22 @@ class DraftWorkflow:
         backend_failed = False
         try:
             generation = await self._backend.generate(draft.conversation)
-        except Exception:
-            # Provider bodies and credentials never cross this boundary.
+        except Exception as exc:
+            # Provider bodies and credentials never cross this boundary; log
+            # only the safe business context plus exception type. The backend
+            # layer is responsible for recording its own safe details; here we
+            # avoid echoing upstream exception strings or tracebacks, which may
+            # carry URLs, request bodies, or credentials.
+            LOGGER.warning(
+                "model generation failed: scene=%s agent=%s layer=%s "
+                "event=%s model=%s exc_type=%s",
+                scene.id,
+                agent_id,
+                layer,
+                draft.event_ids,
+                self._model,
+                type(exc).__name__,
+            )
             backend_failed = True
 
         if backend_failed or generation is None:
@@ -122,7 +136,17 @@ class DraftWorkflow:
             except ValueError:
                 invalid_outer = True
         if invalid_outer:
-            # Visible output validation is distinct from backend failures.
+            # Visible output validation is distinct from backend failures; the
+            # raw LLM content is the only way to diagnose format problems.
+            LOGGER.warning(
+                "invalid outer draft: scene=%s agent=%s event=%s model=%s "
+                "content=%r",
+                scene.id,
+                agent_id,
+                draft.event_ids,
+                self._model,
+                generation.content,
+            )
             raise DraftGenerationError(
                 "Model returned an invalid outer draft."
             ) from None
@@ -138,7 +162,7 @@ class DraftWorkflow:
         result = LayerDraftResponse(
             layer=layer,
             call_id=uuid4(),
-            event_id=draft.event_id,
+            event_ids=list(draft.event_ids),
             content=generation.content,
             reasoning=[
                 ModelReasoningBlock(type=block.type, text=block.text)
@@ -150,7 +174,7 @@ class DraftWorkflow:
                 scene.model,
                 agent_id,
                 layer,
-                draft.event,
+                draft.events,
                 draft.conversation,
             ),
         )
@@ -165,14 +189,14 @@ class DraftWorkflow:
     ) -> _DraftCallContext:
         """Build one protocol-neutral conversation exactly once."""
         _require_matching_model(scene, self.model)
-        event_id, event, conversation = build_model_conversation(
+        event_ids, events, conversation = build_model_conversation(
             scene,
             agent_id,
             layer,
         )
         return _DraftCallContext(
-            event_id=event_id,
-            event=event,
+            event_ids=event_ids,
+            events=events,
             conversation=conversation,
         )
 
@@ -181,18 +205,18 @@ def build_model_conversation(
     scene: Scene,
     agent_id: AgentId,
     layer: Layer,
-) -> tuple[UUID, ExternalEvent, ModelConversation]:
+) -> tuple[tuple[UUID, ...], tuple[ExternalEvent, ...], ModelConversation]:
     """Build only the selected persona layer's complete visible context."""
     agent = get_agent(scene, agent_id)
     if layer == "inner":
-        event_id, current_input = build_inner_input(scene, agent_id)
-        event = agent.pending_events[0]
+        event_ids, current_input = build_inner_input(scene, agent_id)
+        events = tuple(agent.pending_events)
         system_prompt = agent.inner_context.system_prompt
         saved_turns = agent.inner_context.turns
     else:
-        event_id, current_input = build_outer_input(scene, agent_id)
+        event_ids, current_input = build_outer_input(scene, agent_id)
         inner_turn = agent.inner_context.turns[-1]
-        event = inner_turn.consumed_event
+        events = tuple(inner_turn.consumed_events)
         system_prompt = agent.outer_context.system_prompt
         saved_turns: list[OuterTurn] = agent.outer_context.turns
 
@@ -204,7 +228,7 @@ def build_model_conversation(
         ),
         current_input=current_input,
     )
-    return event_id, event, conversation
+    return tuple(event_ids), events, conversation
 
 
 def build_readable_context(
@@ -235,7 +259,7 @@ def draft_state_token(
         raise SceneConflictError(
             "Scene must be bound to a model before draft confirmation."
         )
-    _event_id, event, conversation = build_model_conversation(
+    _event_ids, events, conversation = build_model_conversation(
         scene,
         agent_id,
         layer,
@@ -244,7 +268,7 @@ def draft_state_token(
         scene.model,
         agent_id,
         layer,
-        event,
+        events,
         conversation,
     )
 
@@ -256,18 +280,18 @@ def confirm_draft(
     confirmation: ConfirmLayerRequest,
 ) -> Scene:
     """Confirm against current business state without resolving a backend."""
-    event_id, _event, conversation = build_model_conversation(
+    event_ids, _events, conversation = build_model_conversation(
         scene,
         agent_id,
         layer,
     )
-    if confirmation.event_id != event_id:
+    if list(confirmation.event_ids) != list(event_ids):
         raise SceneConflictError("The draft event is no longer current.")
     current_token = _state_token(
         scene.model,
         agent_id,
         layer,
-        _event,
+        _events,
         conversation,
     )
     if not hmac.compare_digest(confirmation.state_token, current_token):
@@ -313,7 +337,7 @@ def _state_token(
     model: str | None,
     agent_id: AgentId,
     layer: Layer,
-    event: ExternalEvent,
+    events: tuple[ExternalEvent, ...],
     conversation: ModelConversation,
 ) -> str:
     """Hash only model identity and protocol-neutral conversation state."""
@@ -325,7 +349,7 @@ def _state_token(
         "model": model,
         "agent_id": agent_id,
         "layer": layer,
-        "event": event.model_dump(mode="json"),
+        "events": [event.model_dump(mode="json") for event in events],
         "system_prompt": conversation.system_prompt,
         "turns": [
             {"input": turn.input, "output": turn.output}

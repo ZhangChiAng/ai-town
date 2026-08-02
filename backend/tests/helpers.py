@@ -208,7 +208,7 @@ def confirm_draft(
         f"/api/scenes/{scene_id}/agents/{agent_id}/{layer}-confirmations",
         json={
             "call_id": draft["call_id"],
-            "event_id": draft["event_id"],
+            "event_ids": draft["event_ids"],
             "content": draft["content"] if content is None else content,
             "state_token": draft["state_token"],
         },
@@ -222,7 +222,7 @@ def confirmation(
     """Convert one workflow draft object to the confirmation DTO."""
     return ConfirmLayerRequest(
         call_id=draft.call_id,
-        event_id=draft.event_id,
+        event_ids=list(draft.event_ids),
         content=draft.content if content is None else content,
         state_token=draft.state_token,
     )

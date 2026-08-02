@@ -399,7 +399,7 @@ def create_app(
         )
         return ModelRequestPreviewResponse(
             layer=preview.layer,
-            event_id=preview.event_id,
+            event_ids=list(preview.event_ids),
             context=[
                 ModelRequestContextItem(role=item.role, text=item.text)
                 for item in preview.context

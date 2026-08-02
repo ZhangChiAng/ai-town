@@ -176,7 +176,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
             "model-request-preview?layer=inner"
         )
     )
-    assert set(first_preview) == {"layer", "event_id", "context"}
+    assert set(first_preview) == {"layer", "event_ids", "context"}
     assert first_preview["context"] == [
         {"role": "system", "text": "A INNER SYSTEM"},
         {"role": "user", "text": "外部事件：\nA FIRST EVENT"},
@@ -225,7 +225,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
             "model-request-preview?layer=outer"
         )
     )
-    assert set(outer_preview) == {"layer", "event_id", "context"}
+    assert set(outer_preview) == {"layer", "event_ids", "context"}
     assert outer_preview["context"] == [
         {"role": "system", "text": "A OUTER SYSTEM"},
         {"role": "user", "text": outer_input},
@@ -264,7 +264,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
             "model-request-preview?layer=inner"
         )
     )
-    assert set(later_preview) == {"layer", "event_id", "context"}
+    assert set(later_preview) == {"layer", "event_ids", "context"}
     assert later_preview["context"] == [
         {"role": "system", "text": "A INNER SYSTEM"},
         {"role": "user", "text": "外部事件：\nA FIRST EVENT"},

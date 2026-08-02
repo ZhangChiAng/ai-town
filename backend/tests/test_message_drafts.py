@@ -60,7 +60,7 @@ def test_first_inner_and_outer_inputs_are_exact() -> None:
         "外部事件：\n门外传来两声敲门。\n\n"
         "你内心有一个声音：\n先别开门。\n问清楚是谁。"
     )
-    assert outer.event_id == inner.event_id
+    assert outer.event_ids == inner.event_ids
 
 
 @pytest.mark.parametrize("recipient_id", ["B", "C"])

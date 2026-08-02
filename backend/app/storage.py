@@ -1,4 +1,4 @@
-"""Atomic JSON-file persistence for schema-v6 scenes."""
+"""Atomic JSON-file persistence for schema-v7 two-layer scenes."""
 
 import contextlib
 import json
@@ -11,7 +11,13 @@ from uuid import UUID
 
 from pydantic import ValidationError
 
-from app.models import Scene, SceneSummary
+from app.models import (
+    LEGACY_SCHEMA_VERSION,
+    SCHEMA_VERSION,
+    Scene,
+    SceneSummary,
+    migrate_v6_to_v7,
+)
 
 
 class SceneStorageError(RuntimeError):
@@ -125,12 +131,30 @@ class SceneStorage:
             ) from error
 
         try:
-            scene = Scene.model_validate(json.loads(contents))
-        except (json.JSONDecodeError, TypeError, ValidationError) as error:
-            # Old schemas are intentionally unsupported; no in-memory upgrade
-            # path may silently change the new experiment's information model.
+            raw = json.loads(contents)
+        except (json.JSONDecodeError, TypeError) as error:
             raise SceneReadError(
-                f"Scene file '{path.name}' is not schema v6 or is corrupted."
+                f"Scene file '{path.name}' is not valid JSON or is corrupted."
+            ) from error
+
+        # Earlier single-layer schemas are intentionally unsupported; no
+        # in-memory upgrade path may silently change the experiment's
+        # information model. Only the previous batch-consumption schema (v6)
+        # is migrated forward to the current v7 batch form before validation.
+        version = raw.get("schema_version") if isinstance(raw, dict) else None
+        if version == LEGACY_SCHEMA_VERSION:
+            raw = migrate_v6_to_v7(raw)
+        elif version != SCHEMA_VERSION:
+            raise SceneReadError(
+                f"Scene file '{path.name}' is not schema v{SCHEMA_VERSION} "
+                "or v6."
+            )
+
+        try:
+            scene = Scene.model_validate(raw)
+        except (ValidationError, TypeError, ValueError) as error:
+            raise SceneReadError(
+                f"Scene file '{path.name}' is corrupted."
             ) from error
 
         file_id = expected_id

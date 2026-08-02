@@ -1,4 +1,4 @@
-"""API and persistence tests for schema-v6 two-layer scenes."""
+"""API and persistence tests for schema-v7 two-layer scenes."""
 
 import json
 from copy import deepcopy
@@ -157,7 +157,7 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
     client, _model = make_client(scene_directory)
     scene = post_scene(client)
 
-    assert scene["schema_version"] == SCHEMA_VERSION == 6
+    assert scene["schema_version"] == SCHEMA_VERSION == 7
     assert [agent["id"] for agent in scene["agents"]] == ["A", "B", "C"]
     assert set(scene) == {
         "schema_version",
@@ -210,7 +210,7 @@ def test_old_schema_is_rejected_without_migration(
     original = json.dumps(raw).encode()
     path.write_bytes(original)
 
-    with pytest.raises(SceneReadError, match="not schema v6"):
+    with pytest.raises(SceneReadError, match="not schema v7 or v6"):
         SceneStorage(scene_directory).get(scene_id)
 
     assert path.read_bytes() == original
@@ -313,7 +313,7 @@ def test_generation_writes_nothing_and_two_confirmations_route_atomically(
     before_inner_generation = path.read_bytes()
     inner = generate(client, scene["id"], "A", "inner")
     assert path.read_bytes() == before_inner_generation
-    assert inner["event_id"] == scene["agents"][0]["pending_events"][0]["id"]
+    assert inner["event_ids"] == [scene["agents"][0]["pending_events"][0]["id"]]
     assert inner["content"] == "先观察。\n别急着表态。"
 
     inner_response = confirm(client, scene["id"], "A", "inner", inner)
@@ -323,7 +323,9 @@ def test_generation_writes_nothing_and_two_confirmations_route_atomically(
     inner_turn = half_round["agents"][0]["inner_context"]["turns"][0]
     assert inner_turn["input"] == "外部事件：\n潮水突然退了。"
     assert inner_turn["output"] == inner["content"]
-    assert inner_turn["consumed_event"]["id"] == inner["event_id"]
+    assert [event["id"] for event in inner_turn["consumed_events"]] == (
+        inner["event_ids"]
+    )
     assert half_round["agents"][0]["outer_context"]["turns"] == []
 
     before_outer_generation = path.read_bytes()
@@ -523,6 +525,275 @@ def test_global_rollback_undoes_exactly_one_confirmed_call(
     assert (
         scene_directory / f"{scene['id']}.json"
     ).read_bytes() == before_conflict
+
+
+def test_inner_round_consumes_the_whole_pending_batch_at_once(
+    scene_directory: Path,
+) -> None:
+    """One inner confirmation consumes and persists the entire FIFO batch."""
+    client, _model = make_client(
+        scene_directory,
+        ["A 内层", "To B: A 外层"],
+    )
+    scene = post_scene(client)
+    scene = post_event(client, scene["id"], "A", "第一件事")
+    scene = post_event(client, scene["id"], "A", "第二件事")
+    event_ids = [event["id"] for event in scene["agents"][0]["pending_events"]]
+    assert len(event_ids) == 2
+
+    inner = generate(client, scene["id"], "A", "inner")
+    assert inner["event_ids"] == event_ids
+    # Both events appear in one block, separated by a blank line.
+    assert inner["content"] == "A 内层"
+    preview = client.get(
+        f"/api/scenes/{scene['id']}/agents/A/model-request-preview?layer=inner"
+    ).json()
+    assert preview["event_ids"] == event_ids
+    assert preview["context"][-1]["text"] == (
+        "外部事件：\n第一件事\n\n第二件事"
+    )
+
+    scene = confirm(client, scene["id"], "A", "inner", inner).json()
+    assert scene["agents"][0]["pending_events"] == []
+    inner_turn = scene["agents"][0]["inner_context"]["turns"][0]
+    assert inner_turn["event_ids"] == event_ids
+    assert [event["content"] for event in inner_turn["consumed_events"]] == [
+        "第一件事",
+        "第二件事",
+    ]
+
+    # Outer input reproduces the same batch verbatim.
+    outer = generate(client, scene["id"], "A", "outer")
+    assert outer["event_ids"] == event_ids
+    assert client.get(
+        f"/api/scenes/{scene['id']}/agents/A/model-request-preview?layer=outer"
+    ).json()["context"][-1]["text"] == (
+        "外部事件：\n第一件事\n\n第二件事\n\n你内心有一个声音：\nA 内层"
+    )
+    scene = confirm(client, scene["id"], "A", "outer", outer).json()
+    outer_turn = scene["agents"][0]["outer_context"]["turns"][0]
+    assert outer_turn["event_ids"] == event_ids
+
+
+def test_rollback_inner_restores_the_consumed_batch_in_fifo_order(
+    scene_directory: Path,
+) -> None:
+    """Undoing an inner batch restores every consumed event in order."""
+    client, _model = make_client(
+        scene_directory,
+        ["A 内层", "To C: A 外层"],
+    )
+    scene = post_scene(client)
+    scene = post_event(client, scene["id"], "A", "第一件事")
+    scene = post_event(client, scene["id"], "A", "第二件事")
+    first_id = scene["agents"][0]["pending_events"][0]["id"]
+    second_id = scene["agents"][0]["pending_events"][1]["id"]
+
+    inner = generate(client, scene["id"], "A", "inner")
+    scene = confirm(client, scene["id"], "A", "inner", inner).json()
+    assert scene["agents"][0]["pending_events"] == []
+
+    undone = client.post(f"/api/scenes/{scene['id']}/rollback").json()
+    restored = undone["agents"][0]["pending_events"]
+    assert [event["id"] for event in restored] == [first_id, second_id]
+    assert undone["agents"][0]["inner_context"]["turns"] == []
+
+
+def test_v6_scene_is_migrated_to_v7_on_read(
+    scene_directory: Path,
+) -> None:
+    """A legacy single-event v6 file loads as a v7 batch scene and persists."""
+    scene_directory.mkdir()
+    scene_id = uuid4()
+    path = scene_directory / f"{scene_id}.json"
+    legacy = {
+        "schema_version": 6,
+        "id": str(scene_id),
+        "name": "旧 v6 场景",
+        "model": MODEL,
+        "agents": [
+            {
+                "id": agent_id,
+                "name": agent_id,
+                "inner_context": {
+                    "system_prompt": f"INNER {agent_id}",
+                    "turns": [],
+                },
+                "outer_context": {
+                    "system_prompt": f"OUTER {agent_id}",
+                    "turns": [],
+                },
+                "pending_events": [],
+            }
+            for agent_id in ("A", "B", "C")
+        ],
+        "rollback_stack": [],
+        "next_sequence": 1,
+    }
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    scene = SceneStorage(scene_directory).get(scene_id)
+    assert scene.schema_version == 7
+    # A migrated v6 scene round-trips through validation and back to disk.
+    SceneStorage(scene_directory).save(scene)
+    reloaded = SceneStorage(scene_directory).get(scene_id)
+    assert reloaded == scene
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["schema_version"] == 7
+
+
+def test_v6_scene_with_confirmed_turn_is_migrated_to_v7_batches(
+    scene_directory: Path,
+) -> None:
+    """Legacy inner/outer turns keep references via single-item v7 batches."""  # noqa: E501
+    scene_directory.mkdir()
+    scene_id = uuid4()
+    path = scene_directory / f"{scene_id}.json"
+    event_id = str(uuid4())
+    inner_call_id = str(uuid4())
+    outer_call_id = str(uuid4())
+    outer_sequence = 3
+    inner_sequence = 2
+    event_sequence = 1
+    legacy = {
+        "schema_version": 6,
+        "id": str(scene_id),
+        "name": "v6 带回合",
+        "model": MODEL,
+        "agents": [
+            {
+                "id": "A",
+                "name": "A",
+                "inner_context": {
+                    "system_prompt": "INNER A",
+                    "turns": [
+                        {
+                            "call_id": inner_call_id,
+                            "event_id": event_id,
+                            "sequence": inner_sequence,
+                            "input": "外部事件：\n单一事件",
+                            "output": "内层判断",
+                            "consumed_event": {
+                                "id": event_id,
+                                "sequence": event_sequence,
+                                "kind": "manual",
+                                "content": "单一事件",
+                                "source_agent_id": None,
+                                "source_call_id": None,
+                            },
+                        }
+                    ],
+                },
+                "outer_context": {
+                    "system_prompt": "OUTER A",
+                    "turns": [
+                        {
+                            "call_id": outer_call_id,
+                            "event_id": event_id,
+                            "sequence": outer_sequence,
+                            "input": "外部事件：\n单一事件\n\n",
+                            "output": "To B: 外层台词",
+                            "recipient_id": "B",
+                            "generated_event_id": "ignored",
+                        }
+                    ],
+                },
+                "pending_events": [],
+            },
+            {
+                "id": "B",
+                "name": "B",
+                "inner_context": {
+                    "system_prompt": "INNER B",
+                    "turns": [],
+                },
+                "outer_context": {
+                    "system_prompt": "OUTER B",
+                    "turns": [],
+                },
+                "pending_events": [],
+            },
+            {
+                "id": "C",
+                "name": "C",
+                "inner_context": {
+                    "system_prompt": "INNER C",
+                    "turns": [],
+                },
+                "outer_context": {
+                    "system_prompt": "OUTER C",
+                    "turns": [],
+                },
+                "pending_events": [],
+            },
+        ],
+        "rollback_stack": [
+            {
+                "call_id": inner_call_id,
+                "agent_id": "A",
+                "layer": "inner",
+            },
+            {
+                "call_id": outer_call_id,
+                "agent_id": "A",
+                "layer": "outer",
+            },
+        ],
+        "next_sequence": 4,
+    }
+    # Make the routed event observable for B so outer routing is consistent.
+    generated_event_id = str(uuid4())
+    legacy["agents"][1]["pending_events"].append(
+        {
+            "id": generated_event_id,
+            "sequence": outer_sequence,
+            "kind": "agent_message",
+            "content": "From A: 外层台词",
+            "source_agent_id": "A",
+            "source_call_id": outer_call_id,
+        }
+    )
+    legacy["agents"][0]["outer_context"]["turns"][0]["generated_event_id"] = (
+        generated_event_id
+    )
+    path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+
+    scene = SceneStorage(scene_directory).get(scene_id)
+    inner_turn = scene.agents[0].inner_context.turns[0]
+    outer_turn = scene.agents[0].outer_context.turns[0]
+    assert scene.schema_version == 7
+    assert inner_turn.event_ids == [UUID(event_id)]
+    assert [event.id for event in inner_turn.consumed_events] == [
+        UUID(event_id)
+    ]
+    assert outer_turn.event_ids == [UUID(event_id)]
+    assert outer_turn.generated_event_id == UUID(generated_event_id)
+
+
+def test_inner_draft_goes_stale_when_a_new_event_arrives_before_confirm(
+    scene_directory: Path,
+) -> None:
+    """A generated inner draft is rejected once the queue content changes."""
+    client, _model = make_client(
+        scene_directory,
+        ["A 内层", "To C: A 外层"],
+    )
+    scene = post_scene(client)
+    scene = post_event(client, scene["id"], "A", "第一件事")
+    draft = generate(client, scene["id"], "A", "inner")
+    assert draft["event_ids"] == [scene["agents"][0]["pending_events"][0]["id"]]
+
+    newer = post_event(client, scene["id"], "A", "第二件事")
+    assert len(newer["agents"][0]["pending_events"]) == 2
+
+    stale_response = confirm(client, scene["id"], "A", "inner", draft)
+    assert stale_response.status_code == 409
+    # No partial write happened: the queue still holds both events.
+    persisted = SceneStorage(scene_directory).get(UUID(scene["id"]))
+    assert [event.content for event in persisted.agents[0].pending_events] == [
+        "第一件事",
+        "第二件事",
+    ]
 
 
 def test_removed_single_layer_endpoints_are_absent(

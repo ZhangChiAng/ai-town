@@ -75,7 +75,9 @@ def test_preview_exposes_neutral_context_without_backend_call() -> None:
         ("user", "外部事件：\na private event"),
     ]
     assert preview.layer == "inner"
-    assert preview.event_id == scene.agents[0].pending_events[0].id
+    assert list(preview.event_ids) == [
+        event.id for event in scene.agents[0].pending_events
+    ]
 
 
 def test_generation_calls_once_and_maps_snapshot_and_observer_metadata() -> (

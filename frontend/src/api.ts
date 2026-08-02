@@ -115,11 +115,15 @@ function isInnerTurn(value: unknown): value is InnerTurn {
   return (
     isRecord(value) &&
     typeof value.call_id === "string" &&
-    typeof value.event_id === "string" &&
+    Array.isArray(value.event_ids) &&
+    value.event_ids.every((id): id is string => typeof id === "string") &&
+    value.event_ids.length > 0 &&
     isPositiveInteger(value.sequence) &&
     typeof value.input === "string" &&
     typeof value.output === "string" &&
-    isEvent(value.consumed_event)
+    Array.isArray(value.consumed_events) &&
+    value.consumed_events.length > 0 &&
+    value.consumed_events.every(isEvent)
   );
 }
 
@@ -127,7 +131,9 @@ function isOuterTurn(value: unknown): value is OuterTurn {
   return (
     isRecord(value) &&
     typeof value.call_id === "string" &&
-    typeof value.event_id === "string" &&
+    Array.isArray(value.event_ids) &&
+    value.event_ids.every((id): id is string => typeof id === "string") &&
+    value.event_ids.length > 0 &&
     isPositiveInteger(value.sequence) &&
     typeof value.input === "string" &&
     typeof value.output === "string" &&
@@ -159,7 +165,7 @@ function isAgent(value: unknown): value is Agent {
 function isScene(value: unknown): value is Scene {
   return (
     isRecord(value) &&
-    value.schema_version === 6 &&
+    value.schema_version === 7 &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     (value.model === null ||
@@ -193,7 +199,9 @@ function isLayerDraft(value: unknown): value is LayerDraftResponse {
     isRecord(value) &&
     isLayer(value.layer) &&
     typeof value.call_id === "string" &&
-    typeof value.event_id === "string" &&
+    Array.isArray(value.event_ids) &&
+    value.event_ids.every((id): id is string => typeof id === "string") &&
+    value.event_ids.length > 0 &&
     typeof value.content === "string" &&
     value.content.trim() !== "" &&
     Array.isArray(value.reasoning) &&
@@ -211,7 +219,9 @@ function isPreview(
     isRecord(value) &&
     Object.keys(value).length === 3 &&
     isLayer(value.layer) &&
-    typeof value.event_id === "string" &&
+    Array.isArray(value.event_ids) &&
+    value.event_ids.every((id): id is string => typeof id === "string") &&
+    value.event_ids.length > 0 &&
     Array.isArray(value.context) &&
     value.context.every(isModelRequestContextItem)
   );

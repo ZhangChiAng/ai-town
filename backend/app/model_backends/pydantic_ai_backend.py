@@ -1,6 +1,7 @@
 """Shared Pydantic AI Direct implementation of the model backend port."""
 
 import json
+import logging
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any, cast
@@ -13,6 +14,7 @@ from pydantic_ai import (
     ThinkingPart,
 )
 from pydantic_ai.direct import model_request
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
 
@@ -23,6 +25,8 @@ from app.model_backends.contracts import (
     ModelReasoning,
     ModelUsage,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 _SUPPORTED_PROVIDERS = frozenset({"anthropic", "openai"})
 _REQUEST_TIMEOUT_SECONDS = 60.0
@@ -80,6 +84,83 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
             raise ValueError("duplicate JSON object member")
         result[key] = value
     return result
+
+
+def _log_request_failure(provider: str, model: str, exc: BaseException) -> None:
+    """Record request-level failures without leaking URL/auth/credentials.
+
+    Pydantic AI's ModelHTTPError already strips transport credentials and
+    surfaces a decoded body; its traceback only reflects the raise site and
+    does not carry URLs or auth headers, so it is safe to include. For any
+    other exception we deliberately avoid the message and traceback, since
+    upstream SDK errors may embed request URLs, bodies, or credentials.
+    """
+    if isinstance(exc, ModelHTTPError):
+        LOGGER.exception(
+            "model request failed: provider=%s model=%s status=%s "
+            "provider_model=%s retry_after=%r body=%r",
+            provider,
+            model,
+            exc.status_code,
+            exc.model_name,
+            exc.retry_after,
+            exc.body,
+        )
+        return
+    LOGGER.warning(
+        "model request failed: provider=%s model=%s exc_type=%s",
+        provider,
+        model,
+        type(exc).__name__,
+    )
+
+
+def _summarize_response(response: ModelResponse) -> dict[str, object]:
+    """Project a ModelResponse into a safe, log-friendly summary.
+
+    Exposes only response-side fields: part types and visible/reasoning text.
+    Never includes request bodies, URLs, or credentials.
+    """
+    parts_summary: list[dict[str, object]] = []
+    for index, part in enumerate(response.parts):
+        entry: dict[str, object] = {"index": index, "kind": type(part).__name__}
+        if isinstance(part, TextPart):
+            entry["content"] = part.content
+        elif isinstance(part, ThinkingPart):
+            content = part.content
+            if isinstance(content, str):
+                # Reasoning can be very long; keep logs bounded.
+                entry["content"] = (
+                    content if len(content) <= 512 else content[:512] + "..."
+                )
+        parts_summary.append(entry)
+    usage = response.usage
+    return {
+        "parts": parts_summary,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "cache_write_tokens": usage.cache_write_tokens,
+        "cache_read_tokens": usage.cache_read_tokens,
+    }
+
+
+def _log_projection_failure(
+    provider: str,
+    model: str,
+    response: ModelResponse,
+    exc: BaseException,
+) -> None:
+    """Record projection/validation failures with the actual model output."""
+    LOGGER.warning(
+        "model output could not be projected: provider=%s model=%s "
+        "exc_type=%s message=%s response=%s",
+        provider,
+        model,
+        type(exc).__name__,
+        str(exc),
+        _summarize_response(response),
+        exc_info=True,
+    )
 
 
 async def _capture_request_body(request: httpx.Request) -> None:
@@ -166,8 +247,10 @@ class PydanticAIBackend:
                     model_settings=self._model_settings,
                     instrument=False,
                 )
-            except Exception:
-                # Provider exceptions can contain URLs, bodies, and credentials.
+            except Exception as exc:
+                # Provider exceptions can contain URLs, bodies, and credentials;
+                # surface their safe fields to the console before dropping them.
+                _log_request_failure(self._provider, self._model, exc)
                 request_failed = True
             else:
                 request_failed = False
@@ -176,9 +259,18 @@ class PydanticAIBackend:
                 # Raising after the handler also drops sensitive context.
                 raise RuntimeError("Pydantic AI model request failed") from None
 
-            snapshot = capture.require_snapshot()
-            assert response is not None
-            return _project_response(response, self._provider, snapshot)
+            try:
+                snapshot = capture.require_snapshot()
+                assert response is not None
+                return _project_response(response, self._provider, snapshot)
+            except Exception as exc:
+                # The request succeeded but the response cannot be
+                # projected; log the actual model output so invalid
+                # formats are diagnosable, then re-raise unchanged.
+                _log_projection_failure(
+                    self._provider, self._model, response, exc
+                )
+                raise
         finally:
             # A later call must never inherit this call's body or failure state.
             _ACTIVE_REQUEST_CAPTURE.reset(token)
