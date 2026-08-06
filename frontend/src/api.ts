@@ -149,12 +149,10 @@ function isAgent(value: unknown): value is Agent {
     typeof value.name === "string" &&
     isRecord(value.inner_context) &&
     typeof value.inner_context.system_prompt === "string" &&
-    value.inner_context.system_prompt.trim() !== "" &&
     Array.isArray(value.inner_context.turns) &&
     value.inner_context.turns.every(isInnerTurn) &&
     isRecord(value.outer_context) &&
     typeof value.outer_context.system_prompt === "string" &&
-    value.outer_context.system_prompt.trim() !== "" &&
     Array.isArray(value.outer_context.turns) &&
     value.outer_context.turns.every(isOuterTurn) &&
     Array.isArray(value.pending_events) &&

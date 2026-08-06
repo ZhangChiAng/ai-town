@@ -20,7 +20,6 @@ from app.models import (
     SceneConflictError,
     UpdateSceneRequest,
     add_manual_event,
-    create_scene,
     edit_manual_event,
     update_scene,
 )
@@ -28,6 +27,9 @@ from tests.helpers import (
     FakeBackend,
     confirmation,
     neutral_payload,
+)
+from tests.helpers import (
+    create_prompted_scene as prompted_scene,
 )
 
 MODEL = "fake/model-Case"
@@ -60,7 +62,7 @@ def _versioned_workflow(
 def test_preview_exposes_neutral_context_without_backend_call() -> None:
     """Readable preview builds only neutral context and never calls backend."""
     scene = add_manual_event(
-        create_scene("Preview", MODEL),
+        prompted_scene("Preview", MODEL),
         "A",
         "a private event",
     )
@@ -84,7 +86,7 @@ def test_generation_calls_once_and_maps_snapshot_and_observer_metadata() -> (
     None
 ):
     """One browser generation maps one backend call and its wire snapshot."""
-    scene = add_manual_event(create_scene("Generate", MODEL), "C", "event")
+    scene = add_manual_event(prompted_scene("Generate", MODEL), "C", "event")
     backend = FakeBackend(["inner answer"], model=MODEL)
 
     draft = _generate(DraftWorkflow(backend), scene, "C", "inner")
@@ -109,7 +111,7 @@ def test_generation_calls_once_and_maps_snapshot_and_observer_metadata() -> (
 
 def test_confirmation_has_no_backend_dependency_or_model_call() -> None:
     """A valid browser draft confirms after its backend is unavailable."""
-    scene = add_manual_event(create_scene("Confirm", MODEL), "A", "event")
+    scene = add_manual_event(prompted_scene("Confirm", MODEL), "A", "event")
     backend = FakeBackend(["inner answer"], model=MODEL)
     draft = _generate(DraftWorkflow(backend), scene, "A", "inner")
     calls_before = len(backend.generate_calls)
@@ -129,7 +131,7 @@ def test_confirmation_has_no_backend_dependency_or_model_call() -> None:
 
 def test_backend_payload_changes_do_not_change_state_token() -> None:
     """Transport-only adapter changes cannot make a browser draft stale."""
-    scene = add_manual_event(create_scene("Stable", MODEL), "B", "event")
+    scene = add_manual_event(prompted_scene("Stable", MODEL), "B", "event")
     first = _generate(_versioned_workflow("answer", 1), scene, "B", "inner")
     second = _generate(_versioned_workflow("answer", 2), scene, "B", "inner")
 
@@ -140,7 +142,7 @@ def test_backend_payload_changes_do_not_change_state_token() -> None:
 
 def test_event_prompt_history_or_model_changes_make_token_stale() -> None:
     """Every frozen business-context input participates in the state hash."""
-    scene = add_manual_event(create_scene("Stale", MODEL), "A", "event one")
+    scene = add_manual_event(prompted_scene("Stale", MODEL), "A", "event one")
     draft = _generate(
         DraftWorkflow(FakeBackend(["inner one"], model=MODEL)),
         scene,
@@ -195,7 +197,7 @@ def test_event_prompt_history_or_model_changes_make_token_stale() -> None:
 
 def test_readable_context_contains_complete_alternating_layer_history() -> None:
     """Preview derives every readable item from the neutral conversation."""
-    scene = add_manual_event(create_scene("History", MODEL), "A", "first")
+    scene = add_manual_event(prompted_scene("History", MODEL), "A", "first")
     inner = _generate(
         DraftWorkflow(FakeBackend(["inner one"], model=MODEL)),
         scene,
@@ -231,7 +233,11 @@ def test_readable_context_contains_complete_alternating_layer_history() -> None:
 
 def test_recipient_rename_invalidates_later_inner_draft() -> None:
     """A recipient display-name change makes the routed-speech draft stale."""
-    scene = add_manual_event(create_scene("Rename stale", MODEL), "A", "first")
+    scene = add_manual_event(
+        prompted_scene("Rename stale", MODEL),
+        "A",
+        "first",
+    )
     inner = _generate(
         DraftWorkflow(FakeBackend(["inner one"], model=MODEL)),
         scene,
@@ -285,7 +291,7 @@ def test_recipient_rename_invalidates_later_inner_draft() -> None:
 
 def test_generation_errors_are_sanitized_and_never_retried() -> None:
     """Both transport and invalid-output failures remain one-shot and safe."""
-    scene = add_manual_event(create_scene("Errors", MODEL), "A", "event")
+    scene = add_manual_event(prompted_scene("Errors", MODEL), "A", "event")
     transport = FakeBackend([RuntimeError("secret provider body")], model=MODEL)
 
     with pytest.raises(DraftGenerationError) as caught:
@@ -312,7 +318,7 @@ def test_generation_errors_are_sanitized_and_never_retried() -> None:
 
 def test_workflow_rejects_backend_for_a_different_scene_model() -> None:
     """Registry mistakes cannot route a scene through another model."""
-    scene = add_manual_event(create_scene("Mismatch", MODEL), "A", "event")
+    scene = add_manual_event(prompted_scene("Mismatch", MODEL), "A", "event")
     workflow = DraftWorkflow(
         FakeBackend(["answer"], model="fake/other"),
     )

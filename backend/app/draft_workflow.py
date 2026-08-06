@@ -220,6 +220,12 @@ def build_model_conversation(
         system_prompt = agent.outer_context.system_prompt
         saved_turns: list[OuterTurn] = agent.outer_context.turns
 
+    if not system_prompt.strip():
+        # Blank prompts are saveable scene state but never reach a model.
+        raise SceneConflictError(
+            f"The {layer} system prompt must be filled before model requests."
+        )
+
     conversation = ModelConversation(
         system_prompt=system_prompt,
         turns=tuple(

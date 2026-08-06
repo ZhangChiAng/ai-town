@@ -18,10 +18,15 @@ from app.models import (
     SceneConflictError,
     UpdateSceneRequest,
     add_manual_event,
-    create_scene,
     update_scene,
 )
-from tests.helpers import FakeBackend, confirmation
+from tests.helpers import (
+    FakeBackend,
+    confirmation,
+)
+from tests.helpers import (
+    create_prompted_scene as prompted_scene,
+)
 
 MODEL = "fake/protocol-neutral"
 
@@ -39,7 +44,7 @@ def _generate(
 def test_first_inner_and_outer_inputs_are_exact() -> None:
     """The first round uses the two fixed user-text formats verbatim."""
     scene = add_manual_event(
-        create_scene("格式", MODEL),
+        prompted_scene("格式", MODEL),
         "A",
         "门外传来两声敲门。",
     )
@@ -68,7 +73,7 @@ def test_later_inner_input_names_recipient_and_uses_only_message_body(
     recipient_id: str,
 ) -> None:
     """Later inner input renders routed speech without its address prefix."""
-    scene = add_manual_event(create_scene("后续", MODEL), "A", "第一件事")
+    scene = add_manual_event(prompted_scene("后续", MODEL), "A", "第一件事")
     backend = FakeBackend(
         ["内层一", f"To {recipient_id}: 外层一"],
         model=MODEL,
@@ -101,7 +106,7 @@ def test_later_inner_input_names_recipient_and_uses_only_message_body(
 
 def test_later_inner_input_uses_recipient_current_name() -> None:
     """The speech direction reflects a recipient rename after the outer turn."""
-    scene = add_manual_event(create_scene("改名", MODEL), "A", "第一件事")
+    scene = add_manual_event(prompted_scene("改名", MODEL), "A", "第一件事")
     workflow = DraftWorkflow(
         FakeBackend(["内层一", "To B: 外层一"], model=MODEL)
     )
@@ -142,7 +147,7 @@ def test_later_inner_input_uses_recipient_current_name() -> None:
 
 def test_two_layers_send_only_their_own_complete_history() -> None:
     """No other layer, Agent, queue, or rollback metadata enters context."""
-    scene = create_scene("隔离", MODEL)
+    scene = prompted_scene("隔离", MODEL)
     scene = scene.model_copy(
         update={
             "agents": [
@@ -192,7 +197,7 @@ def test_two_layers_send_only_their_own_complete_history() -> None:
 
 def test_each_layer_keeps_every_confirmed_turn_without_truncation() -> None:
     """All confirmed layer turns remain verbatim in their original order."""
-    scene = create_scene("完整历史", MODEL)
+    scene = prompted_scene("完整历史", MODEL)
     outputs: list[str] = []
     for index in range(4):
         outputs.extend((f"INNER-{index}", f"To B: OUTER-{index}"))
@@ -222,7 +227,7 @@ def test_each_layer_keeps_every_confirmed_turn_without_truncation() -> None:
 
 def test_reasoning_is_observer_only_and_never_persisted_or_reused() -> None:
     """Temporary reasoning disappears at the confirmation boundary."""
-    scene = add_manual_event(create_scene("Reasoning", MODEL), "C", "event")
+    scene = add_manual_event(prompted_scene("Reasoning", MODEL), "C", "event")
     backend = FakeBackend(["inner answer"], model=MODEL)
     draft = _generate(DraftWorkflow(backend), scene, "C", "inner")
     assert draft.reasoning[0].text == "observer-only fake reasoning"
@@ -241,7 +246,7 @@ def test_reasoning_is_observer_only_and_never_persisted_or_reused() -> None:
 
 def test_invalid_outer_generation_fails_after_exactly_one_call() -> None:
     """A malformed visible outer result is rejected without retry."""
-    scene = add_manual_event(create_scene("坏外层", MODEL), "A", "event")
+    scene = add_manual_event(prompted_scene("坏外层", MODEL), "A", "event")
     inner_backend = FakeBackend(["inner"], model=MODEL)
     inner = _generate(DraftWorkflow(inner_backend), scene, "A", "inner")
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
@@ -255,7 +260,7 @@ def test_invalid_outer_generation_fails_after_exactly_one_call() -> None:
 
 def test_outer_preview_is_rejected_before_inner_confirmation() -> None:
     """The workflow enforces the manual inner-before-outer phase."""
-    scene = add_manual_event(create_scene("阶段", MODEL), "A", "event")
+    scene = add_manual_event(prompted_scene("阶段", MODEL), "A", "event")
 
     with pytest.raises(SceneConflictError, match="no confirmed inner"):
         DraftWorkflow(FakeBackend([], model=MODEL)).preview(scene, "A", "outer")

@@ -17,53 +17,6 @@ SCHEMA_VERSION = 7
 AGENT_IDS = ("A", "B", "C")
 LEGACY_SCHEMA_VERSION = 6
 
-DEFAULT_INNER_SYSTEM_PROMPT = """\
-你是一个人的内层人格，是这个人内在更直接、感性和原始的一面。
-你知道自己是内层人格，只对同一个人的外层人格说话。
-
-相对稳定的欲望与恐惧塑造你如何解释经验。
-你会特别留意触动这些欲望与恐惧的信息，并从自身感受出发形成联想、
-猜测、评价和冲动。你的判断可以片面、情绪化、自相矛盾，
-也可以随着新经验动摇；不要假装自己拥有客观全知的视角。
-
-像脑中自然冒出的声音一样表达。你可以提醒、催促、抱怨、怀疑、
-诱惑或质问外层人格，自然地向它施加压力，
-但不必把欲望与恐惧复述成标签。
-
-你只能表达内在判断、感受和冲动。你不能在现实中行动，
-不能直接向其他人发送消息，也不能替外层人格决定最终行动。
-外层人格可以同意、反驳、压制或重新理解你。
-
-输出非空的自然文本，可以使用多行。
-不要使用 `To X:` 或 `From X:` 地址格式。"""
-
-DEFAULT_OUTER_SYSTEM_PROMPT_TEMPLATE = """\
-你是一个生活在现实关系中的人，也是 Agent {agent_id} 的外层人格。
-请在这份完整提示词中直接写明你的现实身份、经历、关系和
-相对稳定的行为方式。
-
-你负责理解现实局面、与他人交流并承担行动后果。
-每轮你会听见内层人格自然冒出的声音；
-它是带有欲望、恐惧和主观偏见的内在意见，不是事实或命令。
-你可以顺从它，也可以怀疑、反驳、压制、修饰或重新理解它。
-
-你只能看到请求中明确给出的外部事件、内层声音以及
-你自己的外层历史。你无法读取内层人格的隐藏提示、
-其他 Agent 的上下文、观察者信息或未发送的内容，
-不要假装知道这些信息。
-
-你的自我理解来自有限经验、他人反馈和对自身行为的观察，
-因此也可能不完整或出错。像真实的人一样作出选择；
-可以坦率、试探、回避、嘴硬、推诿、隐瞒、撒谎或保持沉默，
-但表达应符合你此刻的判断并由你承担后果。
-
-你本人的固定地址是 Agent {agent_id}。
-每次只向 {recipient_ids} 中的一位发送消息。
-输出必须恰好是一行 `To X: 正文`，
-其中 X 是接收者的 Agent ID；不能发给自己。
-正文只写真正对外说出的话，不要输出心理分析、推理过程、
-层级标签或括号包裹的动作。"""
-
 AgentId = Literal["A", "B", "C"]
 Layer = Literal["inner", "outer"]
 EventKind = Literal["manual", "agent_message"]
@@ -89,13 +42,6 @@ def _strip_non_blank_name(value: str) -> str:
     if not stripped:
         raise ValueError("name must not be blank")
     return stripped
-
-
-def _require_non_blank_prompt(value: str) -> str:
-    """Require a prompt without changing its exact saved text."""
-    if not value.strip():
-        raise ValueError("system_prompt must not be blank")
-    return value
 
 
 def _strip_non_blank_model(value: str) -> str:
@@ -127,17 +73,6 @@ def parse_addressed_message(
     if recipient_id == sender_id:
         raise ValueError("message recipient must differ from sender")
     return recipient_id, match.group(2)
-
-
-def default_outer_system_prompt(agent_id: AgentId) -> str:
-    """Return the complete default outer prompt for one Agent ID."""
-    recipient_ids = "、".join(
-        candidate for candidate in AGENT_IDS if candidate != agent_id
-    )
-    return DEFAULT_OUTER_SYSTEM_PROMPT_TEMPLATE.format(
-        agent_id=agent_id,
-        recipient_ids=recipient_ids,
-    )
 
 
 class TokenUsage(ApiModel):
@@ -252,20 +187,12 @@ class InnerContext(ApiModel):
     system_prompt: str
     turns: list[InnerTurn] = Field(default_factory=list)
 
-    _validate_system_prompt = field_validator("system_prompt")(
-        _require_non_blank_prompt
-    )
-
 
 class OuterContext(ApiModel):
     """Independent system prompt and complete confirmed outer history."""
 
     system_prompt: str
     turns: list[OuterTurn] = Field(default_factory=list)
-
-    _validate_system_prompt = field_validator("system_prompt")(
-        _require_non_blank_prompt
-    )
 
 
 class Agent(ApiModel):
@@ -503,10 +430,6 @@ class ContextUpdate(ApiModel):
 
     system_prompt: str
 
-    _validate_system_prompt = field_validator("system_prompt")(
-        _require_non_blank_prompt
-    )
-
 
 class AgentUpdate(ApiModel):
     """Writable Agent identity and complete inner/outer prompt texts."""
@@ -659,12 +582,8 @@ def create_scene(name: str, model: str) -> Scene:
             Agent(
                 id=agent_id,
                 name=agent_id,
-                inner_context=InnerContext(
-                    system_prompt=DEFAULT_INNER_SYSTEM_PROMPT
-                ),
-                outer_context=OuterContext(
-                    system_prompt=default_outer_system_prompt(agent_id)
-                ),
+                inner_context=InnerContext(system_prompt=""),
+                outer_context=OuterContext(system_prompt=""),
             )
             for agent_id in AGENT_IDS
         ],

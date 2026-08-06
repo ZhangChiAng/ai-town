@@ -73,8 +73,8 @@ def _post_scene(
     *,
     name: str = "HTTP integration",
 ) -> dict[str, Any]:
-    """Create one bound scene through the public API."""
-    return helpers.post_scene(client, model=FAKE_MODEL, name=name)
+    """Create one bound, prompted scene through the public API."""
+    return helpers.post_prompted_scene(client, model=FAKE_MODEL, name=name)
 
 
 def _scene_update(scene: dict[str, Any]) -> dict[str, Any]:

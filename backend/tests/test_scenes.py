@@ -38,8 +38,8 @@ def make_client(
 
 
 def post_scene(client: TestClient, name: str = "港口") -> dict[str, Any]:
-    """Create and return one scene bound to the test model."""
-    return helpers.post_scene(client, model=MODEL, name=name)
+    """Create one scene with complete prompts bound to the test model."""
+    return helpers.post_prompted_scene(client, model=MODEL, name=name)
 
 
 def test_model_options_are_ordered_and_hide_credentials(
@@ -190,6 +190,80 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
 
     restarted = SceneStorage(scene_directory).get(UUID(scene["id"]))
     assert restarted.model_dump(mode="json") == scene
+
+
+def test_new_scene_starts_with_blank_prompts_and_blocks_model_calls(
+    scene_directory: Path,
+) -> None:
+    """Blank prompts are the default state and rejected for model calls."""
+    client, model_client = make_client(scene_directory, ["内层", "To B: 外层"])
+    scene = helpers.post_scene(client, model=MODEL)
+    for agent in scene["agents"]:
+        assert agent["inner_context"]["system_prompt"] == ""
+        assert agent["outer_context"]["system_prompt"] == ""
+
+    post_event(client, scene["id"], "A", "事件")
+    assert (
+        client.post(
+            f"/api/scenes/{scene['id']}/agents/A/inner-drafts"
+        ).status_code
+        == 409
+    )
+    assert (
+        client.get(
+            f"/api/scenes/{scene['id']}/agents/A/model-request-preview"
+            "?layer=inner"
+        ).status_code
+        == 409
+    )
+    assert (
+        client.post(
+            f"/api/scenes/{scene['id']}/agents/A/outer-drafts"
+        ).status_code
+        == 409
+    )
+    assert model_client.generate_calls == []
+
+    blank_update = {
+        "name": scene["name"],
+        "agents": [
+            {
+                "id": agent["id"],
+                "name": agent["name"],
+                "inner_context": {"system_prompt": ""},
+                "outer_context": {"system_prompt": "  "},
+            }
+            for agent in scene["agents"]
+        ],
+    }
+    saved = client.put(f"/api/scenes/{scene['id']}", json=blank_update)
+    assert saved.status_code == 200
+    assert saved.json()["agents"][0]["inner_context"]["system_prompt"] == ""
+    assert (
+        client.post(
+            f"/api/scenes/{scene['id']}/agents/A/inner-drafts"
+        ).status_code
+        == 409
+    )
+
+    filled = client.put(
+        f"/api/scenes/{scene['id']}",
+        json={
+            "name": scene["name"],
+            "agents": [
+                {
+                    "id": agent["id"],
+                    "name": agent["name"],
+                    "inner_context": {"system_prompt": f"INNER {agent['id']}"},
+                    "outer_context": {"system_prompt": f"OUTER {agent['id']}"},
+                }
+                for agent in scene["agents"]
+            ],
+        },
+    )
+    assert filled.status_code == 200
+    inner = generate(client, scene["id"], "A", "inner")
+    assert inner["content"] == "内层"
 
 
 @pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5])

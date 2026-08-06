@@ -13,7 +13,7 @@ from app.model_backends import (
     ModelReasoning,
     ModelUsage,
 )
-from app.models import ConfirmLayerRequest
+from app.models import ConfirmLayerRequest, create_scene
 from app.storage import SceneStorage
 from tests.client import TestClient
 
@@ -158,6 +158,82 @@ def post_scene(
     return require_json(
         client.post("/api/scenes", json={"name": name, "model": model}),
         expected_status,
+    )
+
+
+def fill_prompts(
+    client: TestClient,
+    scene: dict[str, Any],
+    *,
+    text: str | Callable[[str, str], str] | None = None,
+) -> dict[str, Any]:
+    """Write complete inner/outer prompts for every Agent via the PUT API.
+
+    ``text`` is either one literal string or a factory receiving the Agent
+    ID and layer; the default factory keeps every layer observably distinct.
+    """
+    factory = (
+        (text if isinstance(text, Callable) else (lambda agent_id, layer: text))
+        if text is not None
+        else (lambda agent_id, layer: f"{layer.upper()} {agent_id}")
+    )
+    update = {
+        "name": scene["name"],
+        "agents": [
+            {
+                "id": agent["id"],
+                "name": agent["name"],
+                "inner_context": {
+                    "system_prompt": factory(agent["id"], "inner")
+                },
+                "outer_context": {
+                    "system_prompt": factory(agent["id"], "outer")
+                },
+            }
+            for agent in scene["agents"]
+        ],
+    }
+    return require_json(client.put(f"/api/scenes/{scene['id']}", json=update))
+
+
+def post_prompted_scene(
+    client: TestClient,
+    *,
+    model: str,
+    name: str = "HTTP integration",
+    text: str | Callable[[str, str], str] | None = None,
+) -> dict[str, Any]:
+    """Create one bound scene whose Agents already hold complete prompts."""
+    return fill_prompts(
+        client,
+        post_scene(client, model=model, name=name),
+        text=text,
+    )
+
+
+def create_prompted_scene(name: str, model: str) -> Any:
+    """Build an unpersisted scene with complete prompts for every Agent."""
+    return _replace_all_prompts(create_scene(name, model))
+
+
+def _replace_all_prompts(scene: Any) -> Any:
+    """Return a scene with distinct INNER/OUTER prompts on every Agent."""
+    return scene.model_copy(
+        update={
+            "agents": [
+                agent.model_copy(
+                    update={
+                        "inner_context": agent.inner_context.model_copy(
+                            update={"system_prompt": f"INNER {agent.id}"}
+                        ),
+                        "outer_context": agent.outer_context.model_copy(
+                            update={"system_prompt": f"OUTER {agent.id}"}
+                        ),
+                    }
+                )
+                for agent in scene.agents
+            ]
+        }
     )
 
 
