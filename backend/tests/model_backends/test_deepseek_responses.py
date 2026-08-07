@@ -1,4 +1,4 @@
-"""Captured-wire tests for the OpenAI Responses Pydantic AI adapter."""
+"""Captured-wire tests for the DeepSeek Responses Pydantic AI adapter."""
 
 import asyncio
 import json
@@ -18,18 +18,18 @@ from app.model_backends import (
     ModelTurn,
     ModelUsage,
 )
-from app.model_backends import openai_responses as adapter_module
-from app.model_backends.openai_responses import (
-    create_openai_responses_backend,
+from app.model_backends import deepseek_responses as adapter_module
+from app.model_backends.deepseek_responses import (
+    create_deepseek_responses_backend,
 )
 from tests.model_backends.contract import (
     BackendContractCase,
     BackendContractTests,
 )
 
-MODEL = "gpt-5.4"
-BASE_URL = "https://openai.example/v1"
-API_KEY = "openai-secret-never-preview"
+MODEL = "deepseek-v4-flash"
+BASE_URL = "https://deepseek.example"
+API_KEY = "deepseek-secret-never-preview"
 SYSTEM_PROMPT = "SYSTEM exact\nsecond line"
 CONVERSATION = ModelConversation(
     system_prompt=SYSTEM_PROMPT,
@@ -40,7 +40,6 @@ CONVERSATION = ModelConversation(
     current_input="current user\nexact",
 )
 EXPECTED_PAYLOAD: JsonObject = {
-    "include": ["reasoning.encrypted_content"],
     "input": [
         {"role": "user", "content": "first user"},
         {"role": "assistant", "content": "first assistant"},
@@ -49,12 +48,9 @@ EXPECTED_PAYLOAD: JsonObject = {
         {"role": "user", "content": "current user\nexact"},
     ],
     "instructions": SYSTEM_PROMPT,
-    "max_output_tokens": 2048,
     "model": MODEL,
-    "reasoning": {"context": "current_turn"},
-    "store": False,
+    "reasoning": {"effort": "max"},
     "stream": False,
-    "truncation": "disabled",
 }
 
 
@@ -105,7 +101,7 @@ class RecordingTransport(httpx.MockTransport):
 
 
 def _successful_response() -> JsonObject:
-    """Return a realistic OpenAI Responses SDK response body."""
+    """Return a realistic Responses SDK response body."""
     return {
         "id": "resp_123",
         "object": "response",
@@ -115,7 +111,7 @@ def _successful_response() -> JsonObject:
         "error": None,
         "incomplete_details": None,
         "instructions": None,
-        "max_output_tokens": 2048,
+        "max_output_tokens": None,
         "max_tool_calls": None,
         "model": MODEL,
         "output": [
@@ -150,17 +146,17 @@ def _successful_response() -> JsonObject:
         "parallel_tool_calls": True,
         "previous_response_id": None,
         "prompt_cache_key": None,
-        "reasoning": {"effort": "medium", "summary": "auto"},
+        "reasoning": {"effort": "max", "summary": "auto"},
         "safety_identifier": None,
-        "service_tier": "default",
-        "store": False,
+        "service_tier": None,
+        "store": None,
         "temperature": 1.0,
         "text": {"format": {"type": "text"}},
-        "tool_choice": "auto",
+        "tool_choice": None,
         "tools": [],
         "top_logprobs": 0,
         "top_p": 1.0,
-        "truncation": "disabled",
+        "truncation": None,
         "usage": {
             "input_tokens": 20,
             "input_tokens_details": {"cached_tokens": 5},
@@ -177,7 +173,7 @@ async def _make_backend(
     transport: RecordingTransport,
 ) -> ModelBackend:
     """Create the public adapter with an isolated mock network."""
-    return await create_openai_responses_backend(
+    return await create_deepseek_responses_backend(
         FakeSettings(),
         transport=transport,
     )
@@ -205,7 +201,7 @@ def _expected_generation() -> ModelGeneration:
 
 
 def _contract_case() -> BackendContractCase:
-    """Build a fresh real-SDK OpenAI contract fixture."""
+    """Build a fresh real-SDK DeepSeek contract fixture."""
     transport = RecordingTransport(_successful_response())
     return BackendContractCase(
         backend=asyncio.run(_make_backend(transport)),
@@ -222,8 +218,8 @@ def _contract_case() -> BackendContractCase:
     )
 
 
-class TestOpenAIResponsesBackendContract(BackendContractTests):
-    """Apply the neutral async backend contract to OpenAI Responses."""
+class TestDeepSeekResponsesBackendContract(BackendContractTests):
+    """Apply the neutral async backend contract to DeepSeek Responses."""
 
     contract_case_factory = staticmethod(_contract_case)
 
@@ -243,7 +239,7 @@ def test_backend_structurally_satisfies_frozen_port() -> None:
 
 
 def test_wire_preserves_full_history_and_stateless_boundaries() -> None:
-    """The actual body is complete, stateless, and OpenAI-specific."""
+    """The actual body is complete, stateless, and minimal."""
     transport = RecordingTransport(_successful_response())
 
     async def generate_and_close() -> ModelGeneration:
@@ -281,7 +277,16 @@ def test_wire_preserves_full_history_and_stateless_boundaries() -> None:
             "tools",
         }
     )
-    assert body["include"] == ["reasoning.encrypted_content"]
+    for minimal_field in (
+        "include",
+        "max_output_tokens",
+        "service_tier",
+        "store",
+        "tool_choice",
+        "truncation",
+    ):
+        assert minimal_field not in body, f"{minimal_field} must be omitted"
+    assert body["reasoning"] == {"effort": "max"}
     assert transport.requests[0].extensions["timeout"] == {
         "connect": 60.0,
         "read": 60.0,
@@ -357,9 +362,9 @@ def test_factory_error_before_client_is_sanitized(
 
     with pytest.raises(
         RuntimeError,
-        match="^OpenAI Responses client creation failed$",
+        match="^DeepSeek Responses client creation failed$",
     ) as exc_info:
-        asyncio.run(create_openai_responses_backend(FakeSettings()))
+        asyncio.run(create_deepseek_responses_backend(FakeSettings()))
 
     assert API_KEY not in str(exc_info.value)
     assert BASE_URL not in str(exc_info.value)
@@ -390,10 +395,10 @@ def test_factory_failure_closes_captured_client_once(
 
     with pytest.raises(
         RuntimeError,
-        match="^OpenAI Responses client creation failed$",
+        match="^DeepSeek Responses client creation failed$",
     ) as exc_info:
         asyncio.run(
-            create_openai_responses_backend(
+            create_deepseek_responses_backend(
                 FakeSettings(),
                 transport=transport,
             )
@@ -419,7 +424,7 @@ def test_factory_cancellation_closes_client_and_propagates(
 
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(
-            create_openai_responses_backend(
+            create_deepseek_responses_backend(
                 FakeSettings(),
                 transport=transport,
             )

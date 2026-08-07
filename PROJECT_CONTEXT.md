@@ -270,9 +270,13 @@ Anthropic 对当前层设置两个公开的 5 分钟 block-level 缓存断点：
 current user 可能进入供应商的 5 分钟临时缓存，但在项目内仍是未确认、只由
 浏览器持有的输入；缓存传输元数据不得把它写入 scene 或改变确认语义。
 
-OpenAI Responses 使用 `instructions`、完整 `input`、`store=false`，禁用
-truncation，把 reasoning context 限制在当前轮，不回放 reasoning ID，也不发送
-conversation 或 previous response ID。它不发送 Anthropic 的缓存字段。
+DeepSeek 与 MiniMax 共用 Responses-兼容映射：发送 `instructions`、完整
+`input` 和 `reasoning.effort`，其中 DeepSeek 固定 `effort="max"`，MiniMax 固定
+`effort="high"` 并追加 `service_tier="priority"`。两者都不设置
+`max_output_tokens`，不发 store/truncation/reasoning context，不回放 reasoning
+ID，也不发送 conversation 或 previous response ID；厂商 API 天然无状态、输出
+超过模型上限时直接返回错误，因此不引入 Anthropic 的缓存字段，也不需要客户端
+截断。
 
 生成结果展示提供商返回的缓存写入、缓存读取、未缓存输入和输出 token 数。
 缓存门槛与是否命中由模型提供商决定，系统不填充无意义文本。
@@ -304,7 +308,8 @@ redacted 及其他 provider details 不展示；所有 reasoning 都是未持久
 - 后端：Python + FastAPI；
 - 前端：Vue 3 + TypeScript + Vite；
 - 持久化：`data/scenes/<scene-id>.json`；
-- 模型调用：Pydantic AI Direct 映射到 Anthropic Messages 与 OpenAI Responses；
+- 模型调用：Pydantic AI Direct 映射到 Anthropic Messages、DeepSeek
+  Responses 与 MiniMax Responses；
 - 一个场景的三个 Agent、两个层级始终共用该场景绑定的同一模型；
 - Linux 开发，并可在安装 Python、uv、Node.js 与 npm 的 Windows 机器上
   本地运行。
@@ -317,7 +322,9 @@ redacted 及其他 provider details 不展示；所有 reasoning 都是未持久
 - `base_url`：有效的绝对 HTTP(S) URL；
 - `api_key_env`：按模型粒度保存该模型真实密钥的环境变量名，而非密钥本身。
 
-当前正式 protocol key 为 `anthropic_messages` 和 `openai_responses`。
+当前正式 protocol key 为 `anthropic_messages`、`deepseek_responses` 和
+`minimax_responses`；后两者共享 §9 的 Responses-兼容映射，并按各自 adapter 的
+per-vendor 约定填写专属请求字段。
 配置层不硬编码协议枚举；注册表拒绝没有已注册 factory 的 key。TOML 声明顺序
 就是后端创建顺序和界面模型顺序，`GET /api/model-options` 的每个元素严格只有
 `{model}`。scene schema 当前为 v7（加载时迁移 v6），并继续只用

@@ -1,4 +1,4 @@
-"""OpenAI Responses assembly for the shared Pydantic AI Direct backend."""
+"""MiniMax Responses assembly for the shared Pydantic AI Direct backend."""
 
 from contextlib import suppress
 
@@ -16,16 +16,14 @@ from app.model_backends.pydantic_ai_backend import (
     create_request_capture_client,
 )
 
-_MAX_TOKENS = 2048
 
-
-async def create_openai_responses_backend(
+async def create_minimax_responses_backend(
     settings: ModelBackendSettings,
     /,
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> PydanticAIBackend:
-    """Create one stateless OpenAI Responses model using Direct requests."""
+    """Create one stateless MiniMax Responses model using Direct requests."""
     http_client: httpx.AsyncClient | None = None
     try:
         http_client = create_request_capture_client(transport=transport)
@@ -39,10 +37,8 @@ async def create_openai_responses_backend(
         provider = OpenAIProvider(openai_client=client)
         direct_model = OpenAIResponsesModel(settings.model, provider=provider)
         model_settings = OpenAIResponsesModelSettings(
-            max_tokens=_MAX_TOKENS,
-            openai_store=False,
-            openai_truncation="disabled",
-            openai_reasoning_context="current_turn",
+            openai_reasoning_effort="high",
+            openai_service_tier="priority",
             openai_send_reasoning_ids=False,
         )
         return PydanticAIBackend(
@@ -60,4 +56,4 @@ async def create_openai_responses_backend(
             raise
 
     # Raising outside the handler drops sensitive constructor context.
-    raise RuntimeError("OpenAI Responses client creation failed") from None
+    raise RuntimeError("MiniMax Responses client creation failed") from None

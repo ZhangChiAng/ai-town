@@ -13,12 +13,13 @@ MODEL_BACKENDS_ROOT = APP_ROOT / "model_backends"
 FRONTEND_ROOT = REPOSITORY_ROOT / "frontend" / "src"
 
 ANTHROPIC_ADAPTER = MODEL_BACKENDS_ROOT / "anthropic_messages.py"
-RESPONSES_ADAPTER = MODEL_BACKENDS_ROOT / "openai_responses.py"
+DEEPSEEK_ADAPTER = MODEL_BACKENDS_ROOT / "deepseek_responses.py"
+MINIMAX_ADAPTER = MODEL_BACKENDS_ROOT / "minimax_responses.py"
 PYDANTIC_AI_BACKEND = MODEL_BACKENDS_ROOT / "pydantic_ai_backend.py"
-ADAPTER_PATHS = (ANTHROPIC_ADAPTER, RESPONSES_ADAPTER)
+ADAPTER_PATHS = (ANTHROPIC_ADAPTER, DEEPSEEK_ADAPTER, MINIMAX_ADAPTER)
 SDK_OWNERS = {
-    "anthropic": ANTHROPIC_ADAPTER,
-    "openai": RESPONSES_ADAPTER,
+    "anthropic": (ANTHROPIC_ADAPTER,),
+    "openai": (DEEPSEEK_ADAPTER, MINIMAX_ADAPTER),
 }
 PROVIDER_MARKERS = (
     "anthropic",
@@ -105,7 +106,7 @@ def test_provider_sdk_imports_stay_in_their_concrete_adapters() -> None:
         for target, _symbol in _import_targets(_parse(path)):
             sdk_name = target.partition(".")[0]
             if sdk_name in SDK_OWNERS:
-                assert path == SDK_OWNERS[sdk_name], (
+                assert path in SDK_OWNERS[sdk_name], (
                     f"{sdk_name} SDK import escaped its adapter: {path}"
                 )
 
@@ -160,7 +161,8 @@ def test_provider_factories_are_async_for_failure_cleanup() -> None:
     """Factory construction can await cleanup of a partly built client."""
     factory_names = {
         ANTHROPIC_ADAPTER: "create_anthropic_messages_backend",
-        RESPONSES_ADAPTER: "create_openai_responses_backend",
+        DEEPSEEK_ADAPTER: "create_deepseek_responses_backend",
+        MINIMAX_ADAPTER: "create_minimax_responses_backend",
     }
     for path, name in factory_names.items():
         definition = _top_level_definition(path, name)

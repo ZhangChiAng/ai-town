@@ -45,16 +45,22 @@ base_url = "https://api.example.com/anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
 
 [[models]]
-model = "openai/gpt-5-mini"
-protocol = "openai_responses"
-base_url = "https://api.example.com/v1"
-api_key_env = "DeepSeek_API_KEY"
+model = "deepseek-v4-flash"
+protocol = "deepseek_responses"
+base_url = "https://api.example.com/deepseek"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[[models]]
+model = "MiniMax-M3"
+protocol = "minimax_responses"
+base_url = "https://api.example.com/minimax"
+api_key_env = "MINIMAX_API_KEY"
 ```
 
 请把占位 URL 和模型名替换为兼容端点的实际值。`model` 大小写敏感且全局
 唯一；TOML 顺序就是界面顺序，可以配置任意数量模型，也可以让多个模型使用
-同一 protocol。当前正式内部 key 为 `anthropic_messages` 和
-`openai_responses`。protocol、端点和密钥不会出现在模型选择、scene 数据或
+同一 protocol。当前正式内部 key 为 `anthropic_messages`、`deepseek_responses`
+和 `minimax_responses`。protocol、端点和密钥不会出现在模型选择、scene 数据或
 `GET /api/model-options` 中。
 
 `api_key_env` 只引用环境变量名，真实 key 不得写进 `models.toml`。API key 按
@@ -64,7 +70,8 @@ api_key_env = "DeepSeek_API_KEY"
 
 ```dotenv
 ANTHROPIC_API_KEY=""
-DeepSeek_API_KEY=""
+DEEPSEEK_API_KEY=""
+MINIMAX_API_KEY=""
 ```
 
 进程环境优先于 `.env`；`.env` 文件本身可选，但每个 `api_key_env` 引用的值
@@ -210,11 +217,14 @@ Anthropic 的两层分别使用公开的 5 分钟 block-level 缓存设置：
 current user 即使进入供应商临时缓存，在项目内仍是未确认、只由浏览器持有的
 输入，不会写入场景或改变确认规则。
 
-Responses 使用 `store=false`、禁用 truncation、仅当前轮 reasoning context，
-不回放 reasoning ID，也不发送 conversation、previous response ID 或 Anthropic
-缓存元数据。两种协议每次仍发送当前层完整历史，不做截断或摘要，并统一展示
-缓存写入、缓存读取、未缓存输入和输出 token 指标；短上下文指标为 0 属于正常
-情况。
+DeepSeek 与 MiniMax 共用 Responses-兼容映射：发送 `instructions`、完整
+`input` 和 `reasoning.effort`（DeepSeek 为 `max`，MiniMax 为 `high`），MiniMax
+另发 `service_tier="priority"`。两者都不设置 `max_output_tokens` 或 store/
+truncation/reasoning context，不回放 reasoning ID，也不发送 conversation、
+previous response ID 或 Anthropic 缓存元数据；厂商 API 天然无状态、达到模型
+输出上限时直接报错，无需客户端截断。两种协议每次仍发送当前层完整历史，不做
+截断或摘要，并统一展示缓存写入、缓存读取、未缓存输入和输出 token 指标；短
+上下文指标为 0 属于正常情况。
 
 后端按 TOML 顺序异步创建模型 backend，并在部分启动失败或正常退出时逆序、
 幂等地关闭已创建资源；factory 构造中途失败也会先关闭 HTTP client。新增正式
