@@ -30,6 +30,7 @@ import {
   type Layer,
   type LayerDraftResponse,
   type ModelOption,
+  type ModelReasoningBlock,
   type ModelRequestPreviewResponse,
   type Scene,
   type SceneSummary,
@@ -49,6 +50,7 @@ interface TimelineItem {
   status?: string;
   input?: string;
   callId?: string;
+  reasoning?: ModelReasoningBlock[];
 }
 
 const sceneSummaries = ref<SceneSummary[]>([]);
@@ -234,6 +236,7 @@ const mixedTimeline = computed<TimelineItem[]>(() => {
       content: turn.output,
       input: turn.input,
       callId: turn.call_id,
+      reasoning: turn.reasoning,
     });
   }
   for (const turn of agent.outer_context.turns) {
@@ -246,6 +249,7 @@ const mixedTimeline = computed<TimelineItem[]>(() => {
       content: turn.output,
       input: turn.input,
       callId: turn.call_id,
+      reasoning: turn.reasoning,
     });
   }
   for (const event of agent.pending_events) {
@@ -642,6 +646,7 @@ async function confirmDraft(): Promise<void> {
         event_ids: draft.event_ids,
         content: draft.content,
         state_token: draft.state_token,
+        reasoning: activeDraft.value?.reasoning ?? [],
       },
     );
     drafts.value[agentId] = null;
@@ -1025,6 +1030,19 @@ onBeforeUnmount(() => {
                         <pre>{{ item.input }}</pre>
                         <small>call {{ item.callId }}</small>
                       </details>
+                      <details
+                        v-if="item.reasoning?.length"
+                        class="draft-reasoning"
+                      >
+                        <summary>本次已落盘的 reasoning</summary>
+                        <article
+                          v-for="(block, index) in item.reasoning"
+                          :key="`${block.type}:${index}`"
+                        >
+                          <strong>{{ block.type }}</strong>
+                          <pre>{{ block.text }}</pre>
+                        </article>
+                      </details>
                     </article>
                   </li>
                 </ol>
@@ -1116,7 +1134,7 @@ onBeforeUnmount(() => {
                     <pre>{{ block.text }}</pre>
                   </article>
                   <small>
-                    仅存在浏览器草稿中；确认后不会保存或回传模型。
+                    确认后落盘到场景历史、不再回传模型。
                   </small>
                 </details>
 

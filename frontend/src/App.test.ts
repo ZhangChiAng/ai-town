@@ -35,7 +35,7 @@ type RouteHandler =
 
 function makeScene(): Scene {
   return {
-    schema_version: 7,
+    schema_version: 8,
     id: SCENE_ID,
     name: "海边小镇",
     model: MODEL,
@@ -125,6 +125,17 @@ function completeScene(): Scene {
     layer: "outer",
   });
   scene.next_sequence = 4;
+  return scene;
+}
+
+function historyReasoningScene(): Scene {
+  const scene = completeScene();
+  scene.agents[0].inner_context.turns[0].reasoning = [
+    { type: "thinking", text: "历史内层思考" },
+  ];
+  scene.agents[0].outer_context.turns[0].reasoning = [
+    { type: "summary_text", text: "历史外层总结" },
+  ];
   return scene;
 }
 
@@ -377,6 +388,35 @@ describe("App", () => {
     expect(container.querySelector("#message-content")).toBeNull();
   });
 
+  it("renders persisted reasoning blocks inside the scene history", async () => {
+    await mountOpenedScene(historyReasoningScene());
+
+    const timeline = container.querySelector(".timeline") as HTMLElement;
+    const blocks = timeline.querySelectorAll(".draft-reasoning");
+    expect(blocks).toHaveLength(2);
+    expect(
+      timeline.querySelector(".timeline-item--inner .draft-reasoning")
+        ?.textContent,
+    ).toContain("历史内层思考");
+    expect(
+      timeline.querySelector(".timeline-item--outer .draft-reasoning")
+        ?.textContent,
+    ).toContain("历史外层总结");
+    expect(
+      timeline.querySelectorAll(".timeline-item--event .draft-reasoning"),
+    ).toHaveLength(0);
+  });
+
+  it("does not render reasoning when the scene history holds none", async () => {
+    const scene = completeScene();
+    scene.agents[0].inner_context.turns[0].reasoning = [];
+    scene.agents[0].outer_context.turns[0].reasoning = [];
+    await mountOpenedScene(scene);
+
+    const timeline = container.querySelector(".timeline") as HTMLElement;
+    expect(timeline.querySelectorAll(".draft-reasoning")).toHaveLength(0);
+  });
+
   it("edits and confirms an inner draft, then exposes only the outer stage", async () => {
     const initial = pendingScene();
     const confirmed = halfRoundScene();
@@ -417,6 +457,7 @@ describe("App", () => {
       event_ids: [EVENT_ID],
       content: "先观察。\n也许只是天气。",
       state_token: STATE_TOKEN,
+      reasoning: innerDraft().reasoning,
     });
     expect(container.textContent).toContain("等待外层人格");
     expect(container.querySelector(".draft-reasoning")).toBeNull();
@@ -504,6 +545,7 @@ describe("App", () => {
       event_ids: [EVENT_ID],
       content: "先观察风向。",
       state_token: STATE_TOKEN,
+      reasoning: innerDraft().reasoning,
     });
     expect(container.textContent).toContain("等待外层人格");
   });
@@ -696,6 +738,7 @@ describe("App", () => {
       event_ids: [firstEvent.id, secondEvent.id],
       content: "先观察风向。",
       state_token: STATE_TOKEN,
+      reasoning: innerDraft().reasoning,
     });
   });
 });

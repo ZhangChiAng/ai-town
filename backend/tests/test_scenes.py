@@ -1,4 +1,4 @@
-"""API and persistence tests for schema-v7 two-layer scenes."""
+"""API and persistence tests for schema-v8 two-layer scenes."""
 
 import json
 from copy import deepcopy
@@ -157,7 +157,7 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
     client, _model = make_client(scene_directory)
     scene = post_scene(client)
 
-    assert scene["schema_version"] == SCHEMA_VERSION == 7
+    assert scene["schema_version"] == SCHEMA_VERSION == 8
     assert [agent["id"] for agent in scene["agents"]] == ["A", "B", "C"]
     assert set(scene) == {
         "schema_version",
@@ -284,7 +284,7 @@ def test_old_schema_is_rejected_without_migration(
     original = json.dumps(raw).encode()
     path.write_bytes(original)
 
-    with pytest.raises(SceneReadError, match="not schema v7 or v6"):
+    with pytest.raises(SceneReadError, match="not schema v8 or v6"):
         SceneStorage(scene_directory).get(scene_id)
 
     assert path.read_bytes() == original
@@ -673,10 +673,10 @@ def test_rollback_inner_restores_the_consumed_batch_in_fifo_order(
     assert undone["agents"][0]["inner_context"]["turns"] == []
 
 
-def test_v6_scene_is_migrated_to_v7_on_read(
+def test_v6_scene_is_migrated_to_v8_on_read(
     scene_directory: Path,
 ) -> None:
-    """A legacy single-event v6 file loads as a v7 batch scene and persists."""
+    """A legacy single-event v6 file loads as a v8 scene and persists."""
     scene_directory.mkdir()
     scene_id = uuid4()
     path = scene_directory / f"{scene_id}.json"
@@ -707,19 +707,19 @@ def test_v6_scene_is_migrated_to_v7_on_read(
     path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
 
     scene = SceneStorage(scene_directory).get(scene_id)
-    assert scene.schema_version == 7
+    assert scene.schema_version == SCHEMA_VERSION
     # A migrated v6 scene round-trips through validation and back to disk.
     SceneStorage(scene_directory).save(scene)
     reloaded = SceneStorage(scene_directory).get(scene_id)
     assert reloaded == scene
     on_disk = json.loads(path.read_text(encoding="utf-8"))
-    assert on_disk["schema_version"] == 7
+    assert on_disk["schema_version"] == SCHEMA_VERSION
 
 
-def test_v6_scene_with_confirmed_turn_is_migrated_to_v7_batches(
+def test_v6_scene_with_confirmed_turn_is_migrated_to_v8_batches(
     scene_directory: Path,
 ) -> None:
-    """Legacy inner/outer turns keep references via single-item v7 batches."""  # noqa: E501
+    """Legacy inner/outer turns keep references via single-item v8 batches."""  # noqa: E501
     scene_directory.mkdir()
     scene_id = uuid4()
     path = scene_directory / f"{scene_id}.json"
@@ -835,13 +835,95 @@ def test_v6_scene_with_confirmed_turn_is_migrated_to_v7_batches(
     scene = SceneStorage(scene_directory).get(scene_id)
     inner_turn = scene.agents[0].inner_context.turns[0]
     outer_turn = scene.agents[0].outer_context.turns[0]
-    assert scene.schema_version == 7
+    assert scene.schema_version == SCHEMA_VERSION
     assert inner_turn.event_ids == [UUID(event_id)]
     assert [event.id for event in inner_turn.consumed_events] == [
         UUID(event_id)
     ]
     assert outer_turn.event_ids == [UUID(event_id)]
     assert outer_turn.generated_event_id == UUID(generated_event_id)
+    assert inner_turn.reasoning == []
+    assert outer_turn.reasoning == []
+
+
+def _downgrade_to_v7(scene: dict[str, Any]) -> dict[str, Any]:
+    """Return a schema-v7 copy of a v8 scene with reasoning lists removed."""
+    raw = json.loads(json.dumps(scene))
+    raw["schema_version"] = 7
+    for agent in raw["agents"]:
+        for turn in agent["inner_context"]["turns"]:
+            turn.pop("reasoning", None)
+        for turn in agent["outer_context"]["turns"]:
+            turn.pop("reasoning", None)
+    return raw
+
+
+def test_v7_scene_is_migrated_to_v8_with_empty_reasoning(
+    scene_directory: Path,
+) -> None:
+    """A pre-reasoning v7 file loads with an empty reasoning on every turn."""
+    client, _model = make_client(
+        scene_directory,
+        ["A 内层", "To B: A 外层"],
+    )
+    scene = post_scene(client)
+    scene = post_event(client, scene["id"], "A", "事件")
+    inner = generate(client, scene["id"], "A", "inner")
+    scene = confirm(client, scene["id"], "A", "inner", inner).json()
+    outer = generate(client, scene["id"], "A", "outer")
+    scene = confirm(client, scene["id"], "A", "outer", outer).json()
+    path = scene_directory / f"{scene['id']}.json"
+    path.write_text(
+        json.dumps(_downgrade_to_v7(scene), ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+    reloaded = SceneStorage(scene_directory).get(UUID(scene["id"]))
+
+    assert reloaded.schema_version == SCHEMA_VERSION
+    assert all(
+        turn.reasoning == [] for turn in reloaded.agents[0].inner_context.turns
+    )
+    assert all(
+        turn.reasoning == [] for turn in reloaded.agents[0].outer_context.turns
+    )
+
+
+def test_v8_scene_keeps_validated_historic_reasoning(
+    scene_directory: Path,
+) -> None:
+    """Persisted reasoning validates and round-trips while empty stays legal."""  # noqa: E501
+    client, _model = make_client(
+        scene_directory,
+        ["A 内层", "To B: A 外层"],
+    )
+    scene = post_scene(client)
+    scene = post_event(client, scene["id"], "A", "事件")
+    inner = generate(client, scene["id"], "A", "inner")
+    scene = confirm(client, scene["id"], "A", "inner", inner).json()
+    outer = generate(client, scene["id"], "A", "outer")
+    scene = confirm(client, scene["id"], "A", "outer", outer).json()
+    path = scene_directory / f"{scene['id']}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["agents"][0]["inner_context"]["turns"][0]["reasoning"] = [
+        {"type": "thinking", "text": "historic inner reasoning"}
+    ]
+    raw["agents"][0]["outer_context"]["turns"][0]["reasoning"] = [
+        {"type": "summary_text", "text": "historic outer reasoning"}
+    ]
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    reloaded = SceneStorage(scene_directory).get(UUID(scene["id"]))
+
+    assert reloaded.schema_version == SCHEMA_VERSION
+    assert [
+        block.model_dump()
+        for block in reloaded.agents[0].inner_context.turns[0].reasoning
+    ] == [{"type": "thinking", "text": "historic inner reasoning"}]
+    assert [
+        block.model_dump()
+        for block in reloaded.agents[0].outer_context.turns[0].reasoning
+    ] == [{"type": "summary_text", "text": "historic outer reasoning"}]
 
 
 def test_inner_draft_goes_stale_when_a_new_event_arrives_before_confirm(

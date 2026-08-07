@@ -14,9 +14,11 @@ from app.draft_workflow import (
 )
 from app.models import (
     AgentId,
+    ConfirmLayerRequest,
     InvalidLayerOutputError,
     Layer,
     LayerDraftResponse,
+    ModelReasoningBlock,
     Scene,
     SceneConflictError,
     UpdateSceneRequest,
@@ -347,6 +349,91 @@ def test_workflow_rejects_backend_for_a_different_scene_model() -> None:
 
     with pytest.raises(SceneConflictError, match="different"):
         _generate(workflow, scene, "A", "inner")
+
+
+def _confirmation_with_reasoning(
+    draft: LayerDraftResponse,
+    reasoning: list[ModelReasoningBlock],
+) -> ConfirmLayerRequest:
+    """Build one confirmation DTO carrying the given reasoning blocks."""
+    return ConfirmLayerRequest(
+        call_id=draft.call_id,
+        event_ids=list(draft.event_ids),
+        content=draft.content,
+        state_token=draft.state_token,
+        reasoning=reasoning,
+    )
+
+
+def test_confirmed_turns_persist_reasoning_and_leave_it_out_of_requests() -> (
+    None
+):
+    """Inner and outer confirmation writes reasoning onto saved turns only."""
+    scene = add_manual_event(
+        prompted_scene("Reasoning persist", MODEL),
+        "A",
+        "event",
+    )
+    inner_backend = FakeBackend(["inner"], model=MODEL)
+    inner = _generate(DraftWorkflow(inner_backend), scene, "A", "inner")
+    reasoning = [
+        ModelReasoningBlock(type="thinking", text="inner thinking text"),
+    ]
+    scene = confirm_draft(
+        scene,
+        "A",
+        "inner",
+        _confirmation_with_reasoning(inner, reasoning),
+    )
+    assert scene.agents[0].inner_context.turns[-1].reasoning == reasoning
+
+    outer_backend = FakeBackend(["To B: outer"], model=MODEL)
+    outer = _generate(DraftWorkflow(outer_backend), scene, "A", "outer")
+    # The next request replays only input/output turns, never reasoning.
+    assert "inner thinking text" not in repr(outer_backend.generate_calls[-1])
+    scenario = confirm_draft(
+        scene,
+        "A",
+        "outer",
+        _confirmation_with_reasoning(outer, []),
+    )
+    assert scenario.agents[0].outer_context.turns[-1].reasoning == []
+    assert scenario.agents[0].outer_context.turns[-1].output == "To B: outer"
+
+
+def test_empty_reasoning_still_confirms_both_layers() -> None:
+    """A provider that returned no thinking confirms with an empty list."""
+    scene = add_manual_event(
+        prompted_scene("Empty reasoning", MODEL),
+        "A",
+        "event",
+    )
+    inner = _generate(
+        DraftWorkflow(FakeBackend(["inner"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
+    )
+    scene = confirm_draft(
+        scene,
+        "A",
+        "inner",
+        _confirmation_with_reasoning(inner, []),
+    )
+    assert scene.agents[0].inner_context.turns[-1].reasoning == []
+    outer = _generate(
+        DraftWorkflow(FakeBackend(["To B: outer"], model=MODEL)),
+        scene,
+        "A",
+        "outer",
+    )
+    completed = confirm_draft(
+        scene,
+        "A",
+        "outer",
+        _confirmation_with_reasoning(outer, []),
+    )
+    assert completed.agents[0].outer_context.turns[-1].reasoning == []
 
 
 def _replace_inner_prompt(scene: Any, prompt: str) -> Any:

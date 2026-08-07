@@ -1,4 +1,4 @@
-"""Atomic JSON-file persistence for schema-v7 two-layer scenes."""
+"""Atomic JSON-file persistence for schema-v8 two-layer scenes."""
 
 import contextlib
 import json
@@ -13,10 +13,12 @@ from pydantic import ValidationError
 
 from app.models import (
     LEGACY_SCHEMA_VERSION,
+    PREVIOUS_SCHEMA_VERSION,
     SCHEMA_VERSION,
     Scene,
     SceneSummary,
     migrate_v6_to_v7,
+    migrate_v7_to_v8,
 )
 
 
@@ -140,11 +142,17 @@ class SceneStorage:
         # Earlier single-layer schemas are intentionally unsupported; no
         # in-memory upgrade path may silently change the experiment's
         # information model. Only the previous batch-consumption schema (v6)
-        # is migrated forward to the current v7 batch form before validation.
+        # and the pre-reasoning schema (v7) are migrated forward before
+        # validation.
         version = raw.get("schema_version") if isinstance(raw, dict) else None
         if version == LEGACY_SCHEMA_VERSION:
             raw = migrate_v6_to_v7(raw)
-        elif version != SCHEMA_VERSION:
+        current_version = (
+            raw.get("schema_version") if isinstance(raw, dict) else None
+        )
+        if current_version == PREVIOUS_SCHEMA_VERSION:
+            raw = migrate_v7_to_v8(raw)
+        elif current_version != SCHEMA_VERSION:
             raise SceneReadError(
                 f"Scene file '{path.name}' is not schema v{SCHEMA_VERSION} "
                 "or v6."

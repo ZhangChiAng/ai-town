@@ -278,16 +278,20 @@ def confirm_draft(
     draft: dict[str, Any],
     *,
     content: str | None = None,
+    reasoning: list[dict[str, str]] | None = None,
 ) -> Any:
     """Submit one browser draft; returns the raw response for status checks."""
+    body = {
+        "call_id": draft["call_id"],
+        "event_ids": draft["event_ids"],
+        "content": draft["content"] if content is None else content,
+        "state_token": draft["state_token"],
+    }
+    if reasoning is not None:
+        body["reasoning"] = reasoning
     return client.post(
         f"/api/scenes/{scene_id}/agents/{agent_id}/{layer}-confirmations",
-        json={
-            "call_id": draft["call_id"],
-            "event_ids": draft["event_ids"],
-            "content": draft["content"] if content is None else content,
-            "state_token": draft["state_token"],
-        },
+        json=body,
     )
 
 

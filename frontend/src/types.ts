@@ -40,6 +40,7 @@ export interface InnerTurn {
   input: string;
   output: string;
   consumed_events: ExternalEvent[];
+  reasoning?: ModelReasoningBlock[];
 }
 
 export interface OuterTurn {
@@ -50,6 +51,7 @@ export interface OuterTurn {
   output: string;
   recipient_id: AgentId;
   generated_event_id: string;
+  reasoning?: ModelReasoningBlock[];
 }
 
 export interface InnerContext {
@@ -77,7 +79,7 @@ export interface ConfirmedCallReference {
 }
 
 export interface Scene {
-  schema_version: 7;
+  schema_version: 8;
   id: string;
   name: string;
   model: string | null;
@@ -130,6 +132,7 @@ export interface ConfirmLayerRequest {
   event_ids: string[];
   content: string;
   state_token: string;
+  reasoning: ModelReasoningBlock[];
 }
 
 export interface ModelRequestPreviewResponse {

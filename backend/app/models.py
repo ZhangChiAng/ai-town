@@ -13,9 +13,10 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 AGENT_IDS = ("A", "B", "C")
 LEGACY_SCHEMA_VERSION = 6
+PREVIOUS_SCHEMA_VERSION = 7
 
 AgentId = Literal["A", "B", "C"]
 Layer = Literal["inner", "outer"]
@@ -88,7 +89,7 @@ class TokenUsage(ApiModel):
 
 
 class ModelReasoningBlock(ApiModel):
-    """One readable provider reasoning block shown only in the browser."""
+    """One readable provider reasoning block projected before confirmation."""
 
     type: Literal["thinking", "summary_text", "reasoning_text"]
     text: str
@@ -141,6 +142,7 @@ class InnerTurn(ApiModel):
     input: str
     output: str
     consumed_events: list[ExternalEvent]
+    reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
 
     _validate_input = field_validator("input")(_strip_non_blank)
     _validate_output = field_validator("output")(_strip_non_blank)
@@ -179,6 +181,7 @@ class OuterTurn(ApiModel):
     output: str
     recipient_id: AgentId
     generated_event_id: UUID
+    reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
 
     _validate_input = field_validator("input")(_strip_non_blank)
     _validate_output = field_validator("output")(_strip_non_blank)
@@ -244,14 +247,15 @@ class ConfirmedCallReference(ApiModel):
 
 
 class Scene(ApiModel):
-    """A schema-v7 scene containing exactly three two-layer Agents.
+    """A schema-v8 scene containing exactly three two-layer Agents.
 
-    Schema v6 raw files are migrated to v7 by ``migrate_v6_to_v7`` in the
-    storage layer before being validated as a ``Scene``. Earlier schemas
-    (v1-v5) are rejected without migration.
+    Schema v6 raw files are migrated to v7 by ``migrate_v6_to_v7`` and schema
+    v7 files are migrated to v8 by ``migrate_v7_to_v8`` in the storage layer
+    before being validated as a ``Scene``. Earlier schemas (v1-v5) are
+    rejected without migration.
     """
 
-    schema_version: Literal[7] = SCHEMA_VERSION
+    schema_version: Literal[8] = SCHEMA_VERSION
     id: UUID
     name: str
     model: str | None
@@ -409,7 +413,7 @@ class CreateSceneRequest(ApiModel):
 
 
 class BindSceneModelRequest(ApiModel):
-    """One-time model binding payload for an unbound schema-v6 scene."""
+    """One-time model binding payload for an unbound scene."""
 
     model: str
 
@@ -495,6 +499,7 @@ class ConfirmLayerRequest(ApiModel):
     event_ids: list[UUID]
     content: str
     state_token: str = Field(min_length=64, max_length=64)
+    reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
 
     _validate_content = field_validator("content")(_strip_non_blank)
 
@@ -561,7 +566,8 @@ def migrate_v6_to_v7(raw: dict[str, Any]) -> dict[str, Any]:
     legacy ``consumed_event`` and ``event_id`` into single-element lists
     and each outer turn's ``event_id`` into ``event_ids``. It does not
     re-validate the scene; the caller (storage) runs ``Scene`` validation
-    on the migrated value. ``schema_version`` is set to 7.
+    on the migrated value. ``schema_version`` is set to 7 so the v7→v8
+    reasoning migration can run next.
     """
     migrated = deepcopy(raw)
     for agent in migrated.get("agents", []):
@@ -571,12 +577,34 @@ def migrate_v6_to_v7(raw: dict[str, Any]) -> dict[str, Any]:
         outer_context = agent.get("outer_context", {})
         for turn in outer_context.get("turns", []):
             _wrap_v6_outer_turn(turn)
+    migrated["schema_version"] = PREVIOUS_SCHEMA_VERSION
+    return migrated
+
+
+def migrate_v7_to_v8(raw: dict[str, Any]) -> dict[str, Any]:
+    """Migrate one parsed schema-v7 raw scene to the schema-v8 reasoning form.
+
+    The migration is structural and additive: every confirmed inner/outer
+    turn gets a default empty ``reasoning`` list when the field is missing
+    (a provider that returned no thinking persists an empty list, never a
+    stale value). Existing reasoning values are preserved. It does not
+    re-validate the scene; the caller (storage) runs ``Scene`` validation
+    on the migrated value. ``schema_version`` is set to 8.
+    """
+    migrated = deepcopy(raw)
+    for agent in migrated.get("agents", []):
+        for context in (
+            agent.get("inner_context", {}),
+            agent.get("outer_context", {}),
+        ):
+            for turn in context.get("turns", []):
+                turn.setdefault("reasoning", [])
     migrated["schema_version"] = SCHEMA_VERSION
     return migrated
 
 
 def create_scene(name: str, model: str) -> Scene:
-    """Create an empty schema-v7 scene bound to one configured model."""
+    """Create an empty schema-v8 scene bound to one configured model."""
     return Scene(
         id=uuid4(),
         name=name,
@@ -794,6 +822,7 @@ def confirm_inner_turn(
         input=actual_input,
         output=confirmation.content,
         consumed_events=events,
+        reasoning=confirmation.reasoning,
     )
     agents = [
         current.model_copy(
@@ -856,6 +885,7 @@ def confirm_outer_turn(
         output=canonical_output,
         recipient_id=recipient_id,
         generated_event_id=generated_event.id,
+        reasoning=confirmation.reasoning,
     )
 
     agents = []

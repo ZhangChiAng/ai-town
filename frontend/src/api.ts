@@ -71,6 +71,10 @@ function isReasoningBlock(value: unknown): value is ModelReasoningBlock {
   );
 }
 
+function isReasoningList(value: unknown): value is ModelReasoningBlock[] {
+  return Array.isArray(value) && value.every(isReasoningBlock);
+}
+
 function isModelOption(value: unknown): value is ModelOption {
   return (
     isRecord(value) &&
@@ -123,7 +127,8 @@ function isInnerTurn(value: unknown): value is InnerTurn {
     typeof value.output === "string" &&
     Array.isArray(value.consumed_events) &&
     value.consumed_events.length > 0 &&
-    value.consumed_events.every(isEvent)
+    value.consumed_events.every(isEvent) &&
+    (value.reasoning === undefined || isReasoningList(value.reasoning))
   );
 }
 
@@ -138,7 +143,8 @@ function isOuterTurn(value: unknown): value is OuterTurn {
     typeof value.input === "string" &&
     typeof value.output === "string" &&
     isAgentId(value.recipient_id) &&
-    typeof value.generated_event_id === "string"
+    typeof value.generated_event_id === "string" &&
+    (value.reasoning === undefined || isReasoningList(value.reasoning))
   );
 }
 
@@ -163,7 +169,7 @@ function isAgent(value: unknown): value is Agent {
 function isScene(value: unknown): value is Scene {
   return (
     isRecord(value) &&
-    value.schema_version === 7 &&
+    value.schema_version === 8 &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     (value.model === null ||
@@ -202,8 +208,7 @@ function isLayerDraft(value: unknown): value is LayerDraftResponse {
     value.event_ids.length > 0 &&
     typeof value.content === "string" &&
     value.content.trim() !== "" &&
-    Array.isArray(value.reasoning) &&
-    value.reasoning.every(isReasoningBlock) &&
+    isReasoningList(value.reasoning) &&
     isUsage(value.usage) &&
     isRecord(value.request_snapshot) &&
     typeof value.state_token === "string"

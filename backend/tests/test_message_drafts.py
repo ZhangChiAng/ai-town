@@ -225,13 +225,18 @@ def test_each_layer_keeps_every_confirmed_turn_without_truncation() -> None:
         assert assistant_item.text == f"INNER-{index}"
 
 
-def test_reasoning_is_observer_only_and_never_persisted_or_reused() -> None:
-    """Temporary reasoning disappears at the confirmation boundary."""
+def test_reasoning_only_enters_scene_via_confirmation_and_never_requests() -> (
+    None
+):
+    """Requests never replay reasoning; a bare confirmation persists none."""
     scene = add_manual_event(prompted_scene("Reasoning", MODEL), "C", "event")
     backend = FakeBackend(["inner answer"], model=MODEL)
     draft = _generate(DraftWorkflow(backend), scene, "C", "inner")
     assert draft.reasoning[0].text == "observer-only fake reasoning"
 
+    # The browser decides whether to echo reasoning back; this confirmation
+    # does not, so the turn persists an empty list and the provider text is
+    # never written. Reasoning also never enters any later model request.
     scene = confirm_draft(scene, "C", "inner", confirmation(draft))
     next_backend = FakeBackend([], model=MODEL)
     serialized_scene = json.dumps(scene.model_dump(mode="json"))
@@ -241,6 +246,7 @@ def test_reasoning_is_observer_only_and_never_persisted_or_reused() -> None:
 
     assert "observer-only fake reasoning" not in serialized_scene
     assert "observer-only fake reasoning" not in serialized_context
+    assert scene.agents[2].inner_context.turns[-1].reasoning == []
     assert next_backend.generate_calls == []
 
 

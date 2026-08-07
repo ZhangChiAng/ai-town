@@ -331,6 +331,60 @@ def test_valid_draft_confirms_after_restart_without_bound_model(
     )
 
 
+def test_confirmation_persists_reasoning_and_accepts_empty_reasoning(
+    tmp_path: Path,
+) -> None:
+    """Reasoning travels with confirmation into persisted scene history."""
+    storage = SceneStorage(tmp_path / "scenes")
+    backend = _backend(["inner answer", "To B: outer answer"])
+    client = TestClient(create_app(storage, {FAKE_MODEL: backend}))
+    scene = _post_scene(client)
+    scene = _post_event(client, scene["id"], "A", "pending event")
+    inner = _generate(client, scene["id"], "A", "inner")
+
+    confirmed = _require_json(
+        _confirm(
+            client,
+            scene["id"],
+            "A",
+            "inner",
+            inner,
+            reasoning=[
+                {
+                    "type": "summary_text",
+                    "text": "confirmed reasoning text",
+                }
+            ],
+        )
+    )
+    assert confirmed["agents"][0]["inner_context"]["turns"][0]["reasoning"] == [
+        {"type": "summary_text", "text": "confirmed reasoning text"}
+    ]
+
+    # Sonnet-style empty reasoning is legal and must not reject with 422.
+    outer = _generate(client, scene["id"], "A", "outer")
+    completed = _require_json(
+        _confirm(
+            client,
+            scene["id"],
+            "A",
+            "outer",
+            outer,
+            reasoning=[],
+        )
+    )
+    assert (
+        completed["agents"][0]["outer_context"]["turns"][0]["reasoning"] == []
+    )
+
+    # Persisted reasoning survives a reload straight from disk.
+    reloaded = storage.get(UUID(scene["id"]))
+    assert reloaded.agents[0].inner_context.turns[0].reasoning[0].text == (
+        "confirmed reasoning text"
+    )
+    assert reloaded.agents[0].outer_context.turns[0].reasoning == []
+
+
 @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
 def test_failed_generation_is_sanitized_and_returns_no_snapshot(
     tmp_path: Path,

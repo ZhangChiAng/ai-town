@@ -76,9 +76,10 @@
 7. 用户确认外层，后端保存外层 turn，并把它转成接收者的新事件。
 
 每次“生成”或“重新生成”恰好调用模型一次。确认不调用模型。生成不会写
-scene JSON，未确认草稿、token usage、调用状态令牌、请求快照和提供商返回的
-临时 reasoning 只存在浏览器。刷新页面会丢失这些内容；reasoning 不会进入
-确认数据或任何后续请求。
+scene JSON，未确认草稿、token usage、调用状态令牌和请求快照只存在浏览器。
+提供商返回的可见 reasoning 在确认时随草稿落盘到对应已确认的 turn；reasoning
+不会进入任何后续模型请求，也不参与草稿失效判定（状态令牌只哈希
+input/output）。空 reasoning 合法：模型不返回思考时落盘空数组。
 
 确认后的内层 turn 会形成可持久化的半回合。页面刷新并重新打开场景后，该
 Agent 直接恢复到等待外层阶段，不需要重新生成内层。
@@ -145,10 +146,11 @@ FIFO 顺序在同一“外部事件”块内呈现；消费后队列清空，留
 
 ## 6. 持久化、顺序与回退
 
-当前 scene schema 为 v7。schema v6 文件在加载时被一次性迁移到 v7：每个
-内层 turn 的 `consumed_event` 与 `event_id` 被包成单元素列表
+当前 scene schema 为 v8。schema v6 文件在加载时被一次性迁移到 v8：先执行
+v6→v7（每个内层 turn 的 `consumed_event` 与 `event_id` 被包成单元素列表
 `consumed_events` 与 `event_ids`，每个外层 turn 的 `event_id` 被包成
-`event_ids`，`schema_version` 写为 7。schema v1–v5 一律拒绝，不做迁移。
+`event_ids`），再执行 v7→v8（每个 turn 缺失的 `reasoning` 补为空数组）；
+单独的 v7 文件也直接执行 v7→v8 迁移。schema v1–v5 一律拒绝，不做迁移。
 每个场景保存显式的 `model: string | null`；新建场景总是绑定具体模型，`null`
 只表示尚待一次性绑定的未绑定场景。
 
@@ -158,7 +160,8 @@ FIFO 顺序在同一“外部事件”块内呈现；消费后队列清空，留
   显示 `sequence`；
 - 实际发送的本轮 `input`；
 - 用户最终确认的 `output`；
-- `consumed_events`：本轮被消费事件按 FIFO 顺序的完整快照列表。
+- `consumed_events`：本轮被消费事件按 FIFO 顺序的完整快照列表；
+- `reasoning`：确认时回传的可见推理块列表，可为空数组。
 
 每个外层 turn 保存：
 
@@ -166,7 +169,8 @@ FIFO 顺序在同一“外部事件”块内呈现；消费后队列清空，留
   `sequence`；
 - 实际发送的本轮 `input`；
 - 规范化后的确认 `output`；
-- `recipient_id` 与生成的 `generated_event_id`。
+- `recipient_id` 与生成的 `generated_event_id`；
+- `reasoning`：确认时回传的可见推理块列表，可为空数组。
 
 事件保存自己的 ID、显示顺序、正文、手工或 Agent 来源，以及 Agent 事件所需
 的来源调用引用。事件在待处理队列或一个已确认内层 turn 的 `consumed_events`
@@ -193,10 +197,13 @@ FIFO 顺序在同一“外部事件”块内呈现；消费后队列清空，留
 
 生成响应包含当前 `event_ids`（整批）、浏览器使用的 `call_id`、文本、临时
 reasoning、token usage、实际请求快照和由协议无关业务上下文计算的状态令牌。
+确认请求携带该轮 reasoning（可为空数组），后端把它与确认文本一起落盘到
+turn；reasoning 属于输出侧产物，不参与“草稿是否过期”判定。
 
 `state_token` 哈希场景绑定模型、Agent、人格层、当前完整事件批量、当前层
 `system_prompt`、当前层全部已确认 turns 和本轮 input。它不哈希 adapter
-payload；请求字段、缓存传输元数据或 adapter 实现变化不会单独使草稿失效。
+payload，也不哈希 reasoning；请求字段、缓存传输元数据或 reasoning 变化不会
+单独使草稿失效。
 
 确认时后端从当前已保存场景重新构造同层业务上下文，并校验：
 
@@ -300,8 +307,9 @@ hook 从本次实际调用捕获的、已完成序列化且不含凭据的 JSON 
 
 Anthropic 只展示公开 thinking 文本。OpenAI 展示公开 reasoning summary，并只
 对白名单中已文档化的 `raw_content` 形状映射现有 `reasoning_text`。签名、加密、
-redacted 及其他 provider details 不展示；所有 reasoning 都是未持久化的观察
-数据。
+redacted 及其他 provider details 不展示；落盘的 reasoning 就是这份投影后的
+安全可读文本（为空时写空数组），确认后进入场景历史展示，但绝不进入任何后续
+模型请求。
 
 ## 10. 技术与数据边界
 
@@ -327,7 +335,7 @@ redacted 及其他 provider details 不展示；所有 reasoning 都是未持久
 per-vendor 约定填写专属请求字段。
 配置层不硬编码协议枚举；注册表拒绝没有已注册 factory 的 key。TOML 声明顺序
 就是后端创建顺序和界面模型顺序，`GET /api/model-options` 的每个元素严格只有
-`{model}`。scene schema 当前为 v7（加载时迁移 v6），并继续只用
+`{model}`。scene schema 当前为 v8（加载时迁移 v6 与 v7），并继续只用
 `scene.model` 保存绑定。
 
 进程环境中的密钥优先于可选 `.env`；真实密钥不得写入 TOML。仓库提交
@@ -340,7 +348,8 @@ per-vendor 约定填写专属请求字段。
 共享 contract tests，不修改业务 workflow、路由或前端。
 
 `data/` 是被 Git 忽略的纯运行时目录，不包含产品基线或参考材料。应用按需创建
-`data/scenes/`，只在其中保存 schema v7 场景 JSON（加载时自动迁移 schema v6）。
+`data/scenes/`，只在其中保存 schema v8 场景 JSON（加载时自动迁移
+schema v6 与 v7）。
 
 ## 11. 明确非目标
 

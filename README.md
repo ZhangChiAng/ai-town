@@ -126,9 +126,10 @@ Vite 默认位于 `http://127.0.0.1:5173`，并把 `/api` 代理到
    `From A: 正文` 事件。
 7. 继续手工选择 Agent 推进，或使用“回退最近确认”逐调用回退。
 
-生成与重新生成每次只调用模型一次；确认不调用模型。未确认草稿、请求快照、
-token usage 和临时 reasoning 只存在浏览器，刷新即丢失。reasoning 不会保存
-或进入后续上下文。已经确认内层的半回合保存在 JSON，重新打开场景后会恢复
+生成与重新生成每次只调用模型一次；确认不调用模型。未确认草稿、请求快照和
+token usage 只存在浏览器，刷新即丢失。可见 reasoning 在确认时随草稿落盘到
+场景历史，重新打开场景后仍可在时间线中展开查看；reasoning 不会进入后续
+模型请求或上下文。已经确认内层的半回合保存在 JSON，重新打开场景后会恢复
 到外层阶段。
 
 手工事件只进入当前 Agent，按 FIFO 处理。仍在队列中的手工事件可编辑或删除；
@@ -200,7 +201,7 @@ adapter payload。因此事件、prompt、同层历史、模型或阶段变化�
 显式未绑定或绑定模型不在当前进程配置中的场景仍可查看、编辑、管理事件和
 回退，但不能新建预览或生成，相关请求返回 `409`。确认既不访问模型注册表也不
 调用模型；模型从配置移除后，已有且业务状态仍有效的浏览器草稿仍可确认。
-未绑定 v6 场景可通过界面或 `PUT /api/scenes/{scene_id}/model` 永久绑定一次。
+未绑定场景可通过界面或 `PUT /api/scenes/{scene_id}/model` 永久绑定一次。
 
 ## Pydantic AI Direct 与独立 prompt cache
 
@@ -231,10 +232,11 @@ previous response ID 或 Anthropic 缓存元数据；厂商 API 天然无状态�
 协议只需实现 adapter、注册 factory 并通过共享 contract
 tests，不需要修改业务 workflow、API 路由或前端。
 
-## Scene schema v6
+## Scene schema v8
 
 每个场景保存为 `data/scenes/<scene-id>.json`，采用同目录临时文件与原子
-替换。schema v6 不读取或迁移任何旧 schema。
+替换。当前 schema 为 v8；加载时一次性迁移 v6（先 v6→v7 再 v7→v8）与 v7
+（v7→v8）文件，v1–v5 一律拒绝。
 
 Agent 只包含：
 
@@ -243,8 +245,9 @@ Agent 只包含：
 - `outer_context.system_prompt` 与 `outer_context.turns`
 - `pending_events`
 
-turn 保存调用 ID、事件 ID、显示顺序、实际 input 和确认 output。内层还保存
-被消费事件，外层还保存接收者和生成事件 ID。场景额外保存不可变
+turn 保存调用 ID、事件 ID、显示顺序、实际 input 和确认 output，以及确认时
+落盘的 `reasoning` 可见推理列表（可为空数组，模型不返回思考时为空）。内层
+还保存被消费事件，外层还保存接收者和生成事件 ID。场景额外保存不可变
 `model: string | null`、全局 `rollback_stack` 与单调递增 `next_sequence`。
 `null` 只允许一次性绑定；回退栈和显示顺序不进入模型请求。
 
