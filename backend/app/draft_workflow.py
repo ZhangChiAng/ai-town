@@ -317,7 +317,7 @@ def confirm_draft(
         parse_addressed_message(confirmation.content, agent_id)
     except ValueError as error:
         raise InvalidLayerOutputError(
-            "Outer output must be one non-self 'To X: body' line."
+            "Outer output must be a non-self 'To X: body' message."
         ) from error
     return confirm_outer_turn(
         scene,

@@ -258,6 +258,26 @@ def test_invalid_outer_generation_fails_after_exactly_one_call() -> None:
     assert len(invalid_backend.generate_calls) == 1
 
 
+def test_multiline_outer_body_is_preserved_and_routed() -> None:
+    """A visible outer message may span lines after its address prefix."""
+    body = "谁啊？\n\n*放下筷子，看着你*\n\n你最近怎么了？"
+    scene = add_manual_event(prompted_scene("多行外层", MODEL), "A", "event")
+    workflow = DraftWorkflow(
+        FakeBackend(["inner answer", f"To B: {body}"], model=MODEL)
+    )
+
+    inner = _generate(workflow, scene, "A", "inner")
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
+    outer = _generate(workflow, scene, "A", "outer")
+    scene = confirm_draft(scene, "A", "outer", confirmation(outer))
+
+    turn = scene.agents[0].outer_context.turns[-1]
+    assert turn.recipient_id == "B"
+    assert turn.output == f"To B: {body}"
+    recipient = next(agent for agent in scene.agents if agent.id == "B")
+    assert recipient.pending_events[-1].content == f"From A: {body}"
+
+
 def test_outer_preview_is_rejected_before_inner_confirmation() -> None:
     """The workflow enforces the manual inner-before-outer phase."""
     scene = add_manual_event(prompted_scene("阶段", MODEL), "A", "event")

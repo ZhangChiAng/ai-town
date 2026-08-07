@@ -52,27 +52,30 @@ def _strip_non_blank_model(value: str) -> str:
     return stripped
 
 
-_ADDRESSED_MESSAGE_PATTERN = re.compile(
-    r"\ATo\s+([A-C])\s*[:：]\s*(\S(?:[^\r\n]*\S)?)\s*\Z"
-)
+_ADDRESSED_MESSAGE_PREFIX = re.compile(r"\ATo\s+([A-C])\s*[:：]\s*")
 
 
 def parse_addressed_message(
     content: str,
     sender_id: AgentId,
 ) -> tuple[AgentId, str]:
-    """Parse one visible ``To <AgentId>: <body>`` message."""
-    if "\n" in content or "\r" in content:
-        raise ValueError("content must contain exactly one line")
-    match = _ADDRESSED_MESSAGE_PATTERN.fullmatch(content)
+    """Parse one visible ``To <AgentId>: <body>`` message.
+
+    The body may span multiple lines; only the leading address line is
+    required. The body is returned without surrounding whitespace.
+    """
+    match = _ADDRESSED_MESSAGE_PREFIX.match(content)
     if match is None:
         raise ValueError(
-            "content must be one line in the form 'To B: message body'"
+            "content must start with an address in the form 'To B: body'"
         )
     recipient_id = match.group(1)
     if recipient_id == sender_id:
         raise ValueError("message recipient must differ from sender")
-    return recipient_id, match.group(2)
+    body = content[match.end() :].strip()
+    if not body:
+        raise ValueError("message body must not be blank")
+    return recipient_id, body
 
 
 class TokenUsage(ApiModel):

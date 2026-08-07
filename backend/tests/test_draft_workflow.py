@@ -14,6 +14,7 @@ from app.draft_workflow import (
 )
 from app.models import (
     AgentId,
+    InvalidLayerOutputError,
     Layer,
     LayerDraftResponse,
     Scene,
@@ -314,6 +315,27 @@ def test_generation_errors_are_sanitized_and_never_retried() -> None:
         _generate(DraftWorkflow(invalid_outer), half_round, "A", "outer")
 
     assert len(invalid_outer.generate_calls) == 1
+
+
+def test_outer_confirmation_rejects_multiline_blank_body() -> None:
+    """Edited outer output still needs non-blank text after the address."""
+    scene = add_manual_event(prompted_scene("Blank body", MODEL), "A", "event")
+    inner = _generate(
+        DraftWorkflow(FakeBackend(["inner"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
+    )
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
+    outer = _generate(
+        DraftWorkflow(FakeBackend(["To B: first"], model=MODEL)),
+        scene,
+        "A",
+        "outer",
+    )
+
+    with pytest.raises(InvalidLayerOutputError, match="non-self"):
+        confirm_draft(scene, "A", "outer", confirmation(outer, "To B: \n\n"))
 
 
 def test_workflow_rejects_backend_for_a_different_scene_model() -> None:
