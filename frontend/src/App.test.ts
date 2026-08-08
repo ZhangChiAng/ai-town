@@ -196,6 +196,17 @@ function findButton(
   return button as HTMLButtonElement;
 }
 
+function findButtonByAriaLabel(
+  container: HTMLElement,
+  label: string,
+): HTMLButtonElement {
+  const button = container.querySelector(`button[aria-label="${label}"]`);
+  if (button === null) {
+    throw new Error(`Button not found by aria-label: ${label}`);
+  }
+  return button as HTMLButtonElement;
+}
+
 function emptyResponse(status = 204): Response {
   return {
     ok: status >= 200 && status < 300,
@@ -766,7 +777,7 @@ describe("App", () => {
     expect(
       container.querySelector(".scene-delete-button"),
     ).not.toBeNull();
-    findButton(container, "删除").click();
+    findButtonByAriaLabel(container, "删除场景").click();
     await flush();
 
     expect(confirmSpy).toHaveBeenCalledWith(
@@ -792,7 +803,7 @@ describe("App", () => {
       [`DELETE /api/scenes/${SCENE_ID}`]: emptyResponse(204),
     });
 
-    findButton(container, "删除").click();
+    findButtonByAriaLabel(container, "删除场景").click();
     await flush();
 
     expect(container.textContent).toContain(scene.name);

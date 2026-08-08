@@ -145,8 +145,8 @@ pre {
 .scene-sidebar {
   display: flex;
   flex-direction: column;
-  gap: 26px;
-  padding: 25px 18px 20px;
+  gap: 20px;
+  padding: 20px 14px 16px;
   color: #e9f0ed;
   background: #1d2d29;
 }
@@ -198,6 +198,9 @@ pre {
 }
 
 .scene-list-wrap {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
   min-height: 0;
 }
 
@@ -205,12 +208,15 @@ pre {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 9px;
+  margin-bottom: 10px;
+  padding: 0 4px;
 }
 
 .sidebar-heading h2 {
   margin: 0;
-  font-size: 13px;
+  color: #95a8a1;
+  font-size: 12px;
+  font-weight: 700;
   letter-spacing: 0.08em;
 }
 
@@ -219,76 +225,110 @@ pre {
 }
 
 .scene-list {
-  display: grid;
-  gap: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
   padding: 0;
+  padding-right: 2px;
   margin: 0;
+  overflow-y: auto;
   list-style: none;
 }
 
 .scene-list li {
-  display: flex;
-  align-items: stretch;
-  gap: 6px;
-}
-
-.scene-list button {
   display: grid;
+  grid-template-columns: minmax(0, 1fr) 26px;
   gap: 4px;
-  width: 100%;
-  padding: 11px 12px;
-  color: #dce7e3;
-  text-align: left;
+  align-items: center;
+  padding: 2px 4px;
+  color: #e9f0ed;
   border: 1px solid transparent;
-  border-radius: 9px;
-  background: transparent;
+  border-radius: 10px;
 }
 
-.scene-list button:hover {
+.scene-list li:hover {
   background: #273c36;
 }
 
-.scene-list button.active {
+.scene-list li.active {
   color: white;
-  border-color: #597169;
   background: #304941;
+  border-color: #597169;
   box-shadow: inset 3px 0 #d9ad79;
+}
+
+.scene-list-item-button {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 10px;
+  color: inherit;
+  text-align: left;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+}
+
+.scene-list-item-button:focus-visible {
+  outline: 2px solid #d9ad79;
+  outline-offset: 2px;
 }
 
 .scene-list strong {
   overflow: hidden;
   font-size: 14px;
+  font-weight: 600;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .scene-list small {
-  color: #91a49d;
+  color: #8da39b;
   font-family: ui-monospace, monospace;
   font-size: 10px;
 }
 
 .scene-delete-button {
-  flex: 0 0 auto;
-  align-self: center;
-  padding: 5px 10px;
-  font-size: 12px;
-  color: #e0a0a0;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  color: #a8c0b8;
+  visibility: hidden;
+  border: 0;
+  border-radius: 50%;
+  opacity: 0;
   background: transparent;
+  transition:
+    color 120ms ease,
+    background 120ms ease,
+    opacity 120ms ease;
+}
+
+.scene-delete-button.visible {
+  visibility: visible;
+  opacity: 1;
+}
+
+.scene-delete-button svg {
+  width: 12px;
+  height: 12px;
 }
 
 .scene-delete-button:hover:not(:disabled) {
-  color: #f4cccc;
-  background: #4a2727;
+  color: #ff9999;
+  background: rgb(164 57 50 / 18%);
 }
 
 .storage-note {
-  margin: auto 2px 0;
-  color: #98aaa4;
+  margin: auto 4px 0;
+  padding: 0 4px;
+  color: #7e9690;
   font-size: 11px;
-  line-height: 1.6;
+  line-height: 1.55;
 }
 
 .content-region {
@@ -1193,6 +1233,7 @@ pre {
   }
 
   .scene-list {
+    display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1241,6 +1282,11 @@ pre {
 @media (max-width: 520px) {
   .scene-sidebar {
     grid-template-columns: 1fr;
+  }
+
+  .scene-list {
+    display: flex;
+    flex-direction: column;
   }
 
   .agent-tabs {
