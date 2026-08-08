@@ -27,6 +27,7 @@ coverage/
 
 # Logs
 *.log
+/logs/
 
 # Local persistent data
 data/

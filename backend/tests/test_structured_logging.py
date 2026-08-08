@@ -5,13 +5,26 @@ import json
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 from uuid import UUID
 
+import pytest
+
 from app.main import create_app
+from app.model_backends.contracts import (
+    LoggedModelError,
+    ModelConversation,
+    ModelGeneration,
+)
 from app.storage import SceneStorage
 from app.structured_logging import (
+    JSON_LOG_DISPLAY_PATH,
+    JSON_LOG_PATH,
     REDACTED,
+    HumanConsoleHandler,
+    HumanFormatter,
     JsonFormatter,
+    JsonlRotatingFileHandler,
     bind_log_context,
     log_event,
     register_secrets,
@@ -19,6 +32,7 @@ from app.structured_logging import (
 from tests.client import TestClient
 from tests.helpers import (
     FakeBackend,
+    confirm_draft,
     fill_prompts,
     generate_draft,
     make_client,
@@ -27,6 +41,34 @@ from tests.helpers import (
 )
 
 MODEL = "structured-log-model"
+
+
+class _TtyStream(io.StringIO):
+    """In-memory stream that reports terminal color support."""
+
+    def isatty(self) -> bool:
+        """Pretend this capture is connected to an interactive terminal."""
+        return True
+
+
+class _DetailedFailureBackend(FakeBackend):
+    """Backend double that logs its own detailed failure before raising."""
+
+    async def generate(
+        self,
+        conversation: ModelConversation,
+    ) -> ModelGeneration:
+        """Emit one adapter-style event and raise its safe marker."""
+        self.generate_calls.append(conversation)
+        log_event(
+            logging.getLogger("tests.detailed_backend"),
+            logging.ERROR,
+            "model.provider_request.failed",
+            "Upstream model request timed out.",
+            failure_category="upstream_timeout",
+            exception_type="ReadTimeout",
+        )
+        raise LoggedModelError("detailed diagnostics already logged")
 
 
 @contextmanager
@@ -80,6 +122,136 @@ def test_json_formatter_emits_stable_unicode_event_and_full_stack() -> None:
     assert document["scene_id"] is None
     assert long_message in document["exception"]
     assert "RuntimeError" in document["exception"]
+
+
+def test_human_and_json_formats_share_full_redacted_document() -> None:
+    """Both channels use the same safe values without terminal truncation."""
+    secret = "shared-format-secret"
+    register_secrets([secret])
+    human_stream = io.StringIO()
+    json_stream = io.StringIO()
+    human_handler = HumanConsoleHandler(human_stream)
+    human_handler.setFormatter(HumanFormatter())
+    json_handler = logging.StreamHandler(json_stream)
+    json_handler.setFormatter(JsonFormatter())
+    logger = logging.Logger("tests.shared_formats", level=logging.DEBUG)
+    logger.addHandler(human_handler)
+    logger.addHandler(json_handler)
+    visible_output = "完整模型输出" * 1500
+
+    with bind_log_context(
+        request_id="request-human",
+        scene_id="",
+        call_id="call-human",
+    ):
+        log_event(
+            logger,
+            logging.ERROR,
+            "model.workflow.failed",
+            "外层格式错误",
+            failure_category="outer_protocol",
+            visible_output=visible_output,
+            nested={
+                "Authorization": f"Bearer {secret}",
+                "safe": f"before-{secret}-after",
+            },
+        )
+
+    human = human_stream.getvalue()
+    [document] = _documents(json_stream)
+    assert "外层格式错误" in human
+    assert visible_output in human
+    assert document["visible_output"] == visible_output
+    assert document["nested"] == {
+        "Authorization": REDACTED,
+        "safe": f"before-{REDACTED}-after",
+    }
+    assert secret not in human
+    assert secret not in json_stream.getvalue()
+    assert 'request_id="request-human"' in human
+    assert 'call_id="call-human"' in human
+    assert f'json_log="{JSON_LOG_DISPLAY_PATH}"' in human
+    assert "scene_id=" not in human
+    assert len(json_stream.getvalue().splitlines()) == 1
+
+
+def test_human_terminal_color_is_tty_only_and_honors_no_color(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ANSI styling follows TTY detection and the standard opt-out."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    color_stream = _TtyStream()
+    color_handler = HumanConsoleHandler(color_stream)
+    color_handler.setFormatter(HumanFormatter())
+    logger = logging.Logger("tests.color", level=logging.INFO)
+    logger.addHandler(color_handler)
+    log_event(logger, logging.INFO, "test.colored", "彩色消息")
+    assert "\x1b[" in color_stream.getvalue()
+
+    monkeypatch.setenv("NO_COLOR", "1")
+    plain_stream = _TtyStream()
+    plain_handler = HumanConsoleHandler(plain_stream)
+    plain_handler.setFormatter(HumanFormatter())
+    logger.handlers = [plain_handler]
+    log_event(logger, logging.INFO, "test.plain", "无颜色消息")
+    assert "\x1b[" not in plain_stream.getvalue()
+
+
+def test_jsonl_handler_rotates_five_backups_and_deletes_oldest(
+    tmp_path: Path,
+) -> None:
+    """JSONL remains parseable while bounded rotation removes old files."""
+    path = tmp_path / "nested" / "ai-town.jsonl"
+    handler = JsonlRotatingFileHandler(
+        filename=path,
+        max_bytes=500,
+        backup_count=5,
+    )
+    handler.setFormatter(JsonFormatter())
+    logger = logging.Logger("tests.rotation", level=logging.INFO)
+    logger.addHandler(handler)
+    try:
+        for sequence in range(10):
+            log_event(
+                logger,
+                logging.INFO,
+                "rotation.event",
+                "轮转测试",
+                sequence=sequence,
+                payload="x" * 600,
+            )
+    finally:
+        handler.close()
+
+    files = [path, *[Path(f"{path}.{index}") for index in range(1, 6)]]
+    assert all(file.exists() for file in files)
+    assert not Path(f"{path}.6").exists()
+    documents = [
+        json.loads(line)
+        for file in files
+        for line in file.read_text(encoding="utf-8").splitlines()
+    ]
+    assert {document["sequence"] for document in documents} == set(range(4, 10))
+
+
+def test_production_config_archives_app_debug_but_not_uvicorn() -> None:
+    """The default routing keeps reload-process output terminal-only."""
+    repository_root = Path(__file__).resolve().parents[2]
+    config = json.loads(
+        (repository_root / "backend" / "logging.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert repository_root / JSON_LOG_DISPLAY_PATH == JSON_LOG_PATH
+    assert JSON_LOG_PATH.is_absolute()
+    assert config["root"] == {
+        "handlers": ["terminal", "jsonl"],
+        "level": "DEBUG",
+    }
+    assert config["handlers"]["terminal"]["level"] == "INFO"
+    assert config["handlers"]["jsonl"]["level"] == "DEBUG"
+    assert config["handlers"]["jsonl"]["filters"] == ["structured_event"]
+    assert config["loggers"]["uvicorn"]["handlers"] == ["terminal"]
 
 
 def test_redaction_covers_nested_auth_url_body_and_exception() -> None:
@@ -148,7 +320,10 @@ def test_http_request_id_is_server_generated_and_success_bodies_are_absent(
         if document["event"]
         in {"http.request.started", "scene.created", "http.request.completed"}
     ]
-    assert len(relevant) == 3
+    assert len(relevant) == 2
+    assert all(
+        document["event"] != "http.request.started" for document in documents
+    )
     assert {document["request_id"] for document in relevant} == {
         response_request_id
     }
@@ -237,8 +412,74 @@ def test_model_failure_logs_full_context_with_call_and_request_ids(
     assert failed["conversation"]["current_input"] == (
         f"外部事件：\n{event_content}"
     )
+    assert failed["failure_category"] == "internal"
     assert "RuntimeError" in failed["exception"]
     assert secret not in stream.getvalue()
+
+
+def test_outer_protocol_failure_logs_reason_and_full_visible_output(
+    tmp_path: Path,
+) -> None:
+    """Invalid outer text remains complete beside its validation reason."""
+    visible_output = "不带收件人协议的原始输出" * 1200
+    backend = FakeBackend(["内层判断", visible_output], model=MODEL)
+    client = make_client(tmp_path, backend)
+    scene = fill_prompts(client, post_scene(client, model=MODEL))
+    scene = post_event(client, scene["id"], "A", "触发外层格式校验")
+    inner = generate_draft(client, scene["id"], "A", "inner")
+    confirmation = confirm_draft(
+        client,
+        scene["id"],
+        "A",
+        "inner",
+        inner,
+        reasoning=inner["reasoning"],
+    )
+    assert confirmation.status_code == 200
+
+    with _captured_json_logs() as stream:
+        response = client.post(
+            f"/api/scenes/{scene['id']}/agents/A/outer-drafts"
+        )
+
+    assert response.status_code == 502
+    failure = next(
+        document
+        for document in _documents(stream)
+        if document["event"] == "model.workflow.failed"
+    )
+    assert failure["failure_category"] == "outer_protocol"
+    assert failure["visible_output"] == visible_output
+    assert failure["validation_error"]
+    assert "ValueError" in failure["exception"]
+
+
+def test_detailed_backend_failure_does_not_add_generic_duplicate(
+    tmp_path: Path,
+) -> None:
+    """Adapter diagnostics suppress only the workflow's generic fallback."""
+    backend = _DetailedFailureBackend([], model=MODEL)
+    client = make_client(tmp_path, backend)
+    scene = fill_prompts(client, post_scene(client, model=MODEL))
+    scene = post_event(client, scene["id"], "A", "触发详细适配器错误")
+
+    with _captured_json_logs() as stream:
+        response = client.post(
+            f"/api/scenes/{scene['id']}/agents/A/inner-drafts"
+        )
+
+    assert response.status_code == 502
+    documents = _documents(stream)
+    detailed = [
+        document
+        for document in documents
+        if document["event"] == "model.provider_request.failed"
+    ]
+    assert len(detailed) == 1
+    assert detailed[0]["failure_category"] == "upstream_timeout"
+    assert all(
+        document["event"] != "model.call.failed" for document in documents
+    )
 
 
 def test_model_success_logs_usage_hashes_and_final_call_id(tmp_path) -> None:

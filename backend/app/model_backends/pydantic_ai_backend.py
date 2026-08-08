@@ -20,6 +20,7 @@ from pydantic_ai.settings import ModelSettings
 
 from app.model_backends.contracts import (
     JsonObject,
+    LoggedModelError,
     ModelConversation,
     ModelGeneration,
     ModelReasoning,
@@ -116,14 +117,19 @@ def _log_request_failure(
     exc: BaseException,
 ) -> None:
     """Record untruncated request, provider error, and exception details."""
+    failure_category, message = _classify_request_failure(exc)
     log_event(
         LOGGER,
         logging.ERROR,
         "model.provider_request.failed",
-        "Provider request failed.",
+        message,
         exception=exc,
         provider=provider,
         model=model,
+        failure_category=failure_category,
+        upstream_status_code=(
+            exc.status_code if isinstance(exc, ModelHTTPError) else None
+        ),
         conversation=conversation,
         serialized_requests=capture.requests_for_logging(),
         provider_error=exc,
@@ -150,10 +156,47 @@ def _log_projection_failure(
         exception=exc,
         provider=provider,
         model=model,
+        failure_category="response_projection",
         conversation=conversation,
         serialized_requests=capture.requests_for_logging(),
         provider_response=response,
     )
+
+
+def _classify_request_failure(exc: BaseException) -> tuple[str, str]:
+    """Return a stable category and readable summary for an upstream error."""
+    if isinstance(exc, ModelHTTPError):
+        return "upstream_http", "Upstream HTTP request failed."
+
+    chain = tuple(_exception_chain(exc))
+    if any(isinstance(error, httpx.TimeoutException) for error in chain):
+        return "upstream_timeout", "Upstream model request timed out."
+    if any("timeout" in type(error).__name__.casefold() for error in chain):
+        return "upstream_timeout", "Upstream model request timed out."
+    if any(
+        isinstance(error, httpx.TransportError | ConnectionError)
+        for error in chain
+    ):
+        return "upstream_connection", "Upstream model connection failed."
+    if any(
+        "connection" in type(error).__name__.casefold()
+        or "network" in type(error).__name__.casefold()
+        for error in chain
+    ):
+        return "upstream_connection", "Upstream model connection failed."
+    return "internal", "Provider request failed with an internal error."
+
+
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Collect explicit or implicit causes without following cycles."""
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return chain
 
 
 async def _capture_request_body(request: httpx.Request) -> None:
@@ -281,7 +324,7 @@ class PydanticAIBackend:
                 if request_failed:
                     # Raise after logging so browser errors retain no provider
                     # exception, body, URL, or authentication data.
-                    raise RuntimeError(
+                    raise LoggedModelError(
                         "Pydantic AI model request failed"
                     ) from None
 
@@ -303,7 +346,9 @@ class PydanticAIBackend:
                         response,
                         exc,
                     )
-                    raise
+                    raise LoggedModelError(
+                        "Provider response projection failed"
+                    ) from None
             finally:
                 # A later call must never inherit this call's wire details.
                 _ACTIVE_REQUEST_CAPTURE.reset(token)

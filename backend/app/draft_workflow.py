@@ -10,6 +10,7 @@ from typing import Literal
 from uuid import UUID, uuid4
 
 from app.model_backends.contracts import (
+    LoggedModelError,
     ModelBackend,
     ModelConversation,
     ModelTurn,
@@ -134,6 +135,9 @@ class DraftWorkflow:
             backend_failed = False
             try:
                 generation = await self._backend.generate(draft.conversation)
+            except LoggedModelError:
+                # Concrete adapters already emitted the full diagnostic.
+                backend_failed = True
             except Exception as error:
                 log_event(
                     LOGGER,
@@ -141,6 +145,7 @@ class DraftWorkflow:
                     "model.call.failed",
                     "Model call failed.",
                     exception=error,
+                    failure_category="internal",
                     duration_ms=_duration_ms(started_at),
                     conversation=draft.conversation,
                     event_ids=draft.event_ids,
@@ -163,6 +168,8 @@ class DraftWorkflow:
                         "model.workflow.failed",
                         "Model output failed outer-layer validation.",
                         exception=error,
+                        failure_category="outer_protocol",
+                        validation_error=str(error),
                         duration_ms=_duration_ms(started_at),
                         conversation=draft.conversation,
                         serialized_request=generation.request_snapshot,

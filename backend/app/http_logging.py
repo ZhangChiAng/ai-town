@@ -100,7 +100,7 @@ class RequestLoggingMiddleware:
         ):
             log_event(
                 LOGGER,
-                logging.INFO,
+                logging.DEBUG,
                 "http.request.started",
                 "HTTP request started.",
                 **request_fields,

@@ -2,25 +2,39 @@
   "version": 1,
   "disable_existing_loggers": false,
   "formatters": {
+    "human": {
+      "()": "app.structured_logging.HumanFormatter"
+    },
     "json": {
       "()": "app.structured_logging.JsonFormatter"
     }
   },
+  "filters": {
+    "structured_event": {
+      "()": "app.structured_logging.StructuredEventFilter"
+    }
+  },
   "handlers": {
-    "stdout": {
-      "class": "logging.StreamHandler",
-      "formatter": "json",
+    "terminal": {
+      "class": "app.structured_logging.HumanConsoleHandler",
+      "formatter": "human",
       "level": "INFO",
       "stream": "ext://sys.stdout"
+    },
+    "jsonl": {
+      "class": "app.structured_logging.JsonlRotatingFileHandler",
+      "filters": ["structured_event"],
+      "formatter": "json",
+      "level": "DEBUG"
     }
   },
   "root": {
-    "handlers": ["stdout"],
-    "level": "INFO"
+    "handlers": ["terminal", "jsonl"],
+    "level": "DEBUG"
   },
   "loggers": {
     "uvicorn": {
-      "handlers": ["stdout"],
+      "handlers": ["terminal"],
       "level": "INFO",
       "propagate": false
     },

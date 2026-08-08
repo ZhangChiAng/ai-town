@@ -11,6 +11,10 @@ type JsonObject = dict[str, JsonValue]
 type ReasoningType = Literal["thinking", "summary_text", "reasoning_text"]
 
 
+class LoggedModelError(RuntimeError):
+    """Signal that a backend already emitted complete failure diagnostics."""
+
+
 def _require_non_blank(value: str, field_name: str) -> None:
     """Require meaningful text without changing its exact whitespace."""
     if not value.strip():

@@ -17,11 +17,13 @@ from pydantic_ai import (
     ToolCallPart,
     UserPromptPart,
 )
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.models import Model
 from pydantic_ai.usage import RequestUsage
 
 from app.model_backends import pydantic_ai_backend as backend_module
 from app.model_backends.contracts import (
+    LoggedModelError,
     ModelConversation,
     ModelReasoning,
     ModelTurn,
@@ -237,7 +239,7 @@ def test_generate_rejects_non_text_or_ambiguous_response_parts(
 
     async def scenario() -> None:
         try:
-            with pytest.raises(ValueError):
+            with pytest.raises(LoggedModelError):
                 await backend.generate(CONVERSATION)
         finally:
             await backend.aclose()
@@ -273,7 +275,7 @@ def test_projection_error_log_keeps_full_raw_provider_details(
 
     async def scenario() -> None:
         try:
-            with pytest.raises(ValueError):
+            with pytest.raises(LoggedModelError):
                 await backend.generate(CONVERSATION)
         finally:
             await backend.aclose()
@@ -287,10 +289,103 @@ def test_projection_error_log_keeps_full_raw_provider_details(
     )
     fields = record.event_fields
     serialized = json.dumps(fields, ensure_ascii=False)
+    assert fields["failure_category"] == "response_projection"
+    assert fields["exception_type"] == "ValueError"
     assert fields["conversation"]["current_input"] == CONVERSATION.current_input
     assert json.loads(fields["serialized_requests"][0]["body"]) == SNAPSHOT
     assert "raw-signature-for-server-log" in serialized
     assert long_provider_detail in serialized
+
+
+def test_http_failure_log_keeps_status_and_full_provider_body(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """HTTP failures identify the upstream and preserve its complete body."""
+    backend, client, _direct_model = _build_backend()
+    provider_body = {"error": "供应商完整错误正文" * 1000}
+
+    async def fake_model_request(*_args: Any, **_kwargs: Any) -> ModelResponse:
+        await _post_json(client, SNAPSHOT)
+        raise ModelHTTPError(503, MODEL, provider_body)
+
+    monkeypatch.setattr(backend_module, "model_request", fake_model_request)
+    caplog.set_level(logging.ERROR)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(LoggedModelError):
+                await backend.generate(CONVERSATION)
+        finally:
+            await backend.aclose()
+
+    asyncio.run(scenario())
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None)
+        == "model.provider_request.failed"
+    )
+    fields = record.event_fields
+    assert record.getMessage() == "Upstream HTTP request failed."
+    assert fields["failure_category"] == "upstream_http"
+    assert fields["provider"] == "anthropic"
+    assert fields["model"] == MODEL
+    assert fields["upstream_status_code"] == 503
+    assert fields["provider_http_body"] == provider_body
+    assert fields["exception_type"] == "ModelHTTPError"
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "message"),
+    [
+        (
+            httpx.ReadTimeout("upstream timed out"),
+            "upstream_timeout",
+            "Upstream model request timed out.",
+        ),
+        (
+            httpx.ConnectError("upstream connection failed"),
+            "upstream_connection",
+            "Upstream model connection failed.",
+        ),
+    ],
+    ids=("timeout", "connection"),
+)
+def test_transport_failure_log_has_stable_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    error: httpx.RequestError,
+    category: str,
+    message: str,
+) -> None:
+    """Timeout and connection paths stay distinct and name their exception."""
+    backend, client, _direct_model = _build_backend()
+
+    async def fake_model_request(*_args: Any, **_kwargs: Any) -> ModelResponse:
+        raise error
+
+    monkeypatch.setattr(backend_module, "model_request", fake_model_request)
+    caplog.set_level(logging.ERROR)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(LoggedModelError):
+                await backend.generate(CONVERSATION)
+        finally:
+            await backend.aclose()
+
+    asyncio.run(scenario())
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None)
+        == "model.provider_request.failed"
+    )
+    assert record.getMessage() == message
+    assert record.event_fields["failure_category"] == category
+    assert record.event_fields["exception_type"] == type(error).__name__
+    assert record.event_fields["upstream_status_code"] is None
 
 
 def test_anthropic_reasoning_exposes_only_non_blank_thinking(
@@ -433,7 +528,7 @@ def test_generate_rejects_invalid_or_inconsistent_usage(
 
     async def scenario() -> None:
         try:
-            with pytest.raises(ValueError):
+            with pytest.raises(LoggedModelError):
                 await backend.generate(CONVERSATION)
         finally:
             await backend.aclose()
@@ -564,7 +659,7 @@ def test_generate_rejects_missing_multiple_or_malformed_capture(
 
     async def scenario() -> None:
         try:
-            with pytest.raises(ValueError, match="snapshot"):
+            with pytest.raises(LoggedModelError, match="projection"):
                 await backend.generate(CONVERSATION)
         finally:
             await backend.aclose()
@@ -632,7 +727,7 @@ def test_malformed_capture_does_not_poison_later_success(
     monkeypatch.setattr(backend_module, "model_request", fake_model_request)
 
     async def scenario():
-        with pytest.raises(ValueError, match="snapshot"):
+        with pytest.raises(LoggedModelError, match="projection"):
             await backend.generate(CONVERSATION)
         result = await backend.generate(CONVERSATION)
         await backend.aclose()

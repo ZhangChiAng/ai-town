@@ -113,29 +113,40 @@ npm run dev
 Vite 默认位于 `http://127.0.0.1:5173`，并把 `/api` 代理到
 `http://127.0.0.1:8000`。后端健康检查为 `GET /api/health`。
 
-## 服务器结构化日志
+## 服务器日志
 
-后端与 Uvicorn 统一向服务器终端的 stdout 输出单行 JSON；项目不创建日志文件，
-也不提供日志轮转。`./start` 和上面的 Windows 命令都已加载
-`backend/logging.json`，默认等级为 `INFO`，并关闭 Uvicorn 自带的重复 access
-log。
+`./start` 和上面的 Windows 命令都会加载 `backend/logging.json`。应用从同一份
+已脱敏事件生成两种输出：
 
-每条记录固定包含 UTC `timestamp`、`level`、`logger`、`event`、`message`，以及
-`request_id`、`scene_id`、`agent_id`、`layer`、`call_id`、`model`、`provider`
-关联字段。所有 HTTP 响应都通过 `X-Request-ID` 返回后端新生成的 UUID；客户端
-传入的同名请求头不会被采用。
+- 服务器终端显示带层级的人类可读格式：UTC 时间、等级、事件、消息和非空关联
+  字段；普通字段紧凑排列，复杂对象和多行诊断缩进显示。TTY 自动着色，设置任意
+  值的 `NO_COLOR` 可关闭颜色。
+- 全部结构化应用事件以单行 JSON 写入根目录 `logs/ai-town.jsonl`。文件达到
+  10 MiB 后轮转，保留 `ai-town.jsonl.1` 至 `.5`；目录和文件由后端按需创建，
+  路径不受启动工作目录影响。
+
+Uvicorn 自己的启动、reload 和关闭提示只写终端，重复 access log 仍关闭。
+`http.request.started` 是 DEBUG，因此默认 INFO 终端中一个请求只显示完成事件；
+业务事件和 `model.call.started` 仍为 INFO。JSON 记录固定包含 UTC `timestamp`、
+`level`、`logger`、`event`、`message`，以及 `request_id`、`scene_id`、
+`agent_id`、`layer`、`call_id`、`model`、`provider`。所有 HTTP 响应都通过
+`X-Request-ID` 返回后端新生成的 UUID；客户端传入的同名请求头不会被采用。
 
 成功事件只记录 ID、计数、耗时、token、正文长度和 SHA-256 等元数据，不记录
-请求或响应正文。所有 HTTP 4xx/5xx、模型调用/投影失败和未处理异常会把完整且
-不截断的请求、响应、模型上下文、供应商错误详情与异常栈写入服务器日志，以便
-复现实验故障。已解析配置中的真实 API key、URL 中的 key，以及 Authorization、
-API-key、token 和 cookie 类认证字段会在 JSON 序列化前统一替换为
-`[REDACTED]`。
+请求或响应正文。错误诊断不截断，并按 `failure_category` 区分外层输出协议、
+供应商 HTTP、上游超时、连接失败、响应投影和其他内部错误。HTTP 状态与 body、
+原始可见输出、provider response 或 traceback 会按故障类型完整写入；终端错误
+还显示 `request_id`、`call_id` 和 JSONL 路径，便于定位同一记录。
 
-服务器错误日志与产品展示是两条独立信息边界：错误日志可能包含完整 prompt、
-事件、模型正文、原始签名、加密 reasoning 或 redacted provider details。它们
-仍不会进入浏览器响应、reasoning 投影、确认数据、scene v8 或后续模型上下文。
-因此服务器终端及其外部日志采集器应按敏感实验数据管理。
+两条通道在格式化前共同递归脱敏：已解析配置中的真实 API key、URL 编码后的
+key，以及 Authorization、API-key、token 和 cookie 类字段都会替换为
+`[REDACTED]`。除此之外，错误日志可能包含完整 prompt、事件、模型正文、原始
+签名、加密 reasoning 或 redacted provider details。它们仍不会进入浏览器响应、
+reasoning 投影、确认数据、scene v8 或后续模型上下文。
+
+`logs/` 已整体被 Git 忽略。活动文件加 5 份备份通常约为 60 MiB；为保证单条
+诊断不被截断，超大记录可能使占用暂时超过该值。服务器终端和 `logs/` 都应按
+敏感实验数据管理，不能当作场景备份或提交到版本库。
 
 ## 使用流程
 
