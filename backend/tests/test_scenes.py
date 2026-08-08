@@ -372,6 +372,32 @@ def test_manual_events_are_fifo_editable_and_deletable_only_while_queued(
     ] == [second_id]
 
 
+def test_scene_can_be_deleted_and_disappears_from_storage(
+    scene_directory: Path,
+) -> None:
+    """DELETE removes the JSON file and 404s on a second attempt."""
+    client, _model = make_client(scene_directory)
+    scene = post_scene(client, name="被删除")
+    other = post_scene(client, name="保留")
+    path = scene_directory / f"{scene['id']}.json"
+
+    missing = client.delete(f"/api/scenes/{uuid4()}")
+    assert missing.status_code == 404
+    assert path.exists()
+
+    response = client.delete(f"/api/scenes/{scene['id']}")
+
+    assert response.status_code == 204
+    assert response.content == b""
+    assert not path.exists()
+    summaries = client.get("/api/scenes").json()
+    assert [summary["id"] for summary in summaries] == [other["id"]]
+    assert client.get(f"/api/scenes/{scene['id']}").status_code == 404
+    # A second delete of the now-removed scene is also 404.
+    assert client.delete(f"/api/scenes/{scene['id']}").status_code == 404
+    assert client.get(f"/api/scenes/{other['id']}").status_code == 200
+
+
 def test_generation_writes_nothing_and_two_confirmations_route_atomically(
     scene_directory: Path,
 ) -> None:

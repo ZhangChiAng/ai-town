@@ -281,6 +281,35 @@ async function requestJson(
   return body;
 }
 
+async function requestNoContent(
+  path: string,
+  options?: RequestInit,
+): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(path, options);
+  } catch {
+    throw new ApiError("无法连接后端，请确认服务正在运行。");
+  }
+  // A 204 has no body; only parse JSON to surface error details on 4xx/5xx.
+  if (response.status === 204) {
+    return;
+  }
+  if (response.ok) {
+    throw new ApiError("后端返回了无法识别的数据。", response.status);
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch {
+    throw new ApiError(`请求失败（${response.status}）。`, response.status);
+  }
+  throw new ApiError(
+    detailMessage(body) ?? `请求失败（${response.status}）。`,
+    response.status,
+  );
+}
+
 function requireScene(body: unknown): Scene {
   if (!isScene(body)) {
     throw new ApiError("后端返回了无法识别的场景数据。");
@@ -340,6 +369,13 @@ export async function bindSceneModel(
 export async function getScene(sceneId: string): Promise<Scene> {
   return requireScene(
     await requestJson(`/api/scenes/${encodeURIComponent(sceneId)}`),
+  );
+}
+
+export async function deleteScene(sceneId: string): Promise<void> {
+  await requestNoContent(
+    `/api/scenes/${encodeURIComponent(sceneId)}`,
+    { method: "DELETE" },
   );
 }
 

@@ -226,6 +226,12 @@ pre {
   list-style: none;
 }
 
+.scene-list li {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+}
+
 .scene-list button {
   display: grid;
   gap: 4px;
@@ -260,6 +266,22 @@ pre {
   color: #91a49d;
   font-family: ui-monospace, monospace;
   font-size: 10px;
+}
+
+.scene-delete-button {
+  flex: 0 0 auto;
+  align-self: center;
+  padding: 5px 10px;
+  font-size: 12px;
+  color: #e0a0a0;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+}
+
+.scene-delete-button:hover:not(:disabled) {
+  color: #f4cccc;
+  background: #4a2727;
 }
 
 .storage-note {

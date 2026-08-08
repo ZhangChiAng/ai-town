@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal, TypedDict
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse
 
 from app.draft_workflow import (
@@ -293,6 +293,29 @@ def create_app(
     @application.get("/api/scenes/{scene_id}")
     async def get_scene(scene_id: UUID, request: Request) -> Scene:
         return storage(request).get(scene_id)
+
+    @application.delete(
+        "/api/scenes/{scene_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+    )
+    async def delete_scene(
+        scene_id: UUID,
+        request: Request,
+    ) -> Response:
+        # Fetch before delete so the 404 path and log metadata reuse the
+        # same not-found handler and persisted scene identity.
+        scene = storage(request).get(scene_id)
+        storage(request).delete(scene_id)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "scene.deleted",
+            "Scene deleted.",
+            scene_id=scene.id,
+            model=scene.model,
+            **text_metadata("name", scene.name),
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.put("/api/scenes/{scene_id}")
     async def put_scene(

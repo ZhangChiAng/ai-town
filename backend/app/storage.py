@@ -90,6 +90,21 @@ class SceneStorage:
         with self._lock:
             self._write(scene, must_not_exist=False)
 
+    def delete(self, scene_id: UUID) -> None:
+        """Remove one scene file; a missing scene is treated as not found."""
+        with self._lock:
+            path = self._path_for(scene_id)
+            try:
+                path.unlink(missing_ok=False)
+            except FileNotFoundError as error:
+                raise SceneNotFoundError(
+                    f"Scene '{scene_id}' does not exist."
+                ) from error
+            except OSError as error:
+                raise SceneWriteError(
+                    f"Could not delete scene '{scene_id}': {error}"
+                ) from error
+
     def mutate(
         self,
         scene_id: UUID,

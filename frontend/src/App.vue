@@ -13,6 +13,7 @@ import {
   createManualEvent,
   createScene,
   deleteManualEvent,
+  deleteScene,
   editManualEvent,
   generateLayerDraft,
   getModelOptions,
@@ -328,6 +329,21 @@ function installScene(
   bindingModel.value = modelOptions.value[0]?.model ?? "";
 }
 
+function closeScene(): void {
+  // Reset every editor/preview surface back to the welcome card.
+  savedScene.value = null;
+  currentScene.value = null;
+  drafts.value = { A: null, B: null, C: null };
+  draftErrors.value = { A: "", B: "", C: "" };
+  eventEdits.value = {};
+  previews.value = {};
+  previewError.value = "";
+  eventError.value = "";
+  saveMessage.value = "";
+  actionError.value = "";
+  bindingModel.value = modelOptions.value[0]?.model ?? "";
+}
+
 function confirmDiscardChanges(): boolean {
   if (!isDirty.value && !hasAnyDraft.value) {
     return true;
@@ -388,6 +404,37 @@ async function openScene(summary: SceneSummary): Promise<void> {
     actionError.value = errorMessage(error, "无法打开场景。");
   } finally {
     openingSceneId.value = null;
+  }
+}
+
+async function deleteCurrentScene(summary: SceneSummary): Promise<void> {
+  const scene = currentScene.value;
+  // Only the active scene has untrusted local state to discard.
+  if (scene === null || scene.id !== summary.id) {
+    return;
+  }
+  const hasLocalState = isDirty.value || hasAnyDraft.value;
+  const message = hasLocalState
+    ? `删除场景“${summary.name}”将同时丢弃此页面未保存的修改或草稿。确定删除？`
+    : `删除场景“${summary.name}”？此操作不可恢复。`;
+  if (
+    editorLocked.value ||
+    !window.confirm(message)
+  ) {
+    return;
+  }
+  busyAction.value = "scene-delete";
+  actionError.value = "";
+  try {
+    await deleteScene(summary.id);
+    sceneSummaries.value = sceneSummaries.value.filter(
+      (item) => item.id !== summary.id,
+    );
+    closeScene();
+  } catch (error) {
+    actionError.value = errorMessage(error, "无法删除场景。");
+  } finally {
+    busyAction.value = null;
   }
 }
 
@@ -839,6 +886,17 @@ onBeforeUnmount(() => {
               >
                 <strong>{{ summary.name }}</strong>
                 <small>{{ summary.id.slice(0, 8) }}</small>
+              </button>
+              <button
+                v-if="currentScene?.id === summary.id"
+                type="button"
+                class="text-button scene-delete-button"
+                :disabled="editorLocked"
+                :title="`删除场景“${summary.name}”`"
+                aria-label="删除场景"
+                @click="deleteCurrentScene(summary)"
+              >
+                删除
               </button>
             </li>
           </ul>

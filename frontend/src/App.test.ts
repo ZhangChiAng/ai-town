@@ -196,6 +196,16 @@ function findButton(
   return button as HTMLButtonElement;
 }
 
+function emptyResponse(status = 204): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    content: "",
+    text: vi.fn().mockResolvedValue(""),
+    json: vi.fn().mockResolvedValue(null),
+  } as unknown as Response;
+}
+
 describe("App", () => {
   let container: HTMLDivElement;
   let app: VueApp<Element> | undefined;
@@ -606,7 +616,11 @@ describe("App", () => {
     await flush();
     expect(editedBody).toEqual({ content: "修改后的雾情" });
 
-    findButton(container, "删除").click();
+    // Scope to the queue so the scene-sidebar "删除" button is not matched.
+    const eventDeleteButton = container.querySelector(
+      ".queue-list li",
+    ) as HTMLElement;
+    findButton(eventDeleteButton, "删除").click();
     await flush();
     expect(container.querySelectorAll(".queue-list textarea")).toHaveLength(0);
 
@@ -740,5 +754,48 @@ describe("App", () => {
       state_token: STATE_TOKEN,
       reasoning: innerDraft().reasoning,
     });
+  });
+
+  it("deletes the open scene after confirm and returns to the welcome card", async () => {
+    const scene = makeScene();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const fetchMock = await mountOpenedScene(scene, {
+      [`DELETE /api/scenes/${SCENE_ID}`]: emptyResponse(204),
+    });
+
+    expect(
+      container.querySelector(".scene-delete-button"),
+    ).not.toBeNull();
+    findButton(container, "删除").click();
+    await flush();
+
+    expect(confirmSpy).toHaveBeenCalledWith(
+      expect.stringContaining(scene.name),
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/scenes/${SCENE_ID}`,
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(container.textContent).toContain("选择或创建一个场景");
+    expect(container.querySelector(".scene-delete-button")).toBeNull();
+    expect(
+      [...container.querySelectorAll(".scene-list li")].some(
+        (li) => li.textContent?.includes(scene.name),
+      ),
+    ).toBe(false);
+  });
+
+  it("keeps the scene when the delete confirm is cancelled", async () => {
+    const scene = makeScene();
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    await mountOpenedScene(scene, {
+      [`DELETE /api/scenes/${SCENE_ID}`]: emptyResponse(204),
+    });
+
+    findButton(container, "删除").click();
+    await flush();
+
+    expect(container.textContent).toContain(scene.name);
+    expect(container.querySelector(".timeline")).not.toBeNull();
   });
 });
