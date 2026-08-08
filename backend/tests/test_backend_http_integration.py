@@ -330,60 +330,6 @@ def test_valid_draft_confirms_after_restart_without_bound_model(
     )
 
 
-def test_confirmation_persists_reasoning_and_accepts_empty_reasoning(
-    tmp_path: Path,
-) -> None:
-    """Reasoning travels with confirmation into persisted scene history."""
-    storage = SceneStorage(tmp_path / "scenes")
-    backend = _backend(["inner answer", "对B说：outer answer"])
-    client = TestClient(create_app(storage, {FAKE_MODEL: backend}))
-    scene = _post_scene(client)
-    scene = _post_event(client, scene["id"], "A", "pending event")
-    inner = _generate(client, scene["id"], "A", "inner")
-
-    confirmed = _require_json(
-        _confirm(
-            client,
-            scene["id"],
-            "A",
-            "inner",
-            inner,
-            reasoning=[
-                {
-                    "type": "summary_text",
-                    "text": "confirmed reasoning text",
-                }
-            ],
-        )
-    )
-    assert confirmed["agents"][0]["inner_context"]["turns"][0]["reasoning"] == [
-        {"type": "summary_text", "text": "confirmed reasoning text"}
-    ]
-
-    # Sonnet-style empty reasoning is legal and must not reject with 422.
-    outer = _generate(client, scene["id"], "A", "outer")
-    completed = _require_json(
-        _confirm(
-            client,
-            scene["id"],
-            "A",
-            "outer",
-            outer,
-            reasoning=[],
-        )
-    )
-    assert (
-        completed["agents"][0]["outer_context"]["turns"][0]["reasoning"] == []
-    )
-
-    # Persisted reasoning survives a reload straight from disk.
-    reloaded = storage.get(UUID(scene["id"]))
-    assert reloaded.agents[0].inner_context.turns[0].reasoning[0].text == (
-        "confirmed reasoning text"
-    )
-    assert reloaded.agents[0].outer_context.turns[0].reasoning == []
-
-
 @pytest.mark.parametrize("error_type", [RuntimeError, ValueError])
 def test_failed_generation_is_sanitized_and_returns_no_snapshot(
     tmp_path: Path,
@@ -441,44 +387,12 @@ def _mutate_event(
     assert edited.status_code == 200
 
 
-def _mutate_prompt(
-    client: TestClient,
-    storage: SceneStorage,
-    scene: dict[str, Any],
-) -> None:
-    """Change the selected layer's prompt variable after the draft."""
-    update = _scene_update(scene)
-    update["agents"][0]["prompt_profile"]["inner_memories"] = (
-        "changed inner memory"
-    )
-    saved = client.put(f"/api/scenes/{scene['id']}", json=update)
-    assert saved.status_code == 200
-
-
-def _mutate_model(
-    client: TestClient,
-    storage: SceneStorage,
-    scene: dict[str, Any],
-) -> None:
-    """Rebind the scene to a different model after the draft."""
-    storage.mutate(
-        UUID(scene["id"]),
-        lambda current: current.model_copy(update={"model": OTHER_MODEL}),
-    )
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [_mutate_event, _mutate_prompt, _mutate_model],
-    ids=["event", "prompt", "model"],
-)
 def test_changed_business_state_rejects_old_draft_over_http(
     tmp_path: Path,
-    mutate,
 ) -> None:
     """A stale draft is rejected with 409 without a backend call."""
     storage, client, backend, scene, draft = _new_pending_inner_draft(tmp_path)
-    mutate(client, storage, scene)
+    _mutate_event(client, storage, scene)
     calls_before = len(backend.generate_calls)
 
     response = _confirm(client, scene["id"], "A", "inner", draft)

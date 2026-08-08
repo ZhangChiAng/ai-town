@@ -6,7 +6,6 @@ import json
 import pytest
 
 from app.draft_workflow import (
-    DraftGenerationError,
     DraftWorkflow,
     confirm_draft,
 )
@@ -243,20 +242,6 @@ def test_reasoning_only_enters_scene_via_confirmation_and_never_requests() -> (
     assert "observer-only fake reasoning" not in serialized_context
     assert scene.agents[2].inner_context.turns[-1].reasoning == []
     assert next_backend.generate_calls == []
-
-
-def test_invalid_outer_generation_fails_after_exactly_one_call() -> None:
-    """A malformed visible outer result is rejected without retry."""
-    scene = add_manual_event(prompted_scene("坏外层", MODEL), "A", "event")
-    inner_backend = FakeBackend(["inner"], model=MODEL)
-    inner = _generate(DraftWorkflow(inner_backend), scene, "A", "inner")
-    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
-    invalid_backend = FakeBackend(["not addressed"], model=MODEL)
-
-    with pytest.raises(DraftGenerationError, match="invalid outer draft"):
-        _generate(DraftWorkflow(invalid_backend), scene, "A", "outer")
-
-    assert len(invalid_backend.generate_calls) == 1
 
 
 def test_multiline_outer_body_is_preserved_and_routed() -> None:

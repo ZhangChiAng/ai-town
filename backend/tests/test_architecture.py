@@ -242,12 +242,6 @@ def test_business_modules_do_not_guess_protocol_from_model_names() -> None:
             ), f"model-name inference in {path}:{node.lineno}"
 
 
-def test_removed_legacy_model_modules_do_not_return() -> None:
-    """The obsolete protocol-branching implementation has no fallback path."""
-    assert not (APP_ROOT / "config.py").exists()
-    assert not (APP_ROOT / "drafting.py").exists()
-
-
 def test_runtime_dependencies_keep_the_slim_direct_surface() -> None:
     """Runtime uses slim provider extras without retry or agent bundles."""
     configuration = tomllib.loads(

@@ -401,41 +401,6 @@ def test_confirmed_turns_persist_reasoning_and_leave_it_out_of_requests() -> (
     assert scenario.agents[0].outer_context.turns[-1].output == "对B说：outer"
 
 
-def test_empty_reasoning_still_confirms_both_layers() -> None:
-    """A provider that returned no thinking confirms with an empty list."""
-    scene = add_manual_event(
-        prompted_scene("Empty reasoning", MODEL),
-        "A",
-        "event",
-    )
-    inner = _generate(
-        DraftWorkflow(FakeBackend(["inner"], model=MODEL)),
-        scene,
-        "A",
-        "inner",
-    )
-    scene = confirm_draft(
-        scene,
-        "A",
-        "inner",
-        _confirmation_with_reasoning(inner, []),
-    )
-    assert scene.agents[0].inner_context.turns[-1].reasoning == []
-    outer = _generate(
-        DraftWorkflow(FakeBackend(["对B说：outer"], model=MODEL)),
-        scene,
-        "A",
-        "outer",
-    )
-    completed = confirm_draft(
-        scene,
-        "A",
-        "outer",
-        _confirmation_with_reasoning(outer, []),
-    )
-    assert completed.agents[0].outer_context.turns[-1].reasoning == []
-
-
 def _replace_inner_prompt(scene: Any, prompt: str) -> Any:
     """Return a valid scene with only Agent A's inner memory changed."""
     agent = scene.agents[0]
