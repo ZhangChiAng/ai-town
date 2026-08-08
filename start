@@ -58,6 +58,8 @@ setsid uv run \
   --app-dir "${PROJECT_ROOT}/backend" \
   --reload \
   --reload-dir "${PROJECT_ROOT}/backend" \
+  --log-config "${PROJECT_ROOT}/backend/logging.json" \
+  --no-access-log \
   --host 127.0.0.1 \
   --port 8000 &
 BACKEND_PID=$!

@@ -1,5 +1,6 @@
 """Anthropic assembly for the shared Pydantic AI Direct backend."""
 
+import logging
 from contextlib import suppress
 
 import httpx
@@ -12,8 +13,10 @@ from app.model_backends.pydantic_ai_backend import (
     PydanticAIBackend,
     create_request_capture_client,
 )
+from app.structured_logging import log_event
 
 _MAX_TOKENS = 1024
+LOGGER = logging.getLogger(__name__)
 
 
 async def create_anthropic_messages_backend(
@@ -45,8 +48,18 @@ async def create_anthropic_messages_backend(
             direct_model=direct_model,
             model_settings=model_settings,
             http_client=http_client,
+            provider="anthropic",
         )
     except BaseException as error:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "model.provider_initialization.failed",
+            "Anthropic provider initialization failed.",
+            exception=error,
+            model=settings.model,
+            provider="anthropic",
+        )
         if http_client is not None:
             # Cleanup errors must not replace the sanitized constructor error.
             with suppress(Exception):

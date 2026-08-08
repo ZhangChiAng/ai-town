@@ -16,31 +16,43 @@ class TestClient:
         """Store the application exercised by each isolated request."""
         self._application = application
 
-    def get(self, path: str) -> httpx.Response:
+    def get(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
         """Send a GET request."""
-        return self._request("GET", path)
+        return self._request("GET", path, headers=headers)
 
     def post(
         self,
         path: str,
         *,
         json: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         """Send a POST request."""
-        return self._request("POST", path, json=json)
+        return self._request("POST", path, json=json, headers=headers)
 
     def put(
         self,
         path: str,
         *,
         json: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         """Send a PUT request."""
-        return self._request("PUT", path, json=json)
+        return self._request("PUT", path, json=json, headers=headers)
 
-    def delete(self, path: str) -> httpx.Response:
+    def delete(
+        self,
+        path: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
         """Send a DELETE request."""
-        return self._request("DELETE", path)
+        return self._request("DELETE", path, headers=headers)
 
     def _request(
         self,
@@ -48,6 +60,7 @@ class TestClient:
         path: str,
         *,
         json: Any | None = None,
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         async def send() -> httpx.Response:
             transport = httpx.ASGITransport(app=self._application)
@@ -55,6 +68,11 @@ class TestClient:
                 transport=transport,
                 base_url="http://testserver",
             ) as client:
-                return await client.request(method, path, json=json)
+                return await client.request(
+                    method,
+                    path,
+                    json=json,
+                    headers=headers,
+                )
 
         return asyncio.run(send())

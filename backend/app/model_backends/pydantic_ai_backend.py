@@ -25,6 +25,7 @@ from app.model_backends.contracts import (
     ModelReasoning,
     ModelUsage,
 )
+from app.structured_logging import bind_log_context, log_event
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,10 +40,18 @@ class _RequestCaptureState:
     count: int = 0
     snapshot: JsonObject | None = None
     invalid: bool = False
+    wire_requests: list[dict[str, object]] | None = None
 
-    def record(self, value: object) -> None:
-        """Record one decoded body without retaining an earlier valid value."""
+    def record(
+        self,
+        value: object,
+        wire_request: dict[str, object],
+    ) -> None:
+        """Record one decoded body and its error-only wire metadata."""
         self.count += 1
+        if self.wire_requests is None:
+            self.wire_requests = []
+        self.wire_requests.append(wire_request)
         if self.count != 1 or type(value) is not dict:
             self.invalid = True
             self.snapshot = None
@@ -56,6 +65,19 @@ class _RequestCaptureState:
             self.snapshot = None
             return
         self.snapshot = cast(JsonObject, value)
+
+    def record_invalid(self, wire_request: dict[str, object]) -> None:
+        """Retain malformed wire data for logs while rejecting the snapshot."""
+        self.count += 1
+        if self.wire_requests is None:
+            self.wire_requests = []
+        self.wire_requests.append(wire_request)
+        self.invalid = True
+        self.snapshot = None
+
+    def requests_for_logging(self) -> list[dict[str, object]]:
+        """Return every actual HTTP request observed for this call."""
+        return list(self.wire_requests or [])
 
     def require_snapshot(self) -> JsonObject:
         """Return the sole valid body or fail without exposing its contents."""
@@ -86,109 +108,98 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
-def _log_request_failure(provider: str, model: str, exc: BaseException) -> None:
-    """Record request-level failures without leaking URL/auth/credentials.
-
-    Pydantic AI's ModelHTTPError already strips transport credentials and
-    surfaces a decoded body; its traceback only reflects the raise site and
-    does not carry URLs or auth headers, so it is safe to include. For any
-    other exception we deliberately avoid the message and traceback, since
-    upstream SDK errors may embed request URLs, bodies, or credentials.
-    """
-    if isinstance(exc, ModelHTTPError):
-        LOGGER.exception(
-            "model request failed: provider=%s model=%s status=%s "
-            "provider_model=%s retry_after=%r body=%r",
-            provider,
-            model,
-            exc.status_code,
-            exc.model_name,
-            exc.retry_after,
-            exc.body,
-        )
-        return
-    LOGGER.warning(
-        "model request failed: provider=%s model=%s exc_type=%s",
-        provider,
-        model,
-        type(exc).__name__,
+def _log_request_failure(
+    provider: str,
+    model: str,
+    conversation: ModelConversation,
+    capture: _RequestCaptureState,
+    exc: BaseException,
+) -> None:
+    """Record untruncated request, provider error, and exception details."""
+    log_event(
+        LOGGER,
+        logging.ERROR,
+        "model.provider_request.failed",
+        "Provider request failed.",
+        exception=exc,
+        provider=provider,
+        model=model,
+        conversation=conversation,
+        serialized_requests=capture.requests_for_logging(),
+        provider_error=exc,
+        provider_http_body=(
+            exc.body if isinstance(exc, ModelHTTPError) else None
+        ),
     )
-
-
-def _summarize_response(response: ModelResponse) -> dict[str, object]:
-    """Project a ModelResponse into a safe, log-friendly summary.
-
-    Exposes only response-side fields: part types and visible/reasoning text.
-    Never includes request bodies, URLs, or credentials.
-    """
-    parts_summary: list[dict[str, object]] = []
-    for index, part in enumerate(response.parts):
-        entry: dict[str, object] = {"index": index, "kind": type(part).__name__}
-        if isinstance(part, TextPart):
-            entry["content"] = part.content
-        elif isinstance(part, ThinkingPart):
-            content = part.content
-            if isinstance(content, str):
-                # Reasoning can be very long; keep logs bounded.
-                entry["content"] = (
-                    content if len(content) <= 512 else content[:512] + "..."
-                )
-        parts_summary.append(entry)
-    usage = response.usage
-    return {
-        "parts": parts_summary,
-        "input_tokens": usage.input_tokens,
-        "output_tokens": usage.output_tokens,
-        "cache_write_tokens": usage.cache_write_tokens,
-        "cache_read_tokens": usage.cache_read_tokens,
-    }
 
 
 def _log_projection_failure(
     provider: str,
     model: str,
+    conversation: ModelConversation,
+    capture: _RequestCaptureState,
     response: ModelResponse,
     exc: BaseException,
 ) -> None:
-    """Record projection/validation failures with the actual model output."""
-    LOGGER.warning(
-        "model output could not be projected: provider=%s model=%s "
-        "exc_type=%s message=%s response=%s",
-        provider,
-        model,
-        type(exc).__name__,
-        str(exc),
-        _summarize_response(response),
-        exc_info=True,
+    """Record full request, response, raw details, and projection stack."""
+    log_event(
+        LOGGER,
+        logging.ERROR,
+        "model.projection.failed",
+        "Provider response could not be projected.",
+        exception=exc,
+        provider=provider,
+        model=model,
+        conversation=conversation,
+        serialized_requests=capture.requests_for_logging(),
+        provider_response=response,
     )
 
 
 async def _capture_request_body(request: httpx.Request) -> None:
-    """Capture only the serialized JSON body for the active model call."""
+    """Capture browser-safe JSON plus error-only URL, headers, and body."""
     state = _ACTIVE_REQUEST_CAPTURE.get()
     if state is None:
         return
 
+    body = await request.aread()
+    wire_request = {
+        "method": request.method,
+        "url": str(request.url),
+        "headers": _headers_for_logging(request.headers),
+        "body": body.decode("utf-8", errors="replace"),
+    }
     try:
-        body = await request.aread()
         value = json.loads(
             body,
             object_pairs_hook=_unique_json_object,
             parse_constant=_reject_json_constant,
         )
     except TypeError, ValueError, UnicodeDecodeError:
-        state.count += 1
-        state.invalid = True
-        state.snapshot = None
+        state.record_invalid(wire_request)
         return
-    state.record(value)
+    state.record(value, wire_request)
+
+
+def _headers_for_logging(headers: httpx.Headers) -> dict[str, object]:
+    """Preserve repeated provider headers in a redactable mapping."""
+    grouped: dict[str, object] = {}
+    for name, value in headers.multi_items():
+        current = grouped.get(name)
+        if current is None:
+            grouped[name] = value
+        elif isinstance(current, list):
+            current.append(value)
+        else:
+            grouped[name] = [current, value]
+    return grouped
 
 
 def create_request_capture_client(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> httpx.AsyncClient:
-    """Create the shared 60-second HTTP client with a body-only hook."""
+    """Create the client with a safe snapshot and error wire capture hook."""
     return httpx.AsyncClient(
         timeout=_REQUEST_TIMEOUT_SECONDS,
         transport=transport,
@@ -206,6 +217,7 @@ class PydanticAIBackend:
         direct_model: Model,
         model_settings: ModelSettings,
         http_client: httpx.AsyncClient,
+        provider: str | None = None,
     ) -> None:
         """Bind one configured model and its owned shared HTTP client."""
         if direct_model.model_name != model:
@@ -219,13 +231,19 @@ class PydanticAIBackend:
         self._direct_model = direct_model
         self._model_settings = cast(ModelSettings, dict(model_settings))
         self._http_client = http_client
-        self._provider = direct_model.system
+        self._provider_family = direct_model.system
+        self._provider = provider or direct_model.system
         self._closed = False
 
     @property
     def model(self) -> str:
         """Return the exact configured model identity."""
         return self._model
+
+    @property
+    def provider(self) -> str:
+        """Return the configured upstream provider identity for logs."""
+        return self._provider
 
     async def generate(
         self,
@@ -235,45 +253,60 @@ class PydanticAIBackend:
         if self._closed:
             raise RuntimeError("model backend is closed")
 
-        messages = _build_messages(conversation)
-        capture = _RequestCaptureState()
-        token = _ACTIVE_REQUEST_CAPTURE.set(capture)
-        try:
-            response: ModelResponse | None = None
+        with bind_log_context(model=self._model, provider=self._provider):
+            messages = _build_messages(conversation)
+            capture = _RequestCaptureState()
+            token = _ACTIVE_REQUEST_CAPTURE.set(capture)
             try:
-                response = await model_request(
-                    self._direct_model,
-                    messages,
-                    model_settings=self._model_settings,
-                    instrument=False,
-                )
-            except Exception as exc:
-                # Provider exceptions can contain URLs, bodies, and credentials;
-                # surface their safe fields to the console before dropping them.
-                _log_request_failure(self._provider, self._model, exc)
-                request_failed = True
-            else:
-                request_failed = False
+                response: ModelResponse | None = None
+                try:
+                    response = await model_request(
+                        self._direct_model,
+                        messages,
+                        model_settings=self._model_settings,
+                        instrument=False,
+                    )
+                except Exception as exc:
+                    _log_request_failure(
+                        self._provider,
+                        self._model,
+                        conversation,
+                        capture,
+                        exc,
+                    )
+                    request_failed = True
+                else:
+                    request_failed = False
 
-            if request_failed:
-                # Raising after the handler also drops sensitive context.
-                raise RuntimeError("Pydantic AI model request failed") from None
+                if request_failed:
+                    # Raise after logging so browser errors retain no provider
+                    # exception, body, URL, or authentication data.
+                    raise RuntimeError(
+                        "Pydantic AI model request failed"
+                    ) from None
 
-            try:
-                snapshot = capture.require_snapshot()
-                assert response is not None
-                return _project_response(response, self._provider, snapshot)
-            except Exception as exc:
-                # The request succeeded but the response cannot be
-                # projected; log the actual model output so invalid
-                # formats are diagnosable, then re-raise unchanged.
-                _log_projection_failure(
-                    self._provider, self._model, response, exc
-                )
-                raise
-        finally:
-            # A later call must never inherit this call's body or failure state.
-            _ACTIVE_REQUEST_CAPTURE.reset(token)
+                try:
+                    snapshot = capture.require_snapshot()
+                    assert response is not None
+                    return _project_response(
+                        response,
+                        self._provider_family,
+                        snapshot,
+                    )
+                except Exception as exc:
+                    assert response is not None
+                    _log_projection_failure(
+                        self._provider,
+                        self._model,
+                        conversation,
+                        capture,
+                        response,
+                        exc,
+                    )
+                    raise
+            finally:
+                # A later call must never inherit this call's wire details.
+                _ACTIVE_REQUEST_CAPTURE.reset(token)
 
     async def aclose(self) -> None:
         """Close the owned shared HTTP client at most once."""

@@ -1,5 +1,6 @@
 """FastAPI routes for the two-layer AI Town experiment."""
 
+import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,6 +15,7 @@ from app.draft_workflow import (
     DraftWorkflow,
     confirm_draft,
 )
+from app.http_logging import RequestLoggingMiddleware
 from app.model_backends import (
     BackendFactory,
     ModelBackend,
@@ -47,10 +49,19 @@ from app.models import (
     create_scene,
     delete_manual_event,
     edit_manual_event,
+    get_agent,
     rollback_latest_call,
     update_scene,
 )
 from app.storage import SceneNotFoundError, SceneStorage, SceneStorageError
+from app.structured_logging import (
+    bind_log_context,
+    log_event,
+    register_secrets,
+    text_metadata,
+)
+
+LOGGER = logging.getLogger(__name__)
 
 
 class HealthResponse(TypedDict):
@@ -81,18 +92,55 @@ def create_app(
             yield
             return
 
-        settings = load_model_settings()
-        registry = await create_model_backend_registry(
-            settings,
-            BACKEND_FACTORIES,
-        )
+        try:
+            settings = load_model_settings()
+            # Register every resolved key before any provider object exists.
+            register_secrets(setting.api_key for setting in settings)
+            registry = await create_model_backend_registry(
+                settings,
+                BACKEND_FACTORIES,
+            )
+        except Exception as error:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "application.startup.failed",
+                "Application startup failed.",
+                exception=error,
+            )
+            raise
         try:
             install_model_backends(application, registry)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "application.started",
+                "Application startup completed.",
+                model_count=len(registry),
+                models=list(registry),
+            )
             yield
         finally:
-            await registry.aclose()
+            try:
+                await registry.aclose()
+            except BaseException as error:
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "application.shutdown.failed",
+                    "Application shutdown failed.",
+                    exception=error,
+                )
+                raise
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "application.stopped",
+                "Application shutdown completed.",
+            )
 
     application = FastAPI(title="AI Town API", lifespan=lifespan)
+    application.add_middleware(RequestLoggingMiddleware)
     application.state.scene_storage = scene_storage or SceneStorage(
         DEFAULT_SCENE_DIRECTORY
     )
@@ -230,6 +278,16 @@ def create_app(
         require_available_model(payload.model, request)
         scene = create_scene(payload.name, payload.model)
         storage(request).create(scene)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "scene.created",
+            "Scene created.",
+            scene_id=scene.id,
+            model=scene.model,
+            agent_count=len(scene.agents),
+            **text_metadata("name", scene.name),
+        )
         return scene
 
     @application.get("/api/scenes/{scene_id}")
@@ -242,10 +300,32 @@ def create_app(
         payload: UpdateSceneRequest,
         request: Request,
     ) -> Scene:
-        return storage(request).mutate(
+        scene = storage(request).mutate(
             scene_id,
             lambda scene: update_scene(scene, payload),
         )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "scene.updated",
+            "Scene settings updated.",
+            scene_id=scene.id,
+            model=scene.model,
+            agents=[
+                {
+                    "agent_id": agent.id,
+                    **text_metadata("name", agent.name),
+                    **text_metadata(
+                        "inner_prompt", agent.inner_context.system_prompt
+                    ),
+                    **text_metadata(
+                        "outer_prompt", agent.outer_context.system_prompt
+                    ),
+                }
+                for agent in scene.agents
+            ],
+        )
+        return scene
 
     @application.put("/api/scenes/{scene_id}/model")
     async def put_scene_model(
@@ -258,10 +338,19 @@ def create_app(
             # A bound scene conflicts regardless of the replacement value.
             bind_scene_model(current_scene, payload.model)
         require_available_model(payload.model, request)
-        return storage(request).mutate(
+        scene = storage(request).mutate(
             scene_id,
             lambda scene: bind_scene_model(scene, payload.model),
         )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "scene.model_bound",
+            "Scene model bound.",
+            scene_id=scene.id,
+            model=scene.model,
+        )
+        return scene
 
     @application.post(
         "/api/scenes/{scene_id}/agents/{agent_id}/events",
@@ -273,7 +362,7 @@ def create_app(
         payload: EventContentRequest,
         request: Request,
     ) -> Scene:
-        return storage(request).mutate(
+        scene = storage(request).mutate(
             scene_id,
             lambda scene: add_manual_event(
                 scene,
@@ -281,6 +370,20 @@ def create_app(
                 payload.content,
             ),
         )
+        event = get_agent(scene, agent_id).pending_events[-1]
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "event.created",
+            "Manual event created.",
+            scene_id=scene.id,
+            agent_id=agent_id,
+            event_id=event.id,
+            event_kind=event.kind,
+            pending_event_count=len(get_agent(scene, agent_id).pending_events),
+            **text_metadata("content", event.content),
+        )
+        return scene
 
     @application.put(
         "/api/scenes/{scene_id}/agents/{agent_id}/events/{event_id}"
@@ -292,7 +395,7 @@ def create_app(
         payload: EventContentRequest,
         request: Request,
     ) -> Scene:
-        return storage(request).mutate(
+        scene = storage(request).mutate(
             scene_id,
             lambda scene: edit_manual_event(
                 scene,
@@ -301,6 +404,17 @@ def create_app(
                 payload.content,
             ),
         )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "event.updated",
+            "Manual event updated.",
+            scene_id=scene.id,
+            agent_id=agent_id,
+            event_id=event_id,
+            **text_metadata("content", payload.content),
+        )
+        return scene
 
     @application.delete(
         "/api/scenes/{scene_id}/agents/{agent_id}/events/{event_id}"
@@ -311,14 +425,36 @@ def create_app(
         event_id: UUID,
         request: Request,
     ) -> Scene:
-        return storage(request).mutate(
+        deleted_events = []
+
+        def delete_with_metadata(scene: Scene) -> Scene:
+            """Capture metadata from the same queued event being deleted."""
+            updated = delete_manual_event(scene, agent_id, event_id)
+            event = next(
+                event
+                for event in get_agent(scene, agent_id).pending_events
+                if event.id == event_id
+            )
+            deleted_events.append(event)
+            return updated
+
+        scene = storage(request).mutate(
             scene_id,
-            lambda scene: delete_manual_event(
-                scene,
-                agent_id,
-                event_id,
-            ),
+            delete_with_metadata,
         )
+        [deleted_event] = deleted_events
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "event.deleted",
+            "Manual event deleted.",
+            scene_id=scene.id,
+            agent_id=agent_id,
+            event_id=event_id,
+            pending_event_count=len(get_agent(scene, agent_id).pending_events),
+            **text_metadata("content", deleted_event.content),
+        )
+        return scene
 
     @application.post("/api/scenes/{scene_id}/agents/{agent_id}/inner-drafts")
     async def post_inner_draft(
@@ -327,11 +463,14 @@ def create_app(
         request: Request,
     ) -> LayerDraftResponse:
         scene = storage(request).get(scene_id)
-        return await drafts_for_scene(scene, request).generate(
-            scene,
-            agent_id,
-            "inner",
-        )
+        with bind_log_context(
+            scene_id=scene_id, agent_id=agent_id, layer="inner"
+        ):
+            return await drafts_for_scene(scene, request).generate(
+                scene,
+                agent_id,
+                "inner",
+            )
 
     @application.post("/api/scenes/{scene_id}/agents/{agent_id}/outer-drafts")
     async def post_outer_draft(
@@ -340,11 +479,14 @@ def create_app(
         request: Request,
     ) -> LayerDraftResponse:
         scene = storage(request).get(scene_id)
-        return await drafts_for_scene(scene, request).generate(
-            scene,
-            agent_id,
-            "outer",
-        )
+        with bind_log_context(
+            scene_id=scene_id, agent_id=agent_id, layer="outer"
+        ):
+            return await drafts_for_scene(scene, request).generate(
+                scene,
+                agent_id,
+                "outer",
+            )
 
     @application.post(
         "/api/scenes/{scene_id}/agents/{agent_id}/inner-confirmations"
@@ -355,7 +497,7 @@ def create_app(
         payload: ConfirmLayerRequest,
         request: Request,
     ) -> Scene:
-        return storage(request).mutate(
+        scene = storage(request).mutate(
             scene_id,
             lambda scene: confirm_draft(
                 scene,
@@ -364,6 +506,24 @@ def create_app(
                 payload,
             ),
         )
+        turn = get_agent(scene, agent_id).inner_context.turns[-1]
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "draft.inner_confirmed",
+            "Inner draft confirmed.",
+            scene_id=scene.id,
+            agent_id=agent_id,
+            layer="inner",
+            call_id=turn.call_id,
+            model=scene.model,
+            event_ids=turn.event_ids,
+            event_count=len(turn.event_ids),
+            reasoning_count=len(turn.reasoning),
+            **text_metadata("input", turn.input),
+            **text_metadata("output", turn.output),
+        )
+        return scene
 
     @application.post(
         "/api/scenes/{scene_id}/agents/{agent_id}/outer-confirmations"
@@ -374,7 +534,7 @@ def create_app(
         payload: ConfirmLayerRequest,
         request: Request,
     ) -> Scene:
-        return storage(request).mutate(
+        scene = storage(request).mutate(
             scene_id,
             lambda scene: confirm_draft(
                 scene,
@@ -383,6 +543,26 @@ def create_app(
                 payload,
             ),
         )
+        turn = get_agent(scene, agent_id).outer_context.turns[-1]
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "draft.outer_confirmed",
+            "Outer draft confirmed and routed.",
+            scene_id=scene.id,
+            agent_id=agent_id,
+            layer="outer",
+            call_id=turn.call_id,
+            model=scene.model,
+            event_ids=turn.event_ids,
+            event_count=len(turn.event_ids),
+            recipient_id=turn.recipient_id,
+            generated_event_id=turn.generated_event_id,
+            reasoning_count=len(turn.reasoning),
+            **text_metadata("input", turn.input),
+            **text_metadata("output", turn.output),
+        )
+        return scene
 
     @application.get(
         "/api/scenes/{scene_id}/agents/{agent_id}/model-request-preview"
@@ -410,7 +590,48 @@ def create_app(
 
     @application.post("/api/scenes/{scene_id}/rollback")
     async def post_rollback(scene_id: UUID, request: Request) -> Scene:
-        return storage(request).mutate(scene_id, rollback_latest_call)
+        references = []
+        rolled_back_metadata = []
+
+        def rollback_with_reference(scene: Scene) -> Scene:
+            """Capture the same stack top changed under the storage lock."""
+            updated = rollback_latest_call(scene)
+            reference = scene.rollback_stack[-1]
+            agent = get_agent(scene, reference.agent_id)
+            turn = (
+                agent.inner_context.turns[-1]
+                if reference.layer == "inner"
+                else agent.outer_context.turns[-1]
+            )
+            references.append(reference)
+            rolled_back_metadata.append(
+                {
+                    "event_ids": turn.event_ids,
+                    "event_count": len(turn.event_ids),
+                    "reasoning_count": len(turn.reasoning),
+                    **text_metadata("input", turn.input),
+                    **text_metadata("output", turn.output),
+                }
+            )
+            return updated
+
+        scene = storage(request).mutate(scene_id, rollback_with_reference)
+        [reference] = references
+        [turn_metadata] = rolled_back_metadata
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "draft.rolled_back",
+            "Latest confirmed draft rolled back.",
+            scene_id=scene.id,
+            agent_id=reference.agent_id,
+            layer=reference.layer,
+            call_id=reference.call_id,
+            model=scene.model,
+            rollback_depth=len(scene.rollback_stack),
+            **turn_metadata,
+        )
+        return scene
 
     return application
 

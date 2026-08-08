@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "disable_existing_loggers": false,
+  "formatters": {
+    "json": {
+      "()": "app.structured_logging.JsonFormatter"
+    }
+  },
+  "handlers": {
+    "stdout": {
+      "class": "logging.StreamHandler",
+      "formatter": "json",
+      "level": "INFO",
+      "stream": "ext://sys.stdout"
+    }
+  },
+  "root": {
+    "handlers": ["stdout"],
+    "level": "INFO"
+  },
+  "loggers": {
+    "uvicorn": {
+      "handlers": ["stdout"],
+      "level": "INFO",
+      "propagate": false
+    },
+    "uvicorn.error": {
+      "level": "INFO",
+      "propagate": true
+    },
+    "uvicorn.access": {
+      "handlers": [],
+      "level": "INFO",
+      "propagate": false
+    }
+  }
+}

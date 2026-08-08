@@ -1,5 +1,6 @@
 """Ordered registry and lifecycle owner for model backends."""
 
+import logging
 from collections.abc import Iterable, Iterator, Mapping
 from typing import Protocol
 
@@ -8,6 +9,9 @@ from app.model_backends.contracts import (
     ModelBackend,
     ModelBackendSettings,
 )
+from app.structured_logging import log_event
+
+LOGGER = logging.getLogger(__name__)
 
 
 class BackendRegistryError(RuntimeError):
@@ -66,6 +70,14 @@ class ModelBackendRegistry(Mapping[str, ModelBackend]):
                 await backend.aclose()
             except BaseException as error:
                 # Continue cleanup so one broken backend cannot leak the rest.
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "model.backend_close.failed",
+                    "Model backend close failed.",
+                    exception=error,
+                    model=backend.model,
+                )
                 if first_error is None:
                     first_error = error
         if first_error is not None:
@@ -104,6 +116,15 @@ async def create_model_backend_registry(
                 raise TypeError("factory returned an invalid backend")
             backend_model = backend.model
         except BaseException as error:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "model.backend_creation.failed",
+                "Model backend creation failed.",
+                exception=error,
+                model=model_settings.model,
+                protocol=model_settings.protocol,
+            )
             cleanup_targets = [*backends]
             if backend is not None:
                 cleanup_targets.append(backend)
@@ -171,6 +192,14 @@ async def _close_after_failed_creation(backends: list[ModelBackend]) -> None:
     for backend in reversed(backends):
         try:
             await backend.aclose()
-        except BaseException:
+        except BaseException as error:
             # The active factory error is the actionable startup failure.
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "model.backend_cleanup.failed",
+                "Model backend cleanup after creation failure failed.",
+                exception=error,
+                model=backend.model,
+            )
             continue

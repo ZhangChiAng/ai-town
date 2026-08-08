@@ -1,5 +1,6 @@
 """DeepSeek Responses assembly for the shared Pydantic AI Direct backend."""
 
+import logging
 from contextlib import suppress
 
 import httpx
@@ -15,6 +16,9 @@ from app.model_backends.pydantic_ai_backend import (
     PydanticAIBackend,
     create_request_capture_client,
 )
+from app.structured_logging import log_event
+
+LOGGER = logging.getLogger(__name__)
 
 
 async def create_deepseek_responses_backend(
@@ -45,8 +49,18 @@ async def create_deepseek_responses_backend(
             direct_model=direct_model,
             model_settings=model_settings,
             http_client=http_client,
+            provider="deepseek",
         )
     except BaseException as error:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "model.provider_initialization.failed",
+            "DeepSeek provider initialization failed.",
+            exception=error,
+            model=settings.model,
+            provider="deepseek",
+        )
         if http_client is not None:
             # Cleanup errors must not replace the sanitized constructor error.
             with suppress(Exception):

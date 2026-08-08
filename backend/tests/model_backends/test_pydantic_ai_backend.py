@@ -1,6 +1,8 @@
 """Tests for the shared Pydantic AI Direct backend implementation."""
 
 import asyncio
+import json
+import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -241,6 +243,54 @@ def test_generate_rejects_non_text_or_ambiguous_response_parts(
             await backend.aclose()
 
     asyncio.run(scenario())
+
+
+def test_projection_error_log_keeps_full_raw_provider_details(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Error logs retain request, context, signatures, and provider details."""
+    backend, client, _direct_model = _build_backend()
+    long_provider_detail = "raw-provider-detail" * 500
+    response = _response(
+        [
+            ThinkingPart(
+                "visible thought",
+                signature="raw-signature-for-server-log",
+                provider_name="anthropic",
+                provider_details={"raw": long_provider_detail},
+            ),
+            ToolCallPart("unexpected", {}),
+        ]
+    )
+
+    async def fake_model_request(*_args: Any, **_kwargs: Any) -> ModelResponse:
+        await _post_json(client, SNAPSHOT)
+        return response
+
+    monkeypatch.setattr(backend_module, "model_request", fake_model_request)
+    caplog.set_level(logging.ERROR)
+
+    async def scenario() -> None:
+        try:
+            with pytest.raises(ValueError):
+                await backend.generate(CONVERSATION)
+        finally:
+            await backend.aclose()
+
+    asyncio.run(scenario())
+
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "model.projection.failed"
+    )
+    fields = record.event_fields
+    serialized = json.dumps(fields, ensure_ascii=False)
+    assert fields["conversation"]["current_input"] == CONVERSATION.current_input
+    assert json.loads(fields["serialized_requests"][0]["body"]) == SNAPSHOT
+    assert "raw-signature-for-server-log" in serialized
+    assert long_provider_detail in serialized
 
 
 def test_anthropic_reasoning_exposes_only_non_blank_thinking(

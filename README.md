@@ -101,7 +101,8 @@ Windows PowerShell 分别启动：
 
 ```powershell
 Set-Location backend
-uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uv run uvicorn app.main:app --reload --host 127.0.0.1 --port 8000 `
+  --log-config logging.json --no-access-log
 ```
 
 ```powershell
@@ -111,6 +112,30 @@ npm run dev
 
 Vite 默认位于 `http://127.0.0.1:5173`，并把 `/api` 代理到
 `http://127.0.0.1:8000`。后端健康检查为 `GET /api/health`。
+
+## 服务器结构化日志
+
+后端与 Uvicorn 统一向服务器终端的 stdout 输出单行 JSON；项目不创建日志文件，
+也不提供日志轮转。`./start` 和上面的 Windows 命令都已加载
+`backend/logging.json`，默认等级为 `INFO`，并关闭 Uvicorn 自带的重复 access
+log。
+
+每条记录固定包含 UTC `timestamp`、`level`、`logger`、`event`、`message`，以及
+`request_id`、`scene_id`、`agent_id`、`layer`、`call_id`、`model`、`provider`
+关联字段。所有 HTTP 响应都通过 `X-Request-ID` 返回后端新生成的 UUID；客户端
+传入的同名请求头不会被采用。
+
+成功事件只记录 ID、计数、耗时、token、正文长度和 SHA-256 等元数据，不记录
+请求或响应正文。所有 HTTP 4xx/5xx、模型调用/投影失败和未处理异常会把完整且
+不截断的请求、响应、模型上下文、供应商错误详情与异常栈写入服务器日志，以便
+复现实验故障。已解析配置中的真实 API key、URL 中的 key，以及 Authorization、
+API-key、token 和 cookie 类认证字段会在 JSON 序列化前统一替换为
+`[REDACTED]`。
+
+服务器错误日志与产品展示是两条独立信息边界：错误日志可能包含完整 prompt、
+事件、模型正文、原始签名、加密 reasoning 或 redacted provider details。它们
+仍不会进入浏览器响应、reasoning 投影、确认数据、scene v8 或后续模型上下文。
+因此服务器终端及其外部日志采集器应按敏感实验数据管理。
 
 ## 使用流程
 

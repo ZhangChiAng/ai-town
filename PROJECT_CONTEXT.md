@@ -311,6 +311,26 @@ redacted 及其他 provider details 不展示；落盘的 reasoning 就是这份
 安全可读文本（为空时写空数组），确认后进入场景历史展示，但绝不进入任何后续
 模型请求。
 
+服务器运维日志与上述产品展示、持久化和模型上下文是独立的信息边界。后端与
+Uvicorn 统一向 stdout 输出单行 JSON，不创建日志文件或轮转机制；每条记录固定
+包含 UTC 时间、等级、logger、事件名、消息，以及 `request_id`、`scene_id`、
+`agent_id`、`layer`、`call_id`、`model`、`provider` 关联字段。所有 HTTP 响应
+返回后端生成且不接受客户端覆盖的 `X-Request-ID`。成功链路只记录 ID、计数、
+耗时、token、正文长度和 SHA-256 等元数据，不记录成功正文。
+
+所有 HTTP 4xx/5xx、模型调用或投影失败、启动关闭失败和未处理异常均记录完整且
+不截断的相关请求、响应、协议中性 conversation、实际序列化供应商请求、可见
+输出、供应商 HTTP body、原始 SDK provider details 与异常栈。这些服务器错误
+日志允许包含完整 prompt、事件、模型正文、原始签名、加密 reasoning 和
+redacted provider details，终端及外部采集器必须按敏感实验内容管理。它们绝不
+因此进入浏览器响应、reasoning 投影、确认数据、scene v8 或后续模型上下文。
+
+模型配置解析成功后、backend 创建前，进程注册全部真实 API key 供日志层统一
+脱敏。日志在序列化前递归清理嵌套对象、headers、URL、供应商 body、异常消息与
+堆栈：真实 key 及其 URL 编码形式均替换为 `[REDACTED]`，Authorization、
+API-key、token 和 cookie 类认证字段整体替换。除这些凭据外，错误诊断内容不做
+长度限制。
+
 ## 10. 技术与数据边界
 
 - 后端：Python + FastAPI；

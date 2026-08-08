@@ -5,13 +5,13 @@ import hmac
 import json
 import logging
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Literal
 from uuid import UUID, uuid4
 
 from app.model_backends.contracts import (
     ModelBackend,
     ModelConversation,
-    ModelGeneration,
     ModelTurn,
 )
 from app.models import (
@@ -33,6 +33,7 @@ from app.models import (
     get_agent,
     parse_addressed_message,
 )
+from app.structured_logging import bind_log_context, log_event, text_metadata
 
 LOGGER = logging.getLogger(__name__)
 ContextRole = Literal["system", "user", "assistant"]
@@ -103,83 +104,121 @@ class DraftWorkflow:
     ) -> LayerDraftResponse:
         """Build context, call once, and return an unpersisted browser draft."""
         draft = self._build_call_context(scene, agent_id, layer)
-        generation: ModelGeneration | None = None
-        backend_failed = False
-        try:
-            generation = await self._backend.generate(draft.conversation)
-        except Exception as exc:
-            # Provider bodies and credentials never cross this boundary; log
-            # only the safe business context plus exception type. The backend
-            # layer is responsible for recording its own safe details; here we
-            # avoid echoing upstream exception strings or tracebacks, which may
-            # carry URLs, request bodies, or credentials.
-            LOGGER.warning(
-                "model generation failed: scene=%s agent=%s layer=%s "
-                "event=%s model=%s exc_type=%s",
-                scene.id,
-                agent_id,
-                layer,
-                draft.event_ids,
-                self._model,
-                type(exc).__name__,
-            )
-            backend_failed = True
-
-        if backend_failed or generation is None:
-            # Raise outside the handler so no provider exception stays linked.
-            raise DraftGenerationError("Model request failed.") from None
-
-        invalid_outer = False
-        if layer == "outer":
-            try:
-                parse_addressed_message(generation.content, agent_id)
-            except ValueError:
-                invalid_outer = True
-        if invalid_outer:
-            # Visible output validation is distinct from backend failures; the
-            # raw LLM content is the only way to diagnose format problems.
-            LOGGER.warning(
-                "invalid outer draft: scene=%s agent=%s event=%s model=%s "
-                "content=%r",
-                scene.id,
-                agent_id,
-                draft.event_ids,
-                self._model,
-                generation.content,
-            )
-            raise DraftGenerationError(
-                "Model returned an invalid outer draft."
-            ) from None
-
-        usage = TokenUsage(
-            input_tokens=generation.usage.input_tokens,
-            output_tokens=generation.usage.output_tokens,
-            cache_creation_input_tokens=(
-                generation.usage.cache_creation_input_tokens
-            ),
-            cache_read_input_tokens=generation.usage.cache_read_input_tokens,
-        )
-        result = LayerDraftResponse(
+        call_id = uuid4()
+        provider = getattr(self._backend, "provider", None)
+        started_at = perf_counter()
+        with bind_log_context(
+            scene_id=scene.id,
+            agent_id=agent_id,
             layer=layer,
-            call_id=uuid4(),
-            event_ids=list(draft.event_ids),
-            content=generation.content,
-            reasoning=[
-                ModelReasoningBlock(type=block.type, text=block.text)
-                for block in generation.reasoning
-            ],
-            usage=usage,
-            request_snapshot=generation.request_snapshot,
-            state_token=_state_token(
-                scene.model,
-                agent_id,
-                layer,
-                draft.events,
-                draft.conversation,
-            ),
-        )
-        _log_usage(scene.id, agent_id, layer, self.model, usage)
-        return result
+            call_id=call_id,
+            model=self._model,
+            provider=provider,
+        ):
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "model.call.started",
+                "Model call started.",
+                event_ids=draft.event_ids,
+                event_count=len(draft.event_ids),
+                confirmed_turn_count=len(draft.conversation.turns),
+                **text_metadata(
+                    "system_prompt", draft.conversation.system_prompt
+                ),
+                **text_metadata(
+                    "current_input", draft.conversation.current_input
+                ),
+            )
+            generation = None
+            backend_failed = False
+            try:
+                generation = await self._backend.generate(draft.conversation)
+            except Exception as error:
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "model.call.failed",
+                    "Model call failed.",
+                    exception=error,
+                    duration_ms=_duration_ms(started_at),
+                    conversation=draft.conversation,
+                    event_ids=draft.event_ids,
+                )
+                backend_failed = True
+            if backend_failed:
+                # Raise outside the handler so provider exceptions cannot be
+                # reached through the browser-safe public error.
+                raise DraftGenerationError("Model request failed.") from None
+            assert generation is not None
+
+            if layer == "outer":
+                invalid_outer = False
+                try:
+                    parse_addressed_message(generation.content, agent_id)
+                except ValueError as error:
+                    log_event(
+                        LOGGER,
+                        logging.ERROR,
+                        "model.workflow.failed",
+                        "Model output failed outer-layer validation.",
+                        exception=error,
+                        duration_ms=_duration_ms(started_at),
+                        conversation=draft.conversation,
+                        serialized_request=generation.request_snapshot,
+                        visible_output=generation.content,
+                        reasoning=generation.reasoning,
+                        usage=generation.usage,
+                        event_ids=draft.event_ids,
+                    )
+                    invalid_outer = True
+                if invalid_outer:
+                    raise DraftGenerationError(
+                        "Model returned an invalid outer draft."
+                    ) from None
+
+            usage = TokenUsage(
+                input_tokens=generation.usage.input_tokens,
+                output_tokens=generation.usage.output_tokens,
+                cache_creation_input_tokens=(
+                    generation.usage.cache_creation_input_tokens
+                ),
+                cache_read_input_tokens=(
+                    generation.usage.cache_read_input_tokens
+                ),
+            )
+            result = LayerDraftResponse(
+                layer=layer,
+                call_id=call_id,
+                event_ids=list(draft.event_ids),
+                content=generation.content,
+                reasoning=[
+                    ModelReasoningBlock(type=block.type, text=block.text)
+                    for block in generation.reasoning
+                ],
+                usage=usage,
+                request_snapshot=generation.request_snapshot,
+                state_token=_state_token(
+                    scene.model,
+                    agent_id,
+                    layer,
+                    draft.events,
+                    draft.conversation,
+                ),
+            )
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "model.call.completed",
+                "Model call completed.",
+                duration_ms=_duration_ms(started_at),
+                event_ids=draft.event_ids,
+                event_count=len(draft.event_ids),
+                reasoning_count=len(generation.reasoning),
+                **usage.model_dump(),
+                **text_metadata("output", generation.content),
+            )
+            return result
 
     def _build_call_context(
         self,
@@ -372,24 +411,6 @@ def _state_token(
     return hashlib.sha256(serialized).hexdigest()
 
 
-def _log_usage(
-    scene_id: UUID,
-    agent_id: AgentId,
-    layer: Layer,
-    model: str,
-    usage: TokenUsage,
-) -> None:
-    """Log non-sensitive request identity and usage as structured JSON."""
-    LOGGER.info(
-        json.dumps(
-            {
-                "event": "layer_draft_generated",
-                "scene_id": str(scene_id),
-                "agent_id": agent_id,
-                "layer": layer,
-                "model": model,
-                **usage.model_dump(),
-            },
-            sort_keys=True,
-        )
-    )
+def _duration_ms(started_at: float) -> float:
+    """Return elapsed model-call time in milliseconds."""
+    return round((perf_counter() - started_at) * 1000, 3)
