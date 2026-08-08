@@ -40,7 +40,7 @@ export interface InnerTurn {
   input: string;
   output: string;
   consumed_events: ExternalEvent[];
-  reasoning?: ModelReasoningBlock[];
+  reasoning: ModelReasoningBlock[];
 }
 
 export interface OuterTurn {
@@ -51,7 +51,7 @@ export interface OuterTurn {
   output: string;
   recipient_id: AgentId | null;
   generated_event_id: string | null;
-  reasoning?: ModelReasoningBlock[];
+  reasoning: ModelReasoningBlock[];
 }
 
 export interface InnerContext {
@@ -69,9 +69,12 @@ export interface PromptProfile {
   outer_memories: string;
 }
 
-export type Interactions = Partial<
-  Record<AgentId, Record<string, string>>
->;
+export interface Interaction {
+  description: string;
+  addresses: Record<string, string>;
+}
+
+export type Interactions = Partial<Record<AgentId, Interaction>>;
 
 export interface Agent {
   id: AgentId;
@@ -90,10 +93,10 @@ export interface ConfirmedCallReference {
 }
 
 export interface Scene {
-  schema_version: 9;
+  schema: `ai-town.scene/1.${number}`;
   id: string;
   name: string;
-  model: string | null;
+  model: string;
   agents: Agent[];
   rollback_stack: ConfirmedCallReference[];
   next_sequence: number;

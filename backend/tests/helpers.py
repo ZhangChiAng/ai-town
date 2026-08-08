@@ -16,6 +16,7 @@ from app.model_backends import (
 from app.models import (
     AGENT_IDS,
     ConfirmLayerRequest,
+    Interaction,
     PromptProfile,
     create_scene,
 )
@@ -194,7 +195,12 @@ def fill_prompts(
                     "outer_memories": factory(agent["id"], "outer"),
                 },
                 "interactions": {
-                    target_id: {target_id: f"称呼 Agent {target_id} 的场合"}
+                    target_id: {
+                        "description": (f"{agent['name']}眼中的{target_id}。"),
+                        "addresses": {
+                            target_id: f"称呼 Agent {target_id} 的场合"
+                        },
+                    }
                     for target_id in AGENT_IDS
                     if target_id != agent["id"]
                 },
@@ -221,7 +227,7 @@ def post_prompted_scene(
 
 
 def create_prompted_scene(name: str, model: str) -> Any:
-    """Build an unpersisted scene with complete v9 prompt variables."""
+    """Build an unpersisted scene with complete prompt variables."""
     return _replace_all_prompts(create_scene(name, model))
 
 
@@ -239,9 +245,14 @@ def _replace_all_prompts(scene: Any) -> Any:
                             outer_memories=f"OUTER {agent.id}",
                         ),
                         "interactions": {
-                            target_id: {
-                                target_id: f"称呼 Agent {target_id} 的场合"
-                            }
+                            target_id: Interaction(
+                                description=f"{agent.name}眼中的{target_id}。",
+                                addresses={
+                                    target_id: (
+                                        f"称呼 Agent {target_id} 的场合"
+                                    )
+                                },
+                            )
                             for target_id in AGENT_IDS
                             if target_id != agent.id
                         },

@@ -268,13 +268,13 @@ def build_model_conversation(
     if layer == "inner":
         event_ids, current_input = build_inner_input(scene, agent_id)
         events = tuple(agent.pending_events)
-        system_prompt = build_system_prompt(agent, "inner")
+        system_prompt = build_system_prompt(scene, agent_id, "inner")
         saved_turns = agent.inner_context.turns
     else:
         event_ids, current_input = build_outer_input(scene, agent_id)
         inner_turn = agent.inner_context.turns[-1]
         events = tuple(inner_turn.consumed_events)
-        system_prompt = build_system_prompt(agent, "outer")
+        system_prompt = build_system_prompt(scene, agent_id, "outer")
         saved_turns: list[OuterTurn] = agent.outer_context.turns
 
     conversation = ModelConversation(
@@ -312,10 +312,6 @@ def draft_state_token(
     layer: Layer,
 ) -> str:
     """Hash protocol-neutral business context for stale-draft detection."""
-    if scene.model is None:
-        raise SceneConflictError(
-            "Scene must be bound to a model before draft confirmation."
-        )
     _event_ids, events, conversation = build_model_conversation(
         scene,
         agent_id,
@@ -386,10 +382,6 @@ def confirm_draft(
 
 def _require_matching_model(scene: Scene, backend_model: str) -> None:
     """Prevent an available backend from serving a differently bound scene."""
-    if scene.model is None:
-        raise SceneConflictError(
-            "Scene must be bound to a model before model requests."
-        )
     if scene.model != backend_model:
         raise SceneConflictError(
             "The scene is bound to a different configured model."
@@ -397,7 +389,7 @@ def _require_matching_model(scene: Scene, backend_model: str) -> None:
 
 
 def _state_token(
-    model: str | None,
+    model: str,
     agent_id: AgentId,
     layer: Layer,
     events: tuple[ExternalEvent, ...],
@@ -405,10 +397,6 @@ def _state_token(
     agent: Agent,
 ) -> str:
     """Hash only model identity and protocol-neutral conversation state."""
-    if model is None:
-        raise SceneConflictError(
-            "Scene must be bound to a model before draft confirmation."
-        )
     state = {
         "model": model,
         "agent_id": agent_id,
@@ -426,7 +414,17 @@ def _state_token(
             "name": agent.name,
             "prompt_profile": agent.prompt_profile.model_dump(),
             "interactions": [
-                [target_id, list(agent.interactions[target_id].items())]
+                [
+                    target_id,
+                    {
+                        "description": (
+                            agent.interactions[target_id].description
+                        ),
+                        "addresses": list(
+                            agent.interactions[target_id].addresses.items()
+                        ),
+                    },
+                ]
                 for target_id in AGENT_IDS
                 if target_id in agent.interactions
             ],

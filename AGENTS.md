@@ -13,6 +13,11 @@ baseline.
   mechanisms, numeric state, automatic recall, or automatic simulation.
 - Clarify major product and behavioral decisions with the user before
   implementing them.
+- Never infer, increment, or otherwise change the scene contract version on
+  behalf of the user. Before any change that may require a different scene
+  version, ask the user to specify the exact target version and use only that
+  confirmed value. The current user-confirmed version is
+  `ai-town.scene/1.0`.
 
 # Coding Style
 

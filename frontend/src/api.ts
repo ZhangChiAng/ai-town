@@ -35,6 +35,24 @@ function isRecord(value: unknown): value is UnknownRecord {
   return typeof value === "object" && value !== null;
 }
 
+function hasExactKeys(
+  value: UnknownRecord,
+  expected: readonly string[],
+): boolean {
+  const actual = Object.keys(value);
+  return (
+    actual.length === expected.length &&
+    expected.every((key) => Object.hasOwn(value, key))
+  );
+}
+
+function isSceneSchema(value: unknown): value is Scene["schema"] {
+  return (
+    typeof value === "string" &&
+    /^ai-town\.scene\/1\.(0|[1-9][0-9]*)$/.test(value)
+  );
+}
+
 function isAgentId(value: unknown): value is AgentId {
   return value === "A" || value === "B" || value === "C";
 }
@@ -54,6 +72,12 @@ function isTokenCount(value: unknown): value is number {
 function isUsage(value: unknown): value is TokenUsage {
   return (
     isRecord(value) &&
+    hasExactKeys(value, [
+      "input_tokens",
+      "output_tokens",
+      "cache_creation_input_tokens",
+      "cache_read_input_tokens",
+    ]) &&
     isTokenCount(value.input_tokens) &&
     isTokenCount(value.output_tokens) &&
     isTokenCount(value.cache_creation_input_tokens) &&
@@ -64,6 +88,7 @@ function isUsage(value: unknown): value is TokenUsage {
 function isReasoningBlock(value: unknown): value is ModelReasoningBlock {
   return (
     isRecord(value) &&
+    hasExactKeys(value, ["type", "text"]) &&
     (value.type === "thinking" ||
       value.type === "summary_text" ||
       value.type === "reasoning_text") &&
@@ -79,7 +104,7 @@ function isReasoningList(value: unknown): value is ModelReasoningBlock[] {
 function isModelOption(value: unknown): value is ModelOption {
   return (
     isRecord(value) &&
-    Object.keys(value).length === 1 &&
+    hasExactKeys(value, ["model"]) &&
     typeof value.model === "string" &&
     value.model.trim() !== ""
   );
@@ -90,7 +115,7 @@ function isModelRequestContextItem(
 ): value is ModelRequestContextItem {
   return (
     isRecord(value) &&
-    Object.keys(value).length === 2 &&
+    hasExactKeys(value, ["role", "text"]) &&
     (value.role === "system" ||
       value.role === "user" ||
       value.role === "assistant") &&
@@ -101,17 +126,28 @@ function isModelRequestContextItem(
 function isEvent(value: unknown): value is ExternalEvent {
   if (
     !isRecord(value) ||
+    !hasExactKeys(value, [
+      "id",
+      "sequence",
+      "kind",
+      "content",
+      "source_agent_id",
+      "source_call_id",
+    ]) ||
     typeof value.id !== "string" ||
     !isPositiveInteger(value.sequence) ||
     typeof value.content !== "string" ||
+    value.content.trim() === "" ||
     (value.kind !== "manual" && value.kind !== "agent_message")
   ) {
     return false;
   }
   return (
-    (value.source_agent_id === null ||
-      isAgentId(value.source_agent_id)) &&
-    (value.source_call_id === null ||
+    (value.kind === "manual" &&
+      value.source_agent_id === null &&
+      value.source_call_id === null) ||
+    (value.kind === "agent_message" &&
+      isAgentId(value.source_agent_id) &&
       typeof value.source_call_id === "string")
   );
 }
@@ -119,30 +155,57 @@ function isEvent(value: unknown): value is ExternalEvent {
 function isInnerTurn(value: unknown): value is InnerTurn {
   return (
     isRecord(value) &&
+    hasExactKeys(value, [
+      "call_id",
+      "event_ids",
+      "sequence",
+      "input",
+      "output",
+      "consumed_events",
+      "reasoning",
+    ]) &&
     typeof value.call_id === "string" &&
     Array.isArray(value.event_ids) &&
     value.event_ids.every((id): id is string => typeof id === "string") &&
     value.event_ids.length > 0 &&
     isPositiveInteger(value.sequence) &&
     typeof value.input === "string" &&
+    value.input.trim() !== "" &&
     typeof value.output === "string" &&
+    value.output.trim() !== "" &&
     Array.isArray(value.consumed_events) &&
     value.consumed_events.length > 0 &&
     value.consumed_events.every(isEvent) &&
-    (value.reasoning === undefined || isReasoningList(value.reasoning))
+    value.event_ids.every(
+      (id, index) =>
+        (value.consumed_events as ExternalEvent[])[index]?.id === id,
+    ) &&
+    isReasoningList(value.reasoning)
   );
 }
 
 function isOuterTurn(value: unknown): value is OuterTurn {
   return (
     isRecord(value) &&
+    hasExactKeys(value, [
+      "call_id",
+      "event_ids",
+      "sequence",
+      "input",
+      "output",
+      "recipient_id",
+      "generated_event_id",
+      "reasoning",
+    ]) &&
     typeof value.call_id === "string" &&
     Array.isArray(value.event_ids) &&
     value.event_ids.every((id): id is string => typeof id === "string") &&
     value.event_ids.length > 0 &&
     isPositiveInteger(value.sequence) &&
     typeof value.input === "string" &&
+    value.input.trim() !== "" &&
     typeof value.output === "string" &&
+    value.output.trim() !== "" &&
     (value.recipient_id === null || isAgentId(value.recipient_id)) &&
     (value.generated_event_id === null ||
       typeof value.generated_event_id === "string") &&
@@ -152,14 +215,19 @@ function isOuterTurn(value: unknown): value is OuterTurn {
       (value.output !== "STOP" &&
         isAgentId(value.recipient_id) &&
         typeof value.generated_event_id === "string")) &&
-    (value.reasoning === undefined || isReasoningList(value.reasoning))
+    isReasoningList(value.reasoning)
   );
 }
 
 function isPromptProfile(value: unknown): value is PromptProfile {
   return (
     isRecord(value) &&
-    Object.keys(value).length === 4 &&
+    hasExactKeys(value, [
+      "pronoun",
+      "hidden_beliefs",
+      "inner_memories",
+      "outer_memories",
+    ]) &&
     typeof value.pronoun === "string" &&
     typeof value.hidden_beliefs === "string" &&
     typeof value.inner_memories === "string" &&
@@ -175,11 +243,19 @@ function hasValidInteractions(
     return false;
   }
   const addresses = new Set<string>();
-  return Object.entries(value).every(([targetId, labels]) => {
-    if (!isAgentId(targetId) || targetId === senderId || !isRecord(labels)) {
+  return Object.entries(value).every(([targetId, relationship]) => {
+    if (
+      !isAgentId(targetId) ||
+      targetId === senderId ||
+      !isRecord(relationship) ||
+      !hasExactKeys(relationship, ["description", "addresses"]) ||
+      typeof relationship.description !== "string" ||
+      !isRecord(relationship.addresses)
+    ) {
       return false;
     }
-    return Object.entries(labels).every(([address, occasion]) => {
+    return Object.entries(relationship.addresses).every(
+      ([address, occasion]) => {
       if (
         address.trim() === "" ||
         typeof occasion !== "string" ||
@@ -190,23 +266,34 @@ function hasValidInteractions(
       }
       addresses.add(address);
       return true;
-    });
+      },
+    );
   });
 }
 
 function isAgent(value: unknown): value is Agent {
   return (
     isRecord(value) &&
+    hasExactKeys(value, [
+      "id",
+      "name",
+      "prompt_profile",
+      "interactions",
+      "inner_context",
+      "outer_context",
+      "pending_events",
+    ]) &&
     isAgentId(value.id) &&
     typeof value.name === "string" &&
+    value.name.trim() !== "" &&
     isPromptProfile(value.prompt_profile) &&
     hasValidInteractions(value.interactions, value.id) &&
     isRecord(value.inner_context) &&
-    Object.keys(value.inner_context).length === 1 &&
+    hasExactKeys(value.inner_context, ["turns"]) &&
     Array.isArray(value.inner_context.turns) &&
     value.inner_context.turns.every(isInnerTurn) &&
     isRecord(value.outer_context) &&
-    Object.keys(value.outer_context).length === 1 &&
+    hasExactKeys(value.outer_context, ["turns"]) &&
     Array.isArray(value.outer_context.turns) &&
     value.outer_context.turns.every(isOuterTurn) &&
     Array.isArray(value.pending_events) &&
@@ -217,19 +304,32 @@ function isAgent(value: unknown): value is Agent {
 function isScene(value: unknown): value is Scene {
   return (
     isRecord(value) &&
-    value.schema_version === 9 &&
+    hasExactKeys(value, [
+      "schema",
+      "id",
+      "name",
+      "model",
+      "agents",
+      "rollback_stack",
+      "next_sequence",
+    ]) &&
+    isSceneSchema(value.schema) &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
-    (value.model === null ||
-      (typeof value.model === "string" && value.model.trim() !== "")) &&
+    value.name.trim() !== "" &&
+    typeof value.model === "string" &&
+    value.model.trim() !== "" &&
     Array.isArray(value.agents) &&
     value.agents.length === 3 &&
     value.agents.every(isAgent) &&
     value.agents.map((agent) => agent.id).join("") === "ABC" &&
+    value.agents.every((agent) => agent.name.trim() !== "") &&
+    new Set(value.agents.map((agent) => agent.name.trim())).size === 3 &&
     Array.isArray(value.rollback_stack) &&
     value.rollback_stack.every(
       (reference) =>
         isRecord(reference) &&
+        hasExactKeys(reference, ["call_id", "agent_id", "layer"]) &&
         typeof reference.call_id === "string" &&
         isAgentId(reference.agent_id) &&
         isLayer(reference.layer),
@@ -241,6 +341,7 @@ function isScene(value: unknown): value is Scene {
 function isSceneSummary(value: unknown): value is SceneSummary {
   return (
     isRecord(value) &&
+    hasExactKeys(value, ["id", "name"]) &&
     typeof value.id === "string" &&
     typeof value.name === "string"
   );
@@ -249,6 +350,16 @@ function isSceneSummary(value: unknown): value is SceneSummary {
 function isLayerDraft(value: unknown): value is LayerDraftResponse {
   return (
     isRecord(value) &&
+    hasExactKeys(value, [
+      "layer",
+      "call_id",
+      "event_ids",
+      "content",
+      "reasoning",
+      "usage",
+      "request_snapshot",
+      "state_token",
+    ]) &&
     isLayer(value.layer) &&
     typeof value.call_id === "string" &&
     Array.isArray(value.event_ids) &&
@@ -268,7 +379,7 @@ function isPreview(
 ): value is ModelRequestPreviewResponse {
   return (
     isRecord(value) &&
-    Object.keys(value).length === 3 &&
+    hasExactKeys(value, ["layer", "event_ids", "context"]) &&
     isLayer(value.layer) &&
     Array.isArray(value.event_ids) &&
     value.event_ids.every((id): id is string => typeof id === "string") &&
@@ -395,22 +506,6 @@ export async function createScene(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ name, model }),
     }),
-  );
-}
-
-export async function bindSceneModel(
-  sceneId: string,
-  model: string,
-): Promise<Scene> {
-  return requireScene(
-    await requestJson(
-      `/api/scenes/${encodeURIComponent(sceneId)}/model`,
-      {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model }),
-      },
-    ),
   );
 }
 

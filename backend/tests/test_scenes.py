@@ -1,4 +1,4 @@
-"""API and persistence tests for schema-v9 two-layer scenes."""
+"""API and persistence tests for versioned two-layer scenes."""
 
 import json
 import logging
@@ -10,7 +10,7 @@ from uuid import UUID, uuid4
 import pytest
 
 from app.main import create_app
-from app.models import SCHEMA_VERSION, create_scene
+from app.models import CURRENT_SCENE_SCHEMA, create_scene
 from app.storage import SceneReadError, SceneStorage
 from tests import helpers
 from tests.client import TestClient
@@ -87,30 +87,6 @@ def test_new_scene_requires_an_available_explicit_model(
     assert not scene_directory.exists()
 
 
-def test_unbound_scene_can_bind_once(
-    scene_directory: Path,
-) -> None:
-    """An explicit null binding can be filled once but never replaced."""
-    storage = SceneStorage(scene_directory)
-    scene = create_scene("待绑定", MODEL).model_copy(update={"model": None})
-    storage.create(scene)
-    client, _model = make_client(scene_directory)
-
-    response = client.put(
-        f"/api/scenes/{scene.id}/model",
-        json={"model": MODEL},
-    )
-
-    assert response.status_code == 200
-    assert response.json()["model"] == MODEL
-    replacement = client.put(
-        f"/api/scenes/{scene.id}/model",
-        json={"model": "gpt-missing"},
-    )
-    assert replacement.status_code == 409
-    assert SceneStorage(scene_directory).get(scene.id).model == MODEL
-
-
 @pytest.mark.parametrize(
     ("method", "suffix", "body"),
     [
@@ -122,19 +98,15 @@ def test_unbound_scene_can_bind_once(
         ),
     ],
 )
-@pytest.mark.parametrize("bound_model", [None, "removed-model"])
-def test_unbound_or_unavailable_model_blocks_only_model_operations(
+def test_unavailable_model_blocks_only_model_operations(
     scene_directory: Path,
     method: str,
     suffix: str,
     body: dict[str, str] | None,
-    bound_model: str | None,
 ) -> None:
     """Model operations return 409 while ordinary scene state stays editable."""
     storage = SceneStorage(scene_directory)
-    scene = create_scene("失效模型", MODEL).model_copy(
-        update={"model": bound_model}
-    )
+    scene = create_scene("失效模型", "removed-model")
     storage.create(scene)
     client, _model = make_client(scene_directory)
 
@@ -151,6 +123,33 @@ def test_unbound_or_unavailable_model_blocks_only_model_operations(
     assert event.status_code == 201
 
 
+def test_null_model_is_corrupt_and_model_binding_route_is_absent(
+    scene_directory: Path,
+) -> None:
+    """Every persisted scene has one immutable non-empty model string."""
+    storage = SceneStorage(scene_directory)
+    scene = create_scene("模型必需", MODEL)
+    raw = scene.model_dump(mode="json", by_alias=True)
+    raw["model"] = None
+    scene_directory.mkdir()
+    path = scene_directory / f"{scene.id}.json"
+    original = json.dumps(raw, ensure_ascii=False).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(SceneReadError, match="corrupted"):
+        storage.get(scene.id)
+    assert path.read_bytes() == original
+
+    path.unlink()
+    client, _model = make_client(scene_directory)
+    created = post_scene(client)
+    response = client.put(
+        f"/api/scenes/{created['id']}/model",
+        json={"model": MODEL},
+    )
+    assert response.status_code == 404
+
+
 def test_new_schema_round_trips_without_legacy_agent_fields(
     scene_directory: Path,
 ) -> None:
@@ -158,10 +157,10 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
     client, _model = make_client(scene_directory)
     scene = post_scene(client)
 
-    assert scene["schema_version"] == SCHEMA_VERSION == 9
+    assert scene["schema"] == CURRENT_SCENE_SCHEMA == "ai-town.scene/1.0"
     assert [agent["id"] for agent in scene["agents"]] == ["A", "B", "C"]
     assert set(scene) == {
-        "schema_version",
+        "schema",
         "id",
         "name",
         "model",
@@ -198,7 +197,7 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
             assert removed not in agent
 
     restarted = SceneStorage(scene_directory).get(UUID(scene["id"]))
-    assert restarted.model_dump(mode="json") == scene
+    assert restarted.model_dump(mode="json", by_alias=True) == scene
 
 
 def test_new_scene_starts_with_blank_variables_and_blocks_model_calls(
@@ -280,7 +279,14 @@ def test_new_scene_starts_with_blank_variables_and_blocks_model_calls(
                         "outer_memories": f"OUTER {agent['id']}",
                     },
                     "interactions": (
-                        {"B": {"B": "一般场合"}} if agent["id"] == "A" else {}
+                        {
+                            "B": {
+                                "description": "你的儿子。",
+                                "addresses": {"B": "一般场合"},
+                            }
+                        }
+                        if agent["id"] == "A"
+                        else {}
                     ),
                 }
                 for agent in scene["agents"]
@@ -292,28 +298,208 @@ def test_new_scene_starts_with_blank_variables_and_blocks_model_calls(
     assert inner["content"] == "内层"
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5, 6, 7, 8])
-def test_old_schema_is_rejected_without_migration(
+@pytest.mark.parametrize(
+    "schema",
+    ["ai-town.scene/1.0", "ai-town.scene/1.1", "ai-town.scene/1.999"],
+)
+def test_same_major_schema_round_trips_without_changing_minor(
     scene_directory: Path,
-    schema_version: int,
+    schema: str,
 ) -> None:
-    """Legacy single-layer files are not upgraded or rewritten."""
+    """Every legal 1.x file remains on its persisted schema identifier."""
+    storage = SceneStorage(scene_directory)
+    scene = helpers.create_prompted_scene("同主版本", MODEL)
+    raw = scene.model_dump(mode="json", by_alias=True)
+    raw["schema"] = schema
+    scene_directory.mkdir()
+    path = scene_directory / f"{scene.id}.json"
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    loaded = storage.get(scene.id)
+    assert loaded.schema_id == schema
+
+    storage.mutate(
+        scene.id,
+        lambda current: current.model_copy(update={"name": "保存后"}),
+    )
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["schema"] == schema
+
+
+@pytest.mark.parametrize(
+    ("schema", "message"),
+    [
+        ("other.scene/1.0", "invalid scene schema"),
+        ("ai-town.scene/1", "invalid scene schema"),
+        ("ai-town.scene/1.0.0", "invalid scene schema"),
+        ("ai-town.scene/01.0", "invalid scene schema"),
+        ("ai-town.scene/1.01", "invalid scene schema"),
+        ("ai-town.scene/-1.0", "invalid scene schema"),
+        ("ai-town.scene/0.9", "incompatible schema major 0"),
+        ("ai-town.scene/2.0", "incompatible schema major 2"),
+    ],
+)
+def test_invalid_or_incompatible_schema_is_rejected_before_structure(
+    scene_directory: Path,
+    schema: str,
+    message: str,
+) -> None:
+    """Schema identity is checked first and failed files stay untouched."""
     scene_directory.mkdir()
     scene_id = uuid4()
     path = scene_directory / f"{scene_id}.json"
     raw = {
-        "schema_version": schema_version,
+        "schema": schema,
         "id": str(scene_id),
-        "name": "旧场景",
-        "agents": [],
     }
     original = json.dumps(raw).encode()
     path.write_bytes(original)
 
-    with pytest.raises(SceneReadError, match="not schema v9"):
+    with pytest.raises(SceneReadError, match=message):
         SceneStorage(scene_directory).get(scene_id)
 
     assert path.read_bytes() == original
+
+
+def test_numeric_schema_version_and_legacy_interactions_are_not_converted(
+    scene_directory: Path,
+) -> None:
+    """Obsolete version fields and relationship maps remain invalid data."""
+    storage = SceneStorage(scene_directory)
+    scene = helpers.create_prompted_scene("旧结构", MODEL)
+    raw = scene.model_dump(mode="json", by_alias=True)
+    raw["schema_version"] = 9
+    del raw["schema"]
+    scene_directory.mkdir()
+    path = scene_directory / f"{scene.id}.json"
+    original = json.dumps(raw, ensure_ascii=False).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(SceneReadError, match="invalid scene schema"):
+        storage.get(scene.id)
+    assert path.read_bytes() == original
+
+    raw["schema"] = CURRENT_SCENE_SCHEMA
+    del raw["schema_version"]
+    for agent in raw["agents"]:
+        agent["interactions"] = {
+            target_id: relationship["addresses"]
+            for target_id, relationship in agent["interactions"].items()
+        }
+    original = json.dumps(raw, ensure_ascii=False, indent=2).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(SceneReadError, match="corrupted"):
+        storage.get(scene.id)
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    [
+        "rollback_stack",
+        "next_sequence",
+        "pending_events",
+        "inner_turns",
+        "outer_turns",
+        "event_source",
+        "reasoning",
+    ],
+)
+def test_same_major_scene_rejects_missing_persisted_fields(
+    scene_directory: Path,
+    missing_field: str,
+) -> None:
+    """A 1.x identifier never enables defaults for corrupted structures."""
+    client, _model = make_client(scene_directory, ["内层输出"])
+    scene = post_event(client, post_scene(client)["id"], "A", "事件")
+    draft = generate(client, scene["id"], "A", "inner")
+    scene = confirm(client, scene["id"], "A", "inner", draft).json()
+    path = scene_directory / f"{scene['id']}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+
+    if missing_field in {"rollback_stack", "next_sequence"}:
+        del raw[missing_field]
+    elif missing_field == "pending_events":
+        del raw["agents"][1]["pending_events"]
+    elif missing_field == "inner_turns":
+        del raw["agents"][0]["inner_context"]["turns"]
+    elif missing_field == "outer_turns":
+        del raw["agents"][0]["outer_context"]["turns"]
+    elif missing_field == "event_source":
+        del raw["agents"][0]["inner_context"]["turns"][0]["consumed_events"][0][
+            "source_agent_id"
+        ]
+    else:
+        del raw["agents"][0]["inner_context"]["turns"][0]["reasoning"]
+
+    original = json.dumps(raw, ensure_ascii=False).encode()
+    path.write_bytes(original)
+
+    with pytest.raises(SceneReadError, match="corrupted"):
+        SceneStorage(scene_directory).get(UUID(scene["id"]))
+    assert path.read_bytes() == original
+
+
+def test_explicit_empty_persisted_arrays_round_trip(
+    scene_directory: Path,
+) -> None:
+    """Empty queues, histories, rollback state, and reasoning stay legal."""
+    client, _model = make_client(scene_directory, ["内层输出"])
+    scene = post_event(client, post_scene(client)["id"], "A", "事件")
+    draft = generate(client, scene["id"], "A", "inner")
+    scene = confirm(client, scene["id"], "A", "inner", draft).json()
+    path = scene_directory / f"{scene['id']}.json"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    raw["agents"][0]["inner_context"]["turns"][0]["reasoning"] = []
+    path.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+
+    loaded = SceneStorage(scene_directory).get(UUID(scene["id"]))
+
+    assert loaded.agents[0].inner_context.turns[0].reasoning == []
+    assert loaded.agents[0].pending_events == []
+    assert loaded.agents[0].outer_context.turns == []
+    assert loaded.agents[1].inner_context.turns == []
+
+
+def test_scene_api_rejects_duplicate_trimmed_agent_names_without_writing(
+    scene_directory: Path,
+) -> None:
+    """Names are unique after trimming with case-sensitive comparison."""
+    client, _model = make_client(scene_directory)
+    scene = post_scene(client)
+    payload = {
+        "name": scene["name"],
+        "agents": [
+            {
+                "id": agent["id"],
+                "name": (
+                    " 同名 "
+                    if agent["id"] == "A"
+                    else "同名"
+                    if agent["id"] == "B"
+                    else "第三人"
+                ),
+                "prompt_profile": agent["prompt_profile"],
+                "interactions": agent["interactions"],
+            }
+            for agent in scene["agents"]
+        ],
+    }
+    path = scene_directory / f"{scene['id']}.json"
+    before = path.read_bytes()
+
+    response = client.put(f"/api/scenes/{scene['id']}", json=payload)
+
+    assert response.status_code == 422
+    assert path.read_bytes() == before
+
+    payload["agents"][0]["name"] = "Person"
+    payload["agents"][1]["name"] = "person"
+    assert (
+        client.put(f"/api/scenes/{scene['id']}", json=payload).status_code
+        == 200
+    )
 
 
 def test_scene_list_skips_one_unreadable_file(
@@ -349,7 +535,7 @@ def test_scene_list_skips_one_unreadable_file(
 def test_scene_edit_saves_profiles_interactions_and_preserves_state(
     scene_directory: Path,
 ) -> None:
-    """PUT changes v9 settings but never queue or call history."""
+    """PUT changes scene settings but never queue or call history."""
     client, _model = make_client(scene_directory)
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "保留的事件")
@@ -366,7 +552,10 @@ def test_scene_edit_saves_profiles_interactions_and_preserves_state(
                     "outer_memories": f"OUTER {agent['id']}\n完整文本",
                 },
                 "interactions": {
-                    ("B" if agent["id"] == "A" else "A"): {"家人": "一般场合"}
+                    ("B" if agent["id"] == "A" else "A"): {
+                        "description": "关系简介。",
+                        "addresses": {"家人": "一般场合"},
+                    }
                 },
             }
             for agent in scene["agents"]
@@ -396,16 +585,27 @@ def test_scene_edit_saves_profiles_interactions_and_preserves_state(
 @pytest.mark.parametrize(
     "bad_interactions",
     [
-        {"A": {"自己": "任何场合"}},
         {
-            "B": {"家人": "一般场合"},
-            "C": {"家人": "正式场合"},
+            "A": {
+                "description": "自己。",
+                "addresses": {"自己": "任何场合"},
+            }
+        },
+        {
+            "B": {
+                "description": "家人。",
+                "addresses": {"家人": "一般场合"},
+            },
+            "C": {
+                "description": "另一个家人。",
+                "addresses": {"家人": "正式场合"},
+            },
         },
     ],
 )
 def test_scene_api_rejects_self_targets_and_duplicate_addresses(
     scene_directory: Path,
-    bad_interactions: dict[str, dict[str, str]],
+    bad_interactions: dict[str, object],
 ) -> None:
     """Invalid reverse-routing configuration never reaches scene JSON."""
     client, _model = make_client(scene_directory)
@@ -556,7 +756,7 @@ def test_generation_writes_nothing_and_two_confirmations_route_atomically(
     assert len(model_client.generate_calls) == 2
 
     restarted = SceneStorage(scene_directory).get(UUID(scene["id"]))
-    assert restarted.model_dump(mode="json") == completed
+    assert restarted.model_dump(mode="json", by_alias=True) == completed
 
 
 def test_half_round_restores_outer_stage_after_restart(
@@ -803,7 +1003,7 @@ def test_rollback_inner_restores_the_consumed_batch_in_fifo_order(
     assert undone["agents"][0]["inner_context"]["turns"] == []
 
 
-def test_v9_scene_keeps_validated_historic_reasoning(
+def test_scene_keeps_validated_historic_reasoning(
     scene_directory: Path,
 ) -> None:
     """Persisted reasoning validates and round-trips while empty stays legal."""  # noqa: E501
@@ -829,7 +1029,7 @@ def test_v9_scene_keeps_validated_historic_reasoning(
 
     reloaded = SceneStorage(scene_directory).get(UUID(scene["id"]))
 
-    assert reloaded.schema_version == SCHEMA_VERSION
+    assert reloaded.schema_id == CURRENT_SCENE_SCHEMA
     assert [
         block.model_dump()
         for block in reloaded.agents[0].inner_context.turns[0].reasoning

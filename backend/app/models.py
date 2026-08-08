@@ -12,8 +12,15 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 9
+SCENE_SCHEMA_NAMESPACE = "ai-town.scene"
+SCENE_SCHEMA_MAJOR = 1
+CURRENT_SCENE_SCHEMA = f"{SCENE_SCHEMA_NAMESPACE}/1.0"
 AGENT_IDS = ("A", "B", "C")
+
+_SCENE_SCHEMA_PATTERN = re.compile(
+    rf"\A{re.escape(SCENE_SCHEMA_NAMESPACE)}/"
+    r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z"
+)
 
 AgentId = Literal["A", "B", "C"]
 Layer = Literal["inner", "outer"]
@@ -49,12 +56,22 @@ def _strip_non_blank_model(value: str) -> str:
     return stripped
 
 
+def parse_scene_schema(value: object) -> tuple[int, int]:
+    """Parse a strict namespaced scene schema identifier."""
+    if not isinstance(value, str):
+        raise ValueError("scene schema must be a string")
+    match = _SCENE_SCHEMA_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError("scene schema has an invalid namespace or version")
+    return int(match.group(1)), int(match.group(2))
+
+
 _SEMANTIC_MESSAGE_PREFIX = re.compile(r"\A对\s*(.+?)\s*说\s*[:：]\s*")
 
 
 def parse_semantic_message(
     content: str,
-    interactions: dict[AgentId, dict[str, str]],
+    interactions: dict[AgentId, Interaction],
 ) -> tuple[AgentId, str, str]:
     """Parse one configured ``对{称呼}说：{正文}`` message.
 
@@ -70,8 +87,8 @@ def parse_semantic_message(
     address = match.group(1).strip()
     recipients = [
         target_id
-        for target_id, labels in interactions.items()
-        if address in labels
+        for target_id, interaction in interactions.items()
+        if address in interaction.addresses
     ]
     if len(recipients) != 1:
         raise ValueError("message address is not uniquely configured")
@@ -124,8 +141,8 @@ class ExternalEvent(ApiModel):
     sequence: int = Field(ge=1)
     kind: EventKind
     content: str
-    source_agent_id: AgentId | None = None
-    source_call_id: UUID | None = None
+    source_agent_id: AgentId | None
+    source_call_id: UUID | None
 
     _validate_content = field_validator("content")(_require_non_blank)
 
@@ -156,7 +173,7 @@ class InnerTurn(ApiModel):
     input: str
     output: str
     consumed_events: list[ExternalEvent]
-    reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
+    reasoning: list[ModelReasoningBlock]
 
     _validate_input = field_validator("input")(_require_non_blank)
     _validate_output = field_validator("output")(_require_non_blank)
@@ -194,7 +211,7 @@ class OuterTurn(ApiModel):
     output: str
     recipient_id: AgentId | None
     generated_event_id: UUID | None
-    reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
+    reasoning: list[ModelReasoningBlock]
 
     _validate_input = field_validator("input")(_require_non_blank)
     _validate_output = field_validator("output")(_require_non_blank)
@@ -218,13 +235,13 @@ class OuterTurn(ApiModel):
 class InnerContext(ApiModel):
     """Complete confirmed inner history without a persisted prompt."""
 
-    turns: list[InnerTurn] = Field(default_factory=list)
+    turns: list[InnerTurn]
 
 
 class OuterContext(ApiModel):
     """Complete confirmed outer history without a persisted prompt."""
 
-    turns: list[OuterTurn] = Field(default_factory=list)
+    turns: list[OuterTurn]
 
 
 class PromptProfile(ApiModel):
@@ -236,51 +253,52 @@ class PromptProfile(ApiModel):
     outer_memories: str
 
 
+class Interaction(ApiModel):
+    """One sender's relationship view of an interactive person."""
+
+    description: str
+    addresses: dict[str, str]
+
+    @field_validator("addresses", mode="before")
+    @classmethod
+    def normalize_addresses(cls, value: Any) -> Any:
+        """Trim route keys and occasions while retaining their input order."""
+        if not isinstance(value, dict):
+            return value
+        normalized: dict[Any, Any] = {}
+        for raw_address, raw_occasion in value.items():
+            address = (
+                raw_address.strip()
+                if isinstance(raw_address, str)
+                else raw_address
+            )
+            occasion = (
+                raw_occasion.strip()
+                if isinstance(raw_occasion, str)
+                else raw_occasion
+            )
+            if not address or not occasion:
+                raise ValueError(
+                    "interaction addresses and occasions must not be blank"
+                )
+            if address in normalized:
+                raise ValueError("interaction addresses must be unique")
+            normalized[address] = occasion
+        return normalized
+
+
 class Agent(ApiModel):
     """One Agent with isolated inner/outer contexts and a FIFO event queue."""
 
     id: AgentId
     name: str
     prompt_profile: PromptProfile
-    interactions: dict[AgentId, dict[str, str]]
+    interactions: dict[AgentId, Interaction]
     inner_context: InnerContext
     outer_context: OuterContext
-    pending_events: list[ExternalEvent] = Field(default_factory=list)
+    pending_events: list[ExternalEvent]
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
-
-    @field_validator("interactions", mode="before")
-    @classmethod
-    def normalize_interactions(cls, value: Any) -> Any:
-        """Trim non-empty labels and occasions without losing entry order."""
-        if not isinstance(value, dict):
-            return value
-        normalized: dict[Any, Any] = {}
-        for target_id, raw_labels in value.items():
-            if not isinstance(raw_labels, dict):
-                normalized[target_id] = raw_labels
-                continue
-            labels: dict[str, Any] = {}
-            for raw_address, raw_occasion in raw_labels.items():
-                address = (
-                    raw_address.strip()
-                    if isinstance(raw_address, str)
-                    else raw_address
-                )
-                occasion = (
-                    raw_occasion.strip()
-                    if isinstance(raw_occasion, str)
-                    else raw_occasion
-                )
-                if not address or not occasion:
-                    raise ValueError(
-                        "interaction addresses and occasions must not be blank"
-                    )
-                if address in labels:
-                    raise ValueError("interaction addresses must be unique")
-                labels[address] = occasion
-            normalized[target_id] = labels
-        return normalized
 
     @model_validator(mode="after")
     def validate_round_alignment(self) -> Self:
@@ -288,8 +306,8 @@ class Agent(ApiModel):
         if self.id in self.interactions:
             raise ValueError("an Agent cannot interact with itself")
         seen_addresses: set[str] = set()
-        for labels in self.interactions.values():
-            for address in labels:
+        for interaction in self.interactions.values():
+            for address in interaction.addresses:
                 if address in seen_addresses:
                     raise ValueError(
                         "interaction addresses must be unique per sender"
@@ -327,31 +345,39 @@ class ConfirmedCallReference(ApiModel):
 
 
 class Scene(ApiModel):
-    """A schema-v9 scene containing exactly three two-layer Agents."""
+    """A current-major scene containing exactly three two-layer Agents."""
 
-    schema_version: Literal[9] = SCHEMA_VERSION
+    schema_id: str = Field(
+        validation_alias="schema",
+        serialization_alias="schema",
+    )
     id: UUID
     name: str
-    model: str | None
+    model: str
     agents: list[Agent] = Field(min_length=3, max_length=3)
-    rollback_stack: list[ConfirmedCallReference] = Field(default_factory=list)
-    next_sequence: int = Field(default=1, ge=1)
+    rollback_stack: list[ConfirmedCallReference]
+    next_sequence: int = Field(ge=1)
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
+    _validate_model = field_validator("model")(_strip_non_blank_model)
 
-    @field_validator("model")
+    @field_validator("schema_id")
     @classmethod
-    def validate_model(cls, value: str | None) -> str | None:
-        """Allow an explicit one-time unbound state or one model name."""
-        if value is None:
-            return None
-        return _strip_non_blank_model(value)
+    def validate_schema(cls, value: str) -> str:
+        """Accept every well-formed schema in the current major version."""
+        major, _minor = parse_scene_schema(value)
+        if major != SCENE_SCHEMA_MAJOR:
+            raise ValueError(f"scene schema major must be {SCENE_SCHEMA_MAJOR}")
+        return value
 
     @model_validator(mode="after")
     def validate_scene_integrity(self) -> Self:
         """Validate IDs, call order, event ownership, and routing references."""
         if tuple(agent.id for agent in self.agents) != AGENT_IDS:
             raise ValueError("agents must contain A, B, and C in order")
+        names = [agent.name for agent in self.agents]
+        if len(set(names)) != len(names):
+            raise ValueError("Agent names must be unique within a scene")
 
         calls: list[tuple[int, ConfirmedCallReference]] = []
         events: dict[UUID, tuple[AgentId, ExternalEvent]] = {}
@@ -494,14 +520,6 @@ class CreateSceneRequest(ApiModel):
     _validate_model = field_validator("model")(_strip_non_blank_model)
 
 
-class BindSceneModelRequest(ApiModel):
-    """One-time model binding payload for an unbound scene."""
-
-    model: str
-
-    _validate_model = field_validator("model")(_strip_non_blank_model)
-
-
 class ModelOption(ApiModel):
     """One public model choice without protocol or endpoint details."""
 
@@ -520,7 +538,7 @@ class AgentUpdate(ApiModel):
     id: AgentId
     name: str
     prompt_profile: PromptProfile
-    interactions: dict[AgentId, dict[str, str]]
+    interactions: dict[AgentId, Interaction]
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
 
@@ -532,8 +550,9 @@ class AgentUpdate(ApiModel):
             name=self.name,
             prompt_profile=self.prompt_profile,
             interactions=self.interactions,
-            inner_context=InnerContext(),
-            outer_context=OuterContext(),
+            inner_context=InnerContext(turns=[]),
+            outer_context=OuterContext(turns=[]),
+            pending_events=[],
         )
         return self
 
@@ -548,9 +567,12 @@ class UpdateSceneRequest(ApiModel):
 
     @model_validator(mode="after")
     def validate_agent_ids(self) -> Self:
-        """Require editable Agents in stable A/B/C order."""
+        """Require stable IDs and unique trimmed names."""
         if tuple(agent.id for agent in self.agents) != AGENT_IDS:
             raise ValueError("agents must contain A, B, and C in order")
+        names = [agent.name for agent in self.agents]
+        if len(set(names)) != len(names):
+            raise ValueError("Agent names must be unique within a scene")
         return self
 
 
@@ -620,13 +642,10 @@ class EventNotFoundError(LookupError):
     """Raised when a scene has no event with the requested ID."""
 
 
-class SceneModelBindingConflictError(RuntimeError):
-    """Raised when replacing an existing scene model binding."""
-
-
 def create_scene(name: str, model: str) -> Scene:
-    """Create an empty schema-v9 scene bound to one configured model."""
+    """Create an empty scene at the user-confirmed current schema."""
     return Scene(
+        schema=CURRENT_SCENE_SCHEMA,
         id=uuid4(),
         name=name,
         model=model,
@@ -641,21 +660,15 @@ def create_scene(name: str, model: str) -> Scene:
                     outer_memories="",
                 ),
                 interactions={},
-                inner_context=InnerContext(),
-                outer_context=OuterContext(),
+                inner_context=InnerContext(turns=[]),
+                outer_context=OuterContext(turns=[]),
+                pending_events=[],
             )
             for agent_id in AGENT_IDS
         ],
+        rollback_stack=[],
+        next_sequence=1,
     )
-
-
-def bind_scene_model(scene: Scene, model: str) -> Scene:
-    """Bind an unbound scene once without allowing later replacement."""
-    if scene.model is not None:
-        raise SceneModelBindingConflictError(
-            f"Scene '{scene.id}' already has a model binding."
-        )
-    return _replace_scene(scene, model=_strip_non_blank_model(model))
 
 
 def update_scene(scene: Scene, update: UpdateSceneRequest) -> Scene:
@@ -694,6 +707,8 @@ def add_manual_event(
         sequence=scene.next_sequence,
         kind="manual",
         content=content,
+        source_agent_id=None,
+        source_call_id=None,
     )
     agents = [
         agent.model_copy(
@@ -1064,7 +1079,7 @@ def get_agent(scene: Scene, agent_id: AgentId) -> Agent:
 
 
 def require_agent_ready(agent: Agent) -> None:
-    """Require every prompt variable and at least one semantic address."""
+    """Require prompt variables and complete routable relationships."""
     profile = agent.prompt_profile
     variables = (
         profile.pronoun,
@@ -1076,10 +1091,20 @@ def require_agent_ready(agent: Agent) -> None:
         raise SceneConflictError(
             "All four prompt variables must be filled before model requests."
         )
-    if not any(agent.interactions.values()):
+    configured = [
+        interaction
+        for interaction in agent.interactions.values()
+        if interaction.addresses
+    ]
+    if not configured:
         raise SceneConflictError(
             "At least one interaction address is required before model "
             "requests."
+        )
+    if any(not interaction.description.strip() for interaction in configured):
+        raise SceneConflictError(
+            "Every person with interaction addresses must have a "
+            "description before model requests."
         )
 
 
@@ -1108,7 +1133,7 @@ def _require_new_call_id(scene: Scene, call_id: UUID) -> None:
 def _replace_scene(scene: Scene, **updates: Any) -> Scene:
     """Return a fully revalidated scene after a state transition."""
     values = {
-        "schema_version": scene.schema_version,
+        "schema": scene.schema_id,
         "id": scene.id,
         "name": scene.name,
         "model": scene.model,

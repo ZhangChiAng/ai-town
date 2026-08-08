@@ -163,9 +163,8 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     scene = _post_event(client, scene["id"], "A", "A FIRST EVENT")
 
     persisted = storage.get(UUID(scene["id"]))
-    agent_a = persisted.agents[0]
-    inner_system_prompt = build_system_prompt(agent_a, "inner")
-    outer_system_prompt = build_system_prompt(agent_a, "outer")
+    inner_system_prompt = build_system_prompt(persisted, "A", "inner")
+    outer_system_prompt = build_system_prompt(persisted, "A", "outer")
     first_conversation = ModelConversation(
         system_prompt=inner_system_prompt,
         turns=(),
@@ -295,7 +294,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     assert all(value not in serialized_context for value in forbidden_values)
 
 
-def test_valid_draft_confirms_after_restart_without_bound_model(
+def test_valid_draft_confirms_after_restart_without_available_model(
     tmp_path: Path,
 ) -> None:
     """Unavailable models block new calls but never an existing confirmation."""

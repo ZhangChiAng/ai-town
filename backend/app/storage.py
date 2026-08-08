@@ -1,4 +1,4 @@
-"""Atomic JSON-file persistence for schema-v9 two-layer scenes."""
+"""Atomic JSON-file persistence for namespaced scene contracts."""
 
 import contextlib
 import json
@@ -13,9 +13,10 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from app.models import (
-    SCHEMA_VERSION,
+    SCENE_SCHEMA_MAJOR,
     Scene,
     SceneSummary,
+    parse_scene_schema,
 )
 from app.structured_logging import log_event
 
@@ -137,7 +138,7 @@ class SceneStorage:
                 )
             # Revalidation makes partial or structurally inconsistent writes
             # impossible even if an operation used Pydantic model_copy.
-            validated = Scene.model_validate(updated.model_dump())
+            validated = Scene.model_validate(updated.model_dump(by_alias=True))
             self._write(validated, must_not_exist=False)
             return validated
 
@@ -168,13 +169,18 @@ class SceneStorage:
                 f"Scene file '{path.name}' is not valid JSON or is corrupted."
             ) from error
 
-        # v9 intentionally starts a new prompt and routing information model.
-        # Older files remain untouched and are never migrated or accepted.
-        version = raw.get("schema_version") if isinstance(raw, dict) else None
-        if version != SCHEMA_VERSION:
+        schema = raw.get("schema") if isinstance(raw, dict) else None
+        try:
+            major, _minor = parse_scene_schema(schema)
+        except ValueError as error:
             raise SceneReadError(
-                f"Scene file '{path.name}' is not schema v{SCHEMA_VERSION} "
-                "and no migration is supported."
+                f"Scene file '{path.name}' has an invalid scene schema."
+            ) from error
+        if major != SCENE_SCHEMA_MAJOR:
+            raise SceneReadError(
+                f"Scene file '{path.name}' uses incompatible schema major "
+                f"{major}; this application supports major "
+                f"{SCENE_SCHEMA_MAJOR}."
             )
 
         try:
@@ -219,7 +225,9 @@ class SceneStorage:
                 delete=False,
             ) as temporary_file:
                 temporary_path = Path(temporary_file.name)
-                temporary_file.write(scene.model_dump_json(indent=2))
+                temporary_file.write(
+                    scene.model_dump_json(indent=2, by_alias=True)
+                )
                 temporary_file.write("\n")
                 temporary_file.flush()
                 os.fsync(temporary_file.fileno())

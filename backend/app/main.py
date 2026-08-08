@@ -27,7 +27,6 @@ from app.model_backends import (
 from app.model_config import load_model_settings
 from app.models import (
     AgentId,
-    BindSceneModelRequest,
     ConfirmLayerRequest,
     CreateSceneRequest,
     EventContentRequest,
@@ -41,11 +40,9 @@ from app.models import (
     ModelRequestPreviewResponse,
     Scene,
     SceneConflictError,
-    SceneModelBindingConflictError,
     SceneSummary,
     UpdateSceneRequest,
     add_manual_event,
-    bind_scene_model,
     create_scene,
     delete_manual_event,
     edit_manual_event,
@@ -169,11 +166,6 @@ def create_app(
         request: Request,
     ) -> DraftWorkflow:
         """Resolve the immutable scene binding to an available service."""
-        if scene.model is None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Scene must be bound to a model before model requests.",
-            )
         workflow = draft_workflows(request).get(scene.model)
         if workflow is None:
             raise HTTPException(
@@ -222,16 +214,6 @@ def create_app(
     ) -> JSONResponse:
         return JSONResponse(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-            content={"detail": str(error)},
-        )
-
-    @application.exception_handler(SceneModelBindingConflictError)
-    async def handle_scene_model_binding_conflict(
-        _request: Request,
-        error: SceneModelBindingConflictError,
-    ) -> JSONResponse:
-        return JSONResponse(
-            status_code=status.HTTP_409_CONFLICT,
             content={"detail": str(error)},
         )
 
@@ -355,31 +337,6 @@ def create_app(
                 }
                 for agent in scene.agents
             ],
-        )
-        return scene
-
-    @application.put("/api/scenes/{scene_id}/model")
-    async def put_scene_model(
-        scene_id: UUID,
-        payload: BindSceneModelRequest,
-        request: Request,
-    ) -> Scene:
-        current_scene = storage(request).get(scene_id)
-        if current_scene.model is not None:
-            # A bound scene conflicts regardless of the replacement value.
-            bind_scene_model(current_scene, payload.model)
-        require_available_model(payload.model, request)
-        scene = storage(request).mutate(
-            scene_id,
-            lambda scene: bind_scene_model(scene, payload.model),
-        )
-        log_event(
-            LOGGER,
-            logging.INFO,
-            "scene.model_bound",
-            "Scene model bound.",
-            scene_id=scene.id,
-            model=scene.model,
         )
         return scene
 

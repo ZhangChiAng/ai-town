@@ -37,18 +37,34 @@ type RouteHandler =
 function interactionsFor(id: "A" | "B" | "C"): Interactions {
   if (id === "A") {
     return {
-      B: { 儿子: "一般场合", 小名: "亲昵场合" },
-      C: { 邻居: "邻里场合" },
+      B: {
+        description: "你的儿子，最近工作不顺。",
+        addresses: { 儿子: "一般场合", 小名: "亲昵场合" },
+      },
+      C: {
+        description: "住在隔壁的邻居。",
+        addresses: { 邻居: "邻里场合" },
+      },
     };
   }
   return id === "B"
-    ? { A: { 母亲: "家庭场合" } }
-    : { A: { 邻居: "邻里场合" } };
+    ? {
+        A: {
+          description: "你的母亲。",
+          addresses: { 母亲: "家庭场合" },
+        },
+      }
+    : {
+        A: {
+          description: "住在隔壁的邻居。",
+          addresses: { 邻居: "邻里场合" },
+        },
+      };
 }
 
 function makeScene(): Scene {
   return {
-    schema_version: 9,
+    schema: "ai-town.scene/1.0",
     id: SCENE_ID,
     name: "海边小镇",
     model: MODEL,
@@ -106,6 +122,7 @@ function halfRoundScene(): Scene {
     input: "外部事件：\n海面突然起雾。",
     output: "先观察风向。\n别急着靠岸。",
     consumed_events: [manualEvent()],
+    reasoning: [],
   });
   scene.rollback_stack.push({
     call_id: INNER_CALL_ID,
@@ -128,6 +145,7 @@ function completeScene(): Scene {
     output: "对儿子说：今晚先别出海。",
     recipient_id: "B",
     generated_event_id: GENERATED_EVENT_ID,
+    reasoning: [],
   });
   scene.agents[1].pending_events.push({
     id: GENERATED_EVENT_ID,
@@ -371,26 +389,26 @@ describe("App", () => {
     );
   });
 
-  it("binds an unbound scene once and then enables model operations", async () => {
-    const unbound = pendingScene();
-    unbound.model = null;
-    const bound = pendingScene();
-    let bindingBody: unknown;
-    await mountOpenedScene(unbound, {
-      [`PUT /api/scenes/${SCENE_ID}/model`]: (init) => {
-        bindingBody = JSON.parse(String(init?.body));
-        return jsonResponse(bound);
-      },
-    });
+  it("opens scenes from any valid current-major schema", async () => {
+    const scene = pendingScene();
+    scene.schema = "ai-town.scene/1.999";
 
-    expect(container.textContent).toContain("尚未绑定模型");
-    expect(findButton(container, "生成内层草稿").disabled).toBe(true);
-    findButton(container, "永久绑定").click();
-    await flush();
+    await mountOpenedScene(scene);
 
-    expect(bindingBody).toEqual({ model: MODEL });
-    expect(container.textContent).not.toContain("模型调用已停用");
+    expect(container.textContent).toContain(scene.name);
     expect(findButton(container, "生成内层草稿").disabled).toBe(false);
+  });
+
+  it("rejects scene responses with fields outside the contract", async () => {
+    const scene = pendingScene() as Scene & { unexpected?: boolean };
+    scene.unexpected = true;
+
+    await mountOpenedScene(scene);
+
+    expect(container.textContent).toContain(
+      "后端返回了无法识别的场景数据。",
+    );
+    expect(container.querySelector(".scene-toolbar")).toBeNull();
   });
 
   it("keeps editing available while a bound model is unavailable", async () => {
@@ -425,9 +443,48 @@ describe("App", () => {
 
     expect(findButton(container, "生成内层草稿").disabled).toBe(true);
     expect(container.textContent).toContain(
-      "请填写四个提示词变量，并至少配置一个互动称呼。",
+      "请填写四个提示词变量。",
     );
     expect(findButton(container, "加载预览").disabled).toBe(true);
+  });
+
+  it("blocks model controls when an addressed person lacks a description", async () => {
+    const scene = pendingScene();
+    const relationship = scene.agents[0].interactions.B;
+    if (relationship === undefined) {
+      throw new Error("fixture relationship missing");
+    }
+    relationship.description = "";
+
+    await mountOpenedScene(scene);
+
+    expect(findButton(container, "生成内层草稿").disabled).toBe(true);
+    expect(findButton(container, "加载预览").disabled).toBe(true);
+    expect(container.textContent).toContain(
+      "请补全所有已配置互动人物的简介。",
+    );
+  });
+
+  it("rejects duplicate trimmed person names before saving", async () => {
+    const scene = makeScene();
+    const fetchMock = await mountOpenedScene(scene);
+    const settings = container.querySelector(
+      ".settings-card",
+    ) as HTMLDetailsElement;
+    settings.open = true;
+    const name = settings.querySelector("#agent-name") as HTMLInputElement;
+    name.value = " 居民 B ";
+    name.dispatchEvent(new Event("input", { bubbles: true }));
+    await nextTick();
+
+    findButton(container, "保存设定").click();
+    await flush();
+
+    expect(container.textContent).toContain("三位人物的姓名不能重复。");
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      `/api/scenes/${SCENE_ID}`,
+      expect.objectContaining({ method: "PUT" }),
+    );
   });
 
   it("edits prompt variables and ordered interactions in the scene payload", async () => {
@@ -460,6 +517,14 @@ describe("App", () => {
     ) as HTMLInputElement;
     pronoun.value = "她自己";
     pronoun.dispatchEvent(new Event("input", { bubbles: true }));
+
+    expect(settings.textContent).toContain("居民 B");
+    expect(settings.textContent).not.toContain("Agent B");
+    const description = settings.querySelector(
+      '[aria-label="居民 B的人物简介"]',
+    ) as HTMLTextAreaElement;
+    description.value = "你的成年儿子，最近工作不顺。";
+    description.dispatchEvent(new Event("input", { bubbles: true }));
 
     const firstAddress = settings.querySelector(
       ".interaction-row input",
@@ -503,10 +568,16 @@ describe("App", () => {
       },
       interactions: {
         B: {
-          孩子: "一般场合",
-          宝贝: "安慰场合",
+          description: "你的成年儿子，最近工作不顺。",
+          addresses: {
+            孩子: "一般场合",
+            宝贝: "安慰场合",
+          },
         },
-        C: { 邻居: "邻里场合" },
+        C: {
+          description: "住在隔壁的邻居。",
+          addresses: { 邻居: "邻里场合" },
+        },
       },
     });
     expect(JSON.stringify(savedBody)).not.toContain("system_prompt");

@@ -8,7 +8,6 @@ import {
 } from "vue";
 
 import {
-  bindSceneModel,
   confirmLayerDraft,
   createManualEvent,
   createScene,
@@ -61,7 +60,6 @@ const savedScene = ref<Scene | null>(null);
 const activeAgentId = ref<AgentId>("A");
 const newSceneName = ref("");
 const newSceneModel = ref("");
-const bindingModel = ref("");
 const modelOptions = ref<ModelOption[]>([]);
 const modelOptionsError = ref("");
 const newEventContent = ref<Record<AgentId, string>>({
@@ -136,39 +134,61 @@ const interactionTargets = computed(() =>
 );
 
 const interactionGroups = computed(() => {
+  const scene = currentScene.value;
   const interactions = activeAgent.value?.interactions ?? {};
-  return AGENT_IDS.flatMap((targetId) => {
-    const labels = interactions[targetId];
-    return labels && Object.keys(labels).length > 0
-      ? [{ targetId, labels: Object.entries(labels) }]
-      : [];
+  return interactionTargets.value.map((targetId) => {
+    const relationship = interactions[targetId];
+    return {
+      targetId,
+      targetName:
+        scene?.agents.find((agent) => agent.id === targetId)?.name ?? "",
+      description: relationship?.description ?? "",
+      labels: Object.entries(relationship?.addresses ?? {}),
+    };
   });
 });
 
 function interactionCount(agent: Agent): number {
   return Object.values(agent.interactions).reduce(
-    (count, labels) => count + Object.keys(labels ?? {}).length,
+    (count, relationship) =>
+      count + Object.keys(relationship?.addresses ?? {}).length,
     0,
   );
 }
 
-function agentReady(agent: Agent): boolean {
+function agentReadinessIssue(agent: Agent): string {
   const profile = agent.prompt_profile;
-  return (
-    [
+  if (
+    ![
       profile.pronoun,
       profile.hidden_beliefs,
       profile.inner_memories,
       profile.outer_memories,
-    ].every((value) => value.trim() !== "") &&
-    interactionCount(agent) > 0
+    ].every((value) => value.trim() !== "")
+  ) {
+    return "请填写四个提示词变量。";
+  }
+  if (interactionCount(agent) === 0) {
+    return "请至少配置一个互动称呼。";
+  }
+  const missingDescription = Object.values(agent.interactions).some(
+    (relationship) =>
+      Object.keys(relationship?.addresses ?? {}).length > 0 &&
+      relationship?.description.trim() === "",
   );
+  if (missingDescription) {
+    return "请补全所有已配置互动人物的简介。";
+  }
+  return "";
+}
+
+function agentReady(agent: Agent): boolean {
+  return agentReadinessIssue(agent) === "";
 }
 
 const sceneModelAvailable = computed(() => {
   const model = currentScene.value?.model;
   return (
-    model !== null &&
     model !== undefined &&
     modelOptions.value.some((option) => option.model === model)
   );
@@ -176,10 +196,7 @@ const sceneModelAvailable = computed(() => {
 
 const sceneModelStatus = computed(() => {
   const model = currentScene.value?.model;
-  if (model === null || model === undefined) {
-    return "此场景尚未绑定模型。绑定后不能更换。";
-  }
-  if (!sceneModelAvailable.value) {
+  if (model !== undefined && !sceneModelAvailable.value) {
     return `绑定模型 ${model} 当前不可用。`;
   }
   return "";
@@ -369,7 +386,6 @@ function installScene(
   saveMessage.value = "";
   actionError.value = "";
   upsertSummary(scene);
-  bindingModel.value = modelOptions.value[0]?.model ?? "";
 }
 
 function closeScene(): void {
@@ -385,7 +401,6 @@ function closeScene(): void {
   interactionError.value = "";
   saveMessage.value = "";
   actionError.value = "";
-  bindingModel.value = modelOptions.value[0]?.model ?? "";
 }
 
 function confirmDiscardChanges(): boolean {
@@ -420,7 +435,6 @@ async function refreshModelOptions(): Promise<void> {
     ) {
       newSceneModel.value = modelOptions.value[0]?.model ?? "";
     }
-    bindingModel.value = modelOptions.value[0]?.model ?? "";
   } catch (error) {
     modelOptions.value = [];
     modelOptionsError.value = errorMessage(
@@ -509,29 +523,6 @@ async function submitNewScene(): Promise<void> {
   }
 }
 
-async function bindCurrentSceneModel(): Promise<void> {
-  const scene = currentScene.value;
-  if (
-    scene === null ||
-    scene.model !== null ||
-    !bindingModel.value ||
-    isDirty.value ||
-    editorLocked.value
-  ) {
-    return;
-  }
-  busyAction.value = "bind-model";
-  actionError.value = "";
-  try {
-    const updated = await bindSceneModel(scene.id, bindingModel.value);
-    installScene(updated, { activeAgentId: activeAgentId.value });
-  } catch (error) {
-    actionError.value = errorMessage(error, "无法绑定模型。");
-  } finally {
-    busyAction.value = null;
-  }
-}
-
 function sceneUpdate(scene: Scene): SceneUpdate {
   return {
     name: scene.name,
@@ -549,11 +540,31 @@ function addressExists(address: string, except?: string): boolean {
   if (agent === undefined) {
     return false;
   }
-  return Object.values(agent.interactions).some((labels) =>
-    Object.keys(labels ?? {}).some(
+  return Object.values(agent.interactions).some((relationship) =>
+    Object.keys(relationship?.addresses ?? {}).some(
       (configured) => configured === address && configured !== except,
     ),
   );
+}
+
+function updateInteractionDescription(
+  targetId: AgentId,
+  event: Event,
+): void {
+  const agent = activeAgent.value;
+  if (agent === undefined) {
+    return;
+  }
+  const description = (event.target as HTMLTextAreaElement).value;
+  const relationship = agent.interactions[targetId];
+  if (relationship === undefined && description === "") {
+    return;
+  }
+  agent.interactions[targetId] = {
+    description,
+    addresses: relationship?.addresses ?? {},
+  };
+  interactionError.value = "";
 }
 
 function addInteraction(): void {
@@ -563,7 +574,7 @@ function addInteraction(): void {
   const targetId = newInteractionTarget.value;
   interactionError.value = "";
   if (agent === undefined || targetId === agent.id) {
-    interactionError.value = "请选择另一个 Agent。";
+    interactionError.value = "请选择另一位人物。";
     return;
   }
   if (!address || !occasion) {
@@ -574,8 +585,14 @@ function addInteraction(): void {
     interactionError.value = "同一发送方下的称呼不能重复。";
     return;
   }
-  const labels = agent.interactions[targetId] ?? {};
-  agent.interactions[targetId] = { ...labels, [address]: occasion };
+  const relationship = agent.interactions[targetId] ?? {
+    description: "",
+    addresses: {},
+  };
+  agent.interactions[targetId] = {
+    ...relationship,
+    addresses: { ...relationship.addresses, [address]: occasion },
+  };
   newInteractionAddress.value = "";
   newInteractionOccasion.value = "";
 }
@@ -599,18 +616,27 @@ function renameInteraction(
     interactionError.value = "同一发送方下的称呼不能重复。";
     return;
   }
-  const labels = agent?.interactions[targetId];
-  if (agent === undefined || labels === undefined || address === oldAddress) {
+  const relationship = agent?.interactions[targetId];
+  if (
+    agent === undefined ||
+    relationship === undefined ||
+    address === oldAddress
+  ) {
     input.value = oldAddress;
     return;
   }
   // Rebuild the object to keep the renamed entry in its page-defined order.
-  agent.interactions[targetId] = Object.fromEntries(
-    Object.entries(labels).map(([current, occasion]) => [
-      current === oldAddress ? address : current,
-      occasion,
-    ]),
-  );
+  agent.interactions[targetId] = {
+    ...relationship,
+    addresses: Object.fromEntries(
+      Object.entries(relationship.addresses).map(
+        ([current, occasion]) => [
+          current === oldAddress ? address : current,
+          occasion,
+        ],
+      ),
+    ),
+  };
 }
 
 function updateInteractionOccasion(
@@ -618,27 +644,37 @@ function updateInteractionOccasion(
   address: string,
   event: Event,
 ): void {
-  const labels = activeAgent.value?.interactions[targetId];
-  if (labels !== undefined) {
-    labels[address] = (event.target as HTMLInputElement).value;
+  const relationship = activeAgent.value?.interactions[targetId];
+  if (relationship !== undefined) {
+    relationship.addresses[address] = (
+      event.target as HTMLInputElement
+    ).value;
     interactionError.value = "";
   }
 }
 
 function removeInteraction(targetId: AgentId, address: string): void {
   const agent = activeAgent.value;
-  const labels = agent?.interactions[targetId];
-  if (agent === undefined || labels === undefined) {
+  const relationship = agent?.interactions[targetId];
+  if (agent === undefined || relationship === undefined) {
     return;
   }
   const remaining = Object.fromEntries(
-    Object.entries(labels).filter(([configured]) => configured !== address),
+    Object.entries(relationship.addresses).filter(
+      ([configured]) => configured !== address,
+    ),
   );
   const interactions: Interactions = { ...agent.interactions };
-  if (Object.keys(remaining).length === 0) {
+  if (
+    Object.keys(remaining).length === 0 &&
+    relationship.description === ""
+  ) {
     delete interactions[targetId];
   } else {
-    interactions[targetId] = remaining;
+    interactions[targetId] = {
+      ...relationship,
+      addresses: remaining,
+    };
   }
   agent.interactions = interactions;
   interactionError.value = "";
@@ -650,8 +686,8 @@ async function saveCurrentScene(): Promise<void> {
     return;
   }
   const hasBlankInteraction = scene.agents.some((agent) =>
-    Object.values(agent.interactions).some((labels) =>
-      Object.entries(labels ?? {}).some(
+    Object.values(agent.interactions).some((relationship) =>
+      Object.entries(relationship?.addresses ?? {}).some(
         ([address, occasion]) =>
           address.trim() === "" || occasion.trim() === "",
       ),
@@ -659,6 +695,15 @@ async function saveCurrentScene(): Promise<void> {
   );
   if (hasBlankInteraction) {
     saveMessage.value = "称呼和使用场合都不能为空。";
+    return;
+  }
+  const names = scene.agents.map((agent) => agent.name.trim());
+  if (names.some((name) => name === "")) {
+    saveMessage.value = "人物姓名不能为空。";
+    return;
+  }
+  if (new Set(names).size !== names.length) {
+    saveMessage.value = "三位人物的姓名不能重复。";
     return;
   }
   busyAction.value = "save";
@@ -1106,7 +1151,7 @@ onBeforeUnmount(() => {
             </label>
             <div class="scene-model">
               <span>场景模型</span>
-              <strong>{{ currentScene.model ?? "未绑定" }}</strong>
+              <strong>{{ currentScene.model }}</strong>
             </div>
             <div class="toolbar-actions">
               <span
@@ -1155,33 +1200,6 @@ onBeforeUnmount(() => {
               <strong>模型调用已停用</strong>
               <p>{{ sceneModelStatus }}</p>
             </div>
-            <form
-              v-if="currentScene.model === null"
-              @submit.prevent="bindCurrentSceneModel"
-            >
-              <select
-                v-model="bindingModel"
-                aria-label="绑定场景模型"
-                :disabled="editorLocked || modelOptions.length === 0"
-              >
-                <option
-                  v-for="option in modelOptions"
-                  :key="option.model"
-                  :value="option.model"
-                >
-                  {{ option.model }}
-                </option>
-              </select>
-              <button
-                type="submit"
-                class="secondary-button"
-                :disabled="editorLocked || isDirty || !bindingModel"
-              >
-                {{
-                  busyAction === "bind-model" ? "绑定中…" : "永久绑定"
-                }}
-              </button>
-            </form>
           </section>
 
           <nav class="agent-tabs" aria-label="选择 Agent">
@@ -1375,13 +1393,13 @@ onBeforeUnmount(() => {
                   {{ draftErrors[activeAgent.id] }}
                 </p>
                 <p v-else-if="!sceneModelAvailable" class="hint">
-                  场景模型未绑定或当前不可用，不能预览或生成新草稿；已有有效草稿仍可确认。
+                  场景模型当前不可用，不能预览或生成新草稿；已有有效草稿仍可确认。
                 </p>
                 <p v-else-if="isDirty" class="hint">
                   请先保存设定，再生成或确认。
                 </p>
                 <p v-else-if="!agentReady(activeAgent)" class="hint">
-                  请填写四个提示词变量，并至少配置一个互动称呼。
+                  {{ agentReadinessIssue(activeAgent) }}
                 </p>
                 <p
                   v-else-if="
@@ -1536,7 +1554,7 @@ onBeforeUnmount(() => {
                 </summary>
                 <div class="settings-body">
                   <label for="agent-name">
-                    <span>显示名</span>
+                    <span>人物姓名</span>
                     <input
                       id="agent-name"
                       v-model="activeAgent.name"
@@ -1596,7 +1614,18 @@ onBeforeUnmount(() => {
                       :key="group.targetId"
                       class="interaction-group"
                     >
-                      <strong>Agent {{ group.targetId }}</strong>
+                      <strong>{{ group.targetName }}</strong>
+                      <label class="interaction-description">
+                        <span>当前人物视角的简介</span>
+                        <textarea
+                          :value="group.description"
+                          rows="3"
+                          :aria-label="`${group.targetName}的人物简介`"
+                          placeholder="例如：你的儿子，最近工作不顺。"
+                          :disabled="editorLocked"
+                          @input="updateInteractionDescription(group.targetId, $event)"
+                        ></textarea>
+                      </label>
                       <div
                         v-for="([address, occasion], index) in group.labels"
                         :key="`${group.targetId}:${address}`"
@@ -1633,7 +1662,7 @@ onBeforeUnmount(() => {
 
                     <form class="interaction-add" @submit.prevent="addInteraction">
                       <label>
-                        <span>目标 Agent</span>
+                        <span>目标人物</span>
                         <select
                           v-model="newInteractionTarget"
                           :disabled="editorLocked"
@@ -1643,7 +1672,11 @@ onBeforeUnmount(() => {
                             :key="targetId"
                             :value="targetId"
                           >
-                            Agent {{ targetId }}
+                            {{
+                              currentScene.agents.find(
+                                (agent) => agent.id === targetId,
+                              )?.name
+                            }}
                           </option>
                         </select>
                       </label>

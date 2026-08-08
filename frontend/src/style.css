@@ -482,15 +482,6 @@ pre {
   font-size: 11px;
 }
 
-.model-status form {
-  display: flex;
-  gap: 8px;
-}
-
-.model-status select {
-  max-width: 360px;
-}
-
 .scene-toolbar label > span,
 .queue-card form > label,
 .settings-body label > span {
@@ -1190,6 +1181,7 @@ pre {
 }
 
 .interaction-row label > span,
+.interaction-description > span,
 .interaction-add label > span {
   display: block;
   margin-bottom: 4px;
@@ -1199,10 +1191,16 @@ pre {
 }
 
 .interaction-row input,
+.interaction-description textarea,
 .interaction-add input,
 .interaction-add select {
   min-height: 36px;
   font-size: 11px;
+}
+
+.interaction-description textarea {
+  width: 100%;
+  resize: vertical;
 }
 
 .interaction-row > button {

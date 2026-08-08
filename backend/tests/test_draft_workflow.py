@@ -77,7 +77,7 @@ def test_preview_exposes_neutral_context_without_backend_call() -> None:
     assert backend.conversations == []
     assert backend.generate_calls == []
     assert [(item.role, item.text) for item in preview.context] == [
-        ("system", build_system_prompt(scene.agents[0], "inner")),
+        ("system", build_system_prompt(scene, "A", "inner")),
         ("user", "外部事件：\na private event"),
     ]
     assert preview.layer == "inner"
@@ -271,7 +271,12 @@ def test_interaction_change_invalidates_later_inner_draft() -> None:
                     "name": agent.name,
                     "prompt_profile": agent.prompt_profile.model_dump(),
                     "interactions": (
-                        {"B": {"儿子": "一般场合"}}
+                        {
+                            "B": {
+                                "description": "你的儿子。",
+                                "addresses": {"儿子": "一般场合"},
+                            }
+                        }
                         if agent.id == "A"
                         else agent.interactions
                     ),
@@ -290,6 +295,51 @@ def test_interaction_change_invalidates_later_inner_draft() -> None:
             "inner",
             confirmation(draft),
         )
+
+
+def test_target_name_and_relationship_description_expire_outer_draft() -> None:
+    """Outer state follows target names and sender relationship views."""
+    scene = add_manual_event(prompted_scene("Outer stale", MODEL), "A", "event")
+    inner = _generate(
+        DraftWorkflow(FakeBackend(["inner"], model=MODEL)),
+        scene,
+        "A",
+        "inner",
+    )
+    scene = confirm_draft(scene, "A", "inner", confirmation(inner))
+    outer = _generate(
+        DraftWorkflow(FakeBackend(["对B说：outer"], model=MODEL)),
+        scene,
+        "A",
+        "outer",
+    )
+
+    renamed_target = scene.agents[1].model_copy(update={"name": "新名字"})
+    renamed = scene.model_copy(
+        update={"agents": [scene.agents[0], renamed_target, scene.agents[2]]}
+    )
+    assert draft_state_token(renamed, "A", "outer") != outer.state_token
+    with pytest.raises(SceneConflictError, match="changed"):
+        confirm_draft(renamed, "A", "outer", confirmation(outer))
+
+    relationship = scene.agents[0].interactions["B"]
+    changed_sender = scene.agents[0].model_copy(
+        update={
+            "interactions": {
+                **scene.agents[0].interactions,
+                "B": relationship.model_copy(
+                    update={"description": "改变后的关系简介。"}
+                ),
+            }
+        }
+    )
+    changed_description = scene.model_copy(
+        update={"agents": [changed_sender, *scene.agents[1:]]}
+    )
+    assert (
+        draft_state_token(changed_description, "A", "outer")
+        != outer.state_token
+    )
 
 
 def test_generation_errors_are_sanitized_and_never_retried() -> None:

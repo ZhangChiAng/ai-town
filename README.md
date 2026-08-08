@@ -143,7 +143,7 @@ Uvicorn 自己的启动、reload 和关闭提示只写终端，重复 access log
 key，以及 Authorization、API-key、token 和 cookie 类字段都会替换为
 `[REDACTED]`。除此之外，错误日志可能包含完整 prompt、事件、模型正文、原始
 签名、加密 reasoning 或 redacted provider details。它们仍不会进入浏览器响应、
-reasoning 投影、确认数据、scene v9 或后续模型上下文。
+reasoning 投影、确认数据、scene 或后续模型上下文。
 
 `logs/` 已整体被 Git 忽略。活动文件加 5 份备份通常约为 60 MiB；为保证单条
 诊断不被截断，超大记录可能使占用暂时超过该值。服务器终端和 `logs/` 都应按
@@ -153,7 +153,8 @@ reasoning 投影、确认数据、scene v9 或后续模型上下文。
 
 1. 选择模型并创建场景，再展开“Agent 提示词变量与互动角色”。
 2. 为需要推进的 Agent 编辑姓名、代词、不可说出口的信念、内层记忆与外层
-   记忆，并给其他 Agent 添加“称呼/使用场合”，保存设定。B/C 可以保持空配置。
+   记忆，并按其他人物的当前姓名填写人物简介和“称呼/使用场合”，保存设定。
+   B/C 可以保持空配置。
 3. 选择一个 Agent，在“待处理外部事件”中添加手工事件。
 4. 点击“生成内层草稿”。可以编辑、重新生成或放弃；确认内层后，队首事件
    被消费并保存半回合。
@@ -173,11 +174,16 @@ token usage 只存在浏览器，刷新即丢失。可见 reasoning 在确认时
 由 Agent 外层消息生成的事件不可直接修改或删除。手工事件逐字保存且不解析，
 可直接输入 `儿子对你说：正文` 模拟回复。没有事件不能启动内层。
 
-四个提示词变量与空互动字典都允许保存。某 Agent 只有在四个变量均非空、且
-至少有一个互动称呼时，才能预览、生成或确认；因此当前实验可以只配置并推进
-A，让 B/C 仅作为手工模拟的路由目标。互动目标按 A/B/C 固定顺序进入外层
-system prompt，同一目标下的称呼保持页面录入顺序。完整固定模板逐字定义见
-`PROJECT_CONTEXT.md` 第 8 节，前端不保存或复制模板。
+四个提示词变量、空人物简介与空互动字典都允许保存。某 Agent 只有在四个变量
+均非空、至少有一个互动称呼，且每个拥有称呼的目标人物都有非空简介时，才能
+预览、生成或确认；因此当前实验可以只配置并推进 A，让 B/C 仅作为手工模拟的
+路由目标。互动目标按内部 A/B/C 固定顺序进入外层 system prompt，同一目标下
+的称呼保持页面录入顺序，但模型看到的人物标识只有当前姓名，不含内部 ID。
+三位人物去除首尾空白后的姓名必须互不相同，比较保持大小写敏感。
+
+完整固定模板逐字定义见 `PROJECT_CONTEXT.md` 第 8 节。模板是后端 `.j2` 文件，
+使用严格变量、关闭 HTML 转义且只渲染一次；用户文本中的 `{{ ... }}` 保持原样，
+前端不保存或复制模板。
 
 ## 模型实际看到的内容
 
@@ -212,10 +218,30 @@ turn 是规范化语义输出或 `STOP`；接收方 Agent 事件只保存纯正�
 {本轮已确认内层输出}
 ```
 
+外层 system prompt 的“当下可互动角色”按人物分组，例如：
+
+```text
+【当下可互动角色】
+以下每组信息分别说明一位可互动人物的姓名、你对其的简单认识，以及你可以使用的全部称呼和对应场合。
+
+人物姓名：李国栋
+人物简介：
+你的儿子，最近工作不顺。
+
+可用称呼及对应场合：
+- 称呼：儿子
+  使用场合：一般场合
+- 称呼：国栋
+  使用场合：对他感到生气时
+```
+
+外层被明确要求从这些称呼中选择符合当前场合的一项，再输出
+`对{称呼}说：{正文}`；语义路由仍由称呼反查目标内部 ID。
+
 每层请求只包含后端为当前 Agent 当前层动态组装的 system prompt、该层全部已确认
 input/output turns，以及上面的本轮输入。另一层 system prompt、另一层完整
-历史、上述接收者 ID 与当前姓名以外的其他 Agent 状态、回退元数据和未确认
-草稿都不会进入请求。
+历史、内部 Agent ID、可互动人物姓名与当前 Agent 关系视角之外的其他 Agent
+状态、回退元数据和未确认草稿都不会进入请求。
 
 “模型请求预览”可明确选择内层或外层，并只展示协议无关的完整上下文。有序
 `context` 固定为 system、完整历史的 user/assistant 交替项和 current user；
@@ -231,9 +257,10 @@ input/output turns，以及上面的本轮输入。另一层 system prompt、另
 生成响应带有事件 ID、调用 ID 和协议无关状态令牌。令牌哈希场景模型、Agent、
 人格层、完整事件、动态 system prompt、当前层全部历史、本轮 input，以及完整
 提示词变量和有序互动字典，不哈希 adapter payload。因此任一变量或互动配置、
-事件、同层历史、模型或阶段变化会使确认返回 `409`；单独改变目标 Agent 的显示
-名不会改写已经保存的称呼。供应商请求字段、缓存元数据或 adapter 实现变化不会
-单独使草稿失效。用户编辑后的非法外层输出返回 `422`，界面在失败时保留草稿。
+事件、同层历史、模型或阶段变化会使确认返回 `409`；目标人物改名还会改变引用
+该人物的当前外层 system prompt，使相关外层草稿失效。改名不会改写已保存的
+称呼或语义历史。供应商请求字段、缓存元数据或 adapter 实现变化不会单独使草稿
+失效。用户编辑后的非法外层输出返回 `422`，界面在失败时保留草稿。
 
 场景有一个只含调用引用的全局回退栈：
 
@@ -243,10 +270,10 @@ input/output turns，以及上面的本轮输入。另一层 system prompt、另
 
 只能回退全场景最近一次已确认模型调用。一次操作只回退一层，不会连锁执行。
 
-显式未绑定或绑定模型不在当前进程配置中的场景仍可查看、编辑、管理事件和
-回退，但不能新建预览或生成，相关请求返回 `409`。确认既不访问模型注册表也不
-调用模型；模型从配置移除后，已有且业务状态仍有效的浏览器草稿仍可确认。
-未绑定场景可通过界面或 `PUT /api/scenes/{scene_id}/model` 永久绑定一次。
+绑定模型不在当前进程配置中的场景仍可查看、编辑、管理事件和回退，但不能新建
+预览或生成，相关请求返回 `409`。确认既不访问模型注册表也不调用模型；模型从
+配置移除后，已有且业务状态仍有效的浏览器草稿仍可确认。场景始终保存不可变的
+非空模型绑定，不存在未绑定或后续绑定流程。
 
 ## Pydantic AI Direct 与独立 prompt cache
 
@@ -277,27 +304,38 @@ previous response ID 或 Anthropic 缓存元数据；厂商 API 天然无状态�
 协议只需实现 adapter、注册 factory 并通过共享 contract
 tests，不需要修改业务 workflow、API 路由或前端。
 
-## Scene schema v9
+## Scene contract versions
 
 每个场景保存为 `data/scenes/<scene-id>.json`，采用同目录临时文件与原子
-替换。当前 schema 为 v9；v1–v8 文件一律拒绝，不迁移、不兼容，也不改写。
-旧场景需要重新创建并录入变量与互动关系。
+替换。当前 schema 为 `ai-town.scene/1.0`，格式严格为
+`ai-town.scene/{major}.{minor}`。主版本对应持久化结构的不兼容变化；当前程序
+接受所有合法 `ai-town.scene/1.x`，其他主版本因版本不兼容而拒绝。次版本可对应
+提示词模板等非持久化行为变化；同一主版本之间不迁移、不补全，只严格校验当前
+完整结构。缺字段、多字段或非法值都视为损坏且不改写文件。已有 `1.x` 场景读取
+并保存后仍保留原次版本，不会自动升降。
+
+实现者不得推断、自动递增或自行修改版本。任何相关变更开始前都必须询问用户，
+并使用用户明确指定的目标版本；新场景使用代码中已确认的当前版本 `1.0`。包
+版本、模型名称和依赖版本不属于这一 scene contract 版本体系。
 
 Agent 只包含：
 
-- `id`、`name`
+- `id`、`name`（姓名去除首尾空白后在场景内唯一，大小写敏感）
 - `prompt_profile`：`pronoun`、`hidden_beliefs`、`inner_memories`、
   `outer_memories`
-- `interactions`：其他 Agent ID 到有序“称呼 → 使用场合”字典的映射
+- `interactions`：其他 Agent ID 到
+  `{description: string, addresses: {称呼: 使用场合}}` 的映射；简介可为空，
+  称呼保持录入顺序
 - `inner_context.turns` 与 `outer_context.turns`（不含 `system_prompt`）
 - `pending_events`
 
 turn 保存调用 ID、事件 ID、显示顺序、实际 input 和确认 output，以及确认时
 落盘的 `reasoning` 可见推理列表（可为空数组，模型不返回思考时为空）。内层
 还保存被消费事件；外层语义发言保存接收者和生成事件 ID，`STOP` 的两项均为
-`null`。场景额外保存不可变
-`model: string | null`、全局 `rollback_stack` 与单调递增 `next_sequence`。
-`null` 只允许一次性绑定；回退栈和显示顺序不进入模型请求。
+`null`。场景额外保存不可变且非空的 `model: string`、全局 `rollback_stack` 与
+单调递增 `next_sequence`。所有契约字段必须显式存在；空 `reasoning`、turns、
+队列和回退栈以 `[]` 保存，规定为空的路由字段以 `null` 保存。回退栈和显示顺序
+不进入模型请求。
 
 `data/` 是被 Git 忽略的运行时目录。删除后应用会在首次写入时重建
 `data/scenes/`。
@@ -310,7 +348,6 @@ turn 保存调用 ID、事件 ID、显示顺序、实际 input 和确认 output�
 - `POST /api/scenes`（`{name, model}`）
 - `GET /api/scenes/{scene_id}`
 - `PUT /api/scenes/{scene_id}`
-- `PUT /api/scenes/{scene_id}/model`
 - `POST /api/scenes/{scene_id}/agents/{agent_id}/events`
 - `PUT /api/scenes/{scene_id}/agents/{agent_id}/events/{event_id}`
 - `DELETE /api/scenes/{scene_id}/agents/{agent_id}/events/{event_id}`
