@@ -338,12 +338,20 @@ def create_app(
                 {
                     "agent_id": agent.id,
                     **text_metadata("name", agent.name),
+                    **text_metadata("pronoun", agent.prompt_profile.pronoun),
                     **text_metadata(
-                        "inner_prompt", agent.inner_context.system_prompt
+                        "hidden_beliefs",
+                        agent.prompt_profile.hidden_beliefs,
                     ),
                     **text_metadata(
-                        "outer_prompt", agent.outer_context.system_prompt
+                        "inner_memories",
+                        agent.prompt_profile.inner_memories,
                     ),
+                    **text_metadata(
+                        "outer_memories",
+                        agent.prompt_profile.outer_memories,
+                    ),
+                    "interactions": agent.interactions,
                 }
                 for agent in scene.agents
             ],
@@ -571,7 +579,7 @@ def create_app(
             LOGGER,
             logging.INFO,
             "draft.outer_confirmed",
-            "Outer draft confirmed and routed.",
+            "Outer draft confirmed.",
             scene_id=scene.id,
             agent_id=agent_id,
             layer="outer",

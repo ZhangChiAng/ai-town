@@ -1,7 +1,6 @@
 """Domain models and state transitions for two-layer AI Town scenes."""
 
 import re
-from copy import deepcopy
 from typing import Any, Literal, Self
 from uuid import UUID, uuid4
 
@@ -13,10 +12,8 @@ from pydantic import (
     model_validator,
 )
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 AGENT_IDS = ("A", "B", "C")
-LEGACY_SCHEMA_VERSION = 6
-PREVIOUS_SCHEMA_VERSION = 7
 
 AgentId = Literal["A", "B", "C"]
 Layer = Literal["inner", "outer"]
@@ -29,12 +26,11 @@ class ApiModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _strip_non_blank(value: str) -> str:
-    """Strip surrounding whitespace and require non-empty text."""
-    stripped = value.strip()
-    if not stripped:
+def _require_non_blank(value: str) -> str:
+    """Require non-empty text while preserving user-authored whitespace."""
+    if not value.strip():
         raise ValueError("text must not be blank")
-    return stripped
+    return value
 
 
 def _strip_non_blank_name(value: str) -> str:
@@ -53,30 +49,48 @@ def _strip_non_blank_model(value: str) -> str:
     return stripped
 
 
-_ADDRESSED_MESSAGE_PREFIX = re.compile(r"\ATo\s+([A-C])\s*[:：]\s*")
+_SEMANTIC_MESSAGE_PREFIX = re.compile(r"\A对\s*(.+?)\s*说\s*[:：]\s*")
 
 
-def parse_addressed_message(
+def parse_semantic_message(
     content: str,
-    sender_id: AgentId,
-) -> tuple[AgentId, str]:
-    """Parse one visible ``To <AgentId>: <body>`` message.
+    interactions: dict[AgentId, dict[str, str]],
+) -> tuple[AgentId, str, str]:
+    """Parse one configured ``对{称呼}说：{正文}`` message.
 
-    The body may span multiple lines; only the leading address line is
-    required. The body is returned without surrounding whitespace.
+    Surrounding whitespace and either colon form are accepted for semantic
+    speech, then the configured address and body are returned canonically.
+    ``STOP`` is intentionally handled separately because it has no route.
     """
-    match = _ADDRESSED_MESSAGE_PREFIX.match(content)
+    match = _SEMANTIC_MESSAGE_PREFIX.match(content.strip())
     if match is None:
         raise ValueError(
-            "content must start with an address in the form 'To B: body'"
+            "content must be '对{已配置称呼}说：{非空正文}' or exact 'STOP'"
         )
-    recipient_id = match.group(1)
-    if recipient_id == sender_id:
-        raise ValueError("message recipient must differ from sender")
-    body = content[match.end() :].strip()
+    address = match.group(1).strip()
+    recipients = [
+        target_id
+        for target_id, labels in interactions.items()
+        if address in labels
+    ]
+    if len(recipients) != 1:
+        raise ValueError("message address is not uniquely configured")
+    body = content.strip()[match.end() :].strip()
     if not body:
         raise ValueError("message body must not be blank")
-    return recipient_id, body
+    return recipients[0], address, body
+
+
+def parse_canonical_semantic_message(content: str) -> tuple[str, str]:
+    """Parse canonical saved semantic speech without current configuration."""
+    match = _SEMANTIC_MESSAGE_PREFIX.match(content)
+    if match is None:
+        raise ValueError("outer output must be canonical semantic speech")
+    address = match.group(1).strip()
+    body = content[match.end() :].strip()
+    if not address or not body or content != f"对{address}说：{body}":
+        raise ValueError("outer output must be canonical semantic speech")
+    return address, body
 
 
 class TokenUsage(ApiModel):
@@ -113,7 +127,7 @@ class ExternalEvent(ApiModel):
     source_agent_id: AgentId | None = None
     source_call_id: UUID | None = None
 
-    _validate_content = field_validator("content")(_strip_non_blank)
+    _validate_content = field_validator("content")(_require_non_blank)
 
     @model_validator(mode="after")
     def validate_source(self) -> Self:
@@ -144,8 +158,8 @@ class InnerTurn(ApiModel):
     consumed_events: list[ExternalEvent]
     reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
 
-    _validate_input = field_validator("input")(_strip_non_blank)
-    _validate_output = field_validator("output")(_strip_non_blank)
+    _validate_input = field_validator("input")(_require_non_blank)
+    _validate_output = field_validator("output")(_require_non_blank)
 
     @model_validator(mode="after")
     def validate_event_references(self) -> Self:
@@ -167,11 +181,10 @@ class InnerTurn(ApiModel):
 
 
 class OuterTurn(ApiModel):
-    """One confirmed outer-layer model call and its routed event reference.
+    """One confirmed outer-layer call and its optional routed event.
 
     ``event_ids`` mirrors the event batch consumed by the matching inner
-    turn. ``generated_event_id`` is the routed message that this outer turn
-    produces for its recipient's queue.
+    turn. Semantic speech has both routing fields; ``STOP`` has neither.
     """
 
     call_id: UUID
@@ -179,26 +192,48 @@ class OuterTurn(ApiModel):
     sequence: int = Field(ge=1)
     input: str
     output: str
-    recipient_id: AgentId
-    generated_event_id: UUID
+    recipient_id: AgentId | None
+    generated_event_id: UUID | None
     reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
 
-    _validate_input = field_validator("input")(_strip_non_blank)
-    _validate_output = field_validator("output")(_strip_non_blank)
+    _validate_input = field_validator("input")(_require_non_blank)
+    _validate_output = field_validator("output")(_require_non_blank)
+
+    @model_validator(mode="after")
+    def validate_route(self) -> Self:
+        """Keep STOP and routed speech metadata mutually consistent."""
+        if self.output == "STOP":
+            if (
+                self.recipient_id is not None
+                or self.generated_event_id is not None
+            ):
+                raise ValueError("STOP turns must not have routing metadata")
+            return self
+        if self.recipient_id is None or self.generated_event_id is None:
+            raise ValueError("semantic speech requires routing metadata")
+        parse_canonical_semantic_message(self.output)
+        return self
 
 
 class InnerContext(ApiModel):
-    """Independent system prompt and complete confirmed inner history."""
+    """Complete confirmed inner history without a persisted prompt."""
 
-    system_prompt: str
     turns: list[InnerTurn] = Field(default_factory=list)
 
 
 class OuterContext(ApiModel):
-    """Independent system prompt and complete confirmed outer history."""
+    """Complete confirmed outer history without a persisted prompt."""
 
-    system_prompt: str
     turns: list[OuterTurn] = Field(default_factory=list)
+
+
+class PromptProfile(ApiModel):
+    """User-authored variables inserted into backend prompt templates."""
+
+    pronoun: str
+    hidden_beliefs: str
+    inner_memories: str
+    outer_memories: str
 
 
 class Agent(ApiModel):
@@ -206,15 +241,60 @@ class Agent(ApiModel):
 
     id: AgentId
     name: str
+    prompt_profile: PromptProfile
+    interactions: dict[AgentId, dict[str, str]]
     inner_context: InnerContext
     outer_context: OuterContext
     pending_events: list[ExternalEvent] = Field(default_factory=list)
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
 
+    @field_validator("interactions", mode="before")
+    @classmethod
+    def normalize_interactions(cls, value: Any) -> Any:
+        """Trim non-empty labels and occasions without losing entry order."""
+        if not isinstance(value, dict):
+            return value
+        normalized: dict[Any, Any] = {}
+        for target_id, raw_labels in value.items():
+            if not isinstance(raw_labels, dict):
+                normalized[target_id] = raw_labels
+                continue
+            labels: dict[str, Any] = {}
+            for raw_address, raw_occasion in raw_labels.items():
+                address = (
+                    raw_address.strip()
+                    if isinstance(raw_address, str)
+                    else raw_address
+                )
+                occasion = (
+                    raw_occasion.strip()
+                    if isinstance(raw_occasion, str)
+                    else raw_occasion
+                )
+                if not address or not occasion:
+                    raise ValueError(
+                        "interaction addresses and occasions must not be blank"
+                    )
+                if address in labels:
+                    raise ValueError("interaction addresses must be unique")
+                labels[address] = occasion
+            normalized[target_id] = labels
+        return normalized
+
     @model_validator(mode="after")
     def validate_round_alignment(self) -> Self:
         """Allow only complete rounds or one confirmed inner half-round."""
+        if self.id in self.interactions:
+            raise ValueError("an Agent cannot interact with itself")
+        seen_addresses: set[str] = set()
+        for labels in self.interactions.values():
+            for address in labels:
+                if address in seen_addresses:
+                    raise ValueError(
+                        "interaction addresses must be unique per sender"
+                    )
+                seen_addresses.add(address)
         inner_count = len(self.inner_context.turns)
         outer_count = len(self.outer_context.turns)
         if inner_count not in (outer_count, outer_count + 1):
@@ -247,15 +327,9 @@ class ConfirmedCallReference(ApiModel):
 
 
 class Scene(ApiModel):
-    """A schema-v8 scene containing exactly three two-layer Agents.
+    """A schema-v9 scene containing exactly three two-layer Agents."""
 
-    Schema v6 raw files are migrated to v7 by ``migrate_v6_to_v7`` and schema
-    v7 files are migrated to v8 by ``migrate_v7_to_v8`` in the storage layer
-    before being validated as a ``Scene``. Earlier schemas (v1-v5) are
-    rejected without migration.
-    """
-
-    schema_version: Literal[8] = SCHEMA_VERSION
+    schema_version: Literal[9] = SCHEMA_VERSION
     id: UUID
     name: str
     model: str | None
@@ -312,15 +386,20 @@ class Scene(ApiModel):
                         consumed.sequence,
                     )
             for turn in agent.outer_context.turns:
-                recipient_id, body = parse_addressed_message(
-                    turn.output,
-                    agent.id,
-                )
-                if (
-                    recipient_id != turn.recipient_id
-                    or turn.output != f"To {recipient_id}: {body}"
-                ):
-                    raise ValueError("outer output must be canonical")
+                if turn.output == "STOP":
+                    if (
+                        turn.recipient_id is not None
+                        or turn.generated_event_id is not None
+                    ):
+                        raise ValueError("STOP turn routing must be empty")
+                else:
+                    _address, _body = parse_canonical_semantic_message(
+                        turn.output
+                    )
+                    if turn.recipient_id == agent.id:
+                        raise ValueError(
+                            "outer message recipient must differ from sender"
+                        )
                 reference = ConfirmedCallReference(
                     call_id=turn.call_id,
                     agent_id=agent.id,
@@ -333,7 +412,8 @@ class Scene(ApiModel):
                     turn.sequence,
                     reference,
                 )
-                generated_events.append((agent.id, turn))
+                if turn.generated_event_id is not None:
+                    generated_events.append((agent.id, turn))
                 if not turn.event_ids:
                     raise ValueError("outer turn must reference inner events")
                 max_sequence = max(max_sequence, turn.sequence)
@@ -345,18 +425,20 @@ class Scene(ApiModel):
             )
 
         for sender_id, turn in generated_events:
+            assert turn.generated_event_id is not None
+            assert turn.recipient_id is not None
             event_location = events.get(turn.generated_event_id)
             if event_location is None:
                 raise ValueError("routed event is missing")
             recipient_id, event = event_location
-            _recipient, body = parse_addressed_message(turn.output, sender_id)
+            _address, body = parse_canonical_semantic_message(turn.output)
             if (
                 recipient_id != turn.recipient_id
                 or event.kind != "agent_message"
                 or event.source_agent_id != sender_id
                 or event.source_call_id != turn.call_id
                 or event.sequence != turn.sequence
-                or event.content != f"From {sender_id}: {body}"
+                or event.content != body
             ):
                 raise ValueError("routed event does not match its outer turn")
 
@@ -432,21 +514,28 @@ class ModelOptionsResponse(ApiModel):
     options: list[ModelOption]
 
 
-class ContextUpdate(ApiModel):
-    """Writable portion of one independent persona context."""
-
-    system_prompt: str
-
-
 class AgentUpdate(ApiModel):
-    """Writable Agent identity and complete inner/outer prompt texts."""
+    """Writable Agent identity, prompt variables, and interactions."""
 
     id: AgentId
     name: str
-    inner_context: ContextUpdate
-    outer_context: ContextUpdate
+    prompt_profile: PromptProfile
+    interactions: dict[AgentId, dict[str, str]]
 
     _validate_name = field_validator("name")(_strip_non_blank_name)
+
+    @model_validator(mode="after")
+    def validate_interactions(self) -> Self:
+        """Reuse Agent validation for self-target and address uniqueness."""
+        Agent(
+            id=self.id,
+            name=self.name,
+            prompt_profile=self.prompt_profile,
+            interactions=self.interactions,
+            inner_context=InnerContext(),
+            outer_context=OuterContext(),
+        )
+        return self
 
 
 class UpdateSceneRequest(ApiModel):
@@ -470,7 +559,7 @@ class EventContentRequest(ApiModel):
 
     content: str
 
-    _validate_content = field_validator("content")(_strip_non_blank)
+    _validate_content = field_validator("content")(_require_non_blank)
 
 
 class LayerDraftResponse(ApiModel):
@@ -485,7 +574,7 @@ class LayerDraftResponse(ApiModel):
     request_snapshot: dict[str, Any]
     state_token: str = Field(min_length=64, max_length=64)
 
-    _validate_content = field_validator("content")(_strip_non_blank)
+    _validate_content = field_validator("content")(_require_non_blank)
 
 
 class ConfirmLayerRequest(ApiModel):
@@ -501,7 +590,7 @@ class ConfirmLayerRequest(ApiModel):
     state_token: str = Field(min_length=64, max_length=64)
     reasoning: list[ModelReasoningBlock] = Field(default_factory=list)
 
-    _validate_content = field_validator("content")(_strip_non_blank)
+    _validate_content = field_validator("content")(_require_non_blank)
 
 
 class ModelRequestContextItem(ApiModel):
@@ -535,76 +624,8 @@ class SceneModelBindingConflictError(RuntimeError):
     """Raised when replacing an existing scene model binding."""
 
 
-def _wrap_v6_inner_turn(raw: dict[str, Any]) -> dict[str, Any]:
-    """Convert one legacy single-event inner turn to the v7 batch form."""
-    if "consumed_events" in raw:
-        return raw
-    consumed = raw.pop("consumed_event", None)
-    event_id = raw.pop("event_id", None)
-    if consumed is None or event_id is None:
-        raise ValueError("legacy inner turn must have consumed_event")
-    raw["event_ids"] = [event_id]
-    raw["consumed_events"] = [consumed]
-    return raw
-
-
-def _wrap_v6_outer_turn(raw: dict[str, Any]) -> dict[str, Any]:
-    """Convert one legacy single-event outer turn to the v7 batch form."""
-    if "event_ids" in raw:
-        return raw
-    event_id = raw.pop("event_id", None)
-    if event_id is None:
-        raise ValueError("legacy outer turn must have event_id")
-    raw["event_ids"] = [event_id]
-    return raw
-
-
-def migrate_v6_to_v7(raw: dict[str, Any]) -> dict[str, Any]:
-    """Migrate one parsed schema-v6 raw scene to the schema-v7 batch form.
-
-    The migration is shallow and structural: it wraps each inner turn's
-    legacy ``consumed_event`` and ``event_id`` into single-element lists
-    and each outer turn's ``event_id`` into ``event_ids``. It does not
-    re-validate the scene; the caller (storage) runs ``Scene`` validation
-    on the migrated value. ``schema_version`` is set to 7 so the v7→v8
-    reasoning migration can run next.
-    """
-    migrated = deepcopy(raw)
-    for agent in migrated.get("agents", []):
-        inner_context = agent.get("inner_context", {})
-        for turn in inner_context.get("turns", []):
-            _wrap_v6_inner_turn(turn)
-        outer_context = agent.get("outer_context", {})
-        for turn in outer_context.get("turns", []):
-            _wrap_v6_outer_turn(turn)
-    migrated["schema_version"] = PREVIOUS_SCHEMA_VERSION
-    return migrated
-
-
-def migrate_v7_to_v8(raw: dict[str, Any]) -> dict[str, Any]:
-    """Migrate one parsed schema-v7 raw scene to the schema-v8 reasoning form.
-
-    The migration is structural and additive: every confirmed inner/outer
-    turn gets a default empty ``reasoning`` list when the field is missing
-    (a provider that returned no thinking persists an empty list, never a
-    stale value). Existing reasoning values are preserved. It does not
-    re-validate the scene; the caller (storage) runs ``Scene`` validation
-    on the migrated value. ``schema_version`` is set to 8.
-    """
-    migrated = deepcopy(raw)
-    for agent in migrated.get("agents", []):
-        for context in (
-            agent.get("inner_context", {}),
-            agent.get("outer_context", {}),
-        ):
-            for turn in context.get("turns", []):
-                turn.setdefault("reasoning", [])
-    migrated["schema_version"] = SCHEMA_VERSION
-    return migrated
-
-
 def create_scene(name: str, model: str) -> Scene:
-    """Create an empty schema-v8 scene bound to one configured model."""
+    """Create an empty schema-v9 scene bound to one configured model."""
     return Scene(
         id=uuid4(),
         name=name,
@@ -613,8 +634,15 @@ def create_scene(name: str, model: str) -> Scene:
             Agent(
                 id=agent_id,
                 name=agent_id,
-                inner_context=InnerContext(system_prompt=""),
-                outer_context=OuterContext(system_prompt=""),
+                prompt_profile=PromptProfile(
+                    pronoun="",
+                    hidden_beliefs="",
+                    inner_memories="",
+                    outer_memories="",
+                ),
+                interactions={},
+                inner_context=InnerContext(),
+                outer_context=OuterContext(),
             )
             for agent_id in AGENT_IDS
         ],
@@ -631,17 +659,17 @@ def bind_scene_model(scene: Scene, model: str) -> Scene:
 
 
 def update_scene(scene: Scene, update: UpdateSceneRequest) -> Scene:
-    """Apply editable fields while preserving every event and confirmed turn."""
+    """Apply prompt variables and interactions while preserving history."""
     agents = [
         Agent(
             id=updated.id,
             name=updated.name,
+            prompt_profile=updated.prompt_profile,
+            interactions=updated.interactions,
             inner_context=InnerContext(
-                system_prompt=updated.inner_context.system_prompt,
                 turns=current.inner_context.turns,
             ),
             outer_context=OuterContext(
-                system_prompt=updated.outer_context.system_prompt,
                 turns=current.outer_context.turns,
             ),
             pending_events=current.pending_events,
@@ -754,9 +782,9 @@ def build_inner_input(
     """Build the exact next inner user text from the current pending batch.
 
     Every event currently in the queue is consumed in this round. Events are
-    presented in FIFO order under a single ``外部事件：`` block, separated
-    by blank lines. The optional prior outer-speech preamble is retained
-    verbatim and remains above the event block.
+    presented in FIFO order under a single ``外部事件：`` block. The optional
+    prior outer result is expressed with its saved semantic address, or as
+    an explicit no-speech sentence for ``STOP``.
     """
     agent = get_agent(scene, agent_id)
     if len(agent.inner_context.turns) != len(agent.outer_context.turns):
@@ -769,17 +797,13 @@ def build_inner_input(
     sections: list[str] = []
     if agent.outer_context.turns:
         previous_outer = agent.outer_context.turns[-1]
-        recipient = get_agent(scene, previous_outer.recipient_id)
-        _parsed_recipient_id, body = parse_addressed_message(
-            previous_outer.output,
-            agent_id,
-        )
-        # Present the prior speech as routed dialogue, without its protocol tag.
-        sections.append(
-            "外层人格上一轮对 "
-            f"Agent {previous_outer.recipient_id}（{recipient.name}）说：\n"
-            f"{body}"
-        )
+        if previous_outer.output == "STOP":
+            sections.append("上一轮：你没有说话。")
+        else:
+            address, body = parse_canonical_semantic_message(
+                previous_outer.output
+            )
+            sections.append(f"上一轮：\n你对{address}说：\n{body}")
     sections.append("外部事件：\n" + _join_event_contents(events))
     return event_ids, "\n\n".join(sections)
 
@@ -858,25 +882,31 @@ def confirm_outer_turn(
     confirmation: ConfirmLayerRequest,
     actual_input: str,
 ) -> Scene:
-    """Append one outer turn and atomically route its generated event."""
+    """Append speech or STOP and route only semantic speech atomically."""
     event_ids, expected_input = build_outer_input(scene, agent_id)
     if confirmation.event_ids != event_ids or actual_input != expected_input:
         raise SceneConflictError("The outer draft is stale.")
     _require_new_call_id(scene, confirmation.call_id)
 
-    recipient_id, body = parse_addressed_message(
-        confirmation.content,
-        agent_id,
-    )
-    canonical_output = f"To {recipient_id}: {body}"
-    generated_event = ExternalEvent(
-        id=uuid4(),
-        sequence=scene.next_sequence,
-        kind="agent_message",
-        content=f"From {agent_id}: {body}",
-        source_agent_id=agent_id,
-        source_call_id=confirmation.call_id,
-    )
+    agent = get_agent(scene, agent_id)
+    recipient_id: AgentId | None = None
+    generated_event: ExternalEvent | None = None
+    if confirmation.content == "STOP":
+        canonical_output = "STOP"
+    else:
+        recipient_id, address, body = parse_semantic_message(
+            confirmation.content,
+            agent.interactions,
+        )
+        canonical_output = f"对{address}说：{body}"
+        generated_event = ExternalEvent(
+            id=uuid4(),
+            sequence=scene.next_sequence,
+            kind="agent_message",
+            content=body,
+            source_agent_id=agent_id,
+            source_call_id=confirmation.call_id,
+        )
     turn = OuterTurn(
         call_id=confirmation.call_id,
         event_ids=event_ids,
@@ -884,7 +914,9 @@ def confirm_outer_turn(
         input=actual_input,
         output=canonical_output,
         recipient_id=recipient_id,
-        generated_event_id=generated_event.id,
+        generated_event_id=(
+            generated_event.id if generated_event is not None else None
+        ),
         reasoning=confirmation.reasoning,
     )
 
@@ -896,7 +928,7 @@ def confirm_outer_turn(
             outer_context = current.outer_context.model_copy(
                 update={"turns": [*current.outer_context.turns, turn]}
             )
-        if current.id == recipient_id:
+        if generated_event is not None and current.id == recipient_id:
             pending_events = [*current.pending_events, generated_event]
         agents.append(
             current.model_copy(
@@ -977,7 +1009,7 @@ def _rollback_outer(
     scene: Scene,
     reference: ConfirmedCallReference,
 ) -> Scene:
-    """Remove the latest outer turn and its still-queued routed event."""
+    """Remove the latest outer turn and any still-queued routed event."""
     sender = get_agent(scene, reference.agent_id)
     if (
         not sender.outer_context.turns
@@ -986,14 +1018,15 @@ def _rollback_outer(
     ):
         raise SceneConflictError("The rollback stack is inconsistent.")
     turn = sender.outer_context.turns[-1]
-    recipient = get_agent(scene, turn.recipient_id)
-    if not any(
-        event.id == turn.generated_event_id
-        for event in recipient.pending_events
-    ):
-        raise SceneConflictError(
-            "The routed event is no longer available for rollback."
-        )
+    if turn.recipient_id is not None:
+        recipient = get_agent(scene, turn.recipient_id)
+        if not any(
+            event.id == turn.generated_event_id
+            for event in recipient.pending_events
+        ):
+            raise SceneConflictError(
+                "The routed event is no longer available for rollback."
+            )
 
     agents = []
     for current in scene.agents:
@@ -1003,7 +1036,7 @@ def _rollback_outer(
             outer_context = current.outer_context.model_copy(
                 update={"turns": current.outer_context.turns[:-1]}
             )
-        if current.id == turn.recipient_id:
+        if turn.recipient_id is not None and current.id == turn.recipient_id:
             pending_events = [
                 event
                 for event in current.pending_events
@@ -1028,6 +1061,26 @@ def _rollback_outer(
 def get_agent(scene: Scene, agent_id: AgentId) -> Agent:
     """Return one Agent by its fixed ID."""
     return next(agent for agent in scene.agents if agent.id == agent_id)
+
+
+def require_agent_ready(agent: Agent) -> None:
+    """Require every prompt variable and at least one semantic address."""
+    profile = agent.prompt_profile
+    variables = (
+        profile.pronoun,
+        profile.hidden_beliefs,
+        profile.inner_memories,
+        profile.outer_memories,
+    )
+    if not all(value.strip() for value in variables):
+        raise SceneConflictError(
+            "All four prompt variables must be filled before model requests."
+        )
+    if not any(agent.interactions.values()):
+        raise SceneConflictError(
+            "At least one interaction address is required before model "
+            "requests."
+        )
 
 
 def _find_event(

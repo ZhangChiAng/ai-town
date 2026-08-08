@@ -1,7 +1,8 @@
-"""Atomic JSON-file persistence for schema-v8 two-layer scenes."""
+"""Atomic JSON-file persistence for schema-v9 two-layer scenes."""
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -12,14 +13,13 @@ from uuid import UUID
 from pydantic import ValidationError
 
 from app.models import (
-    LEGACY_SCHEMA_VERSION,
-    PREVIOUS_SCHEMA_VERSION,
     SCHEMA_VERSION,
     Scene,
     SceneSummary,
-    migrate_v6_to_v7,
-    migrate_v7_to_v8,
 )
+from app.structured_logging import log_event
+
+LOGGER = logging.getLogger(__name__)
 
 
 class SceneStorageError(RuntimeError):
@@ -51,7 +51,7 @@ class SceneStorage:
         self._lock = threading.RLock()
 
     def list_scenes(self) -> list[SceneSummary]:
-        """Return validated scene summaries ordered by name and UUID."""
+        """Return readable scene summaries ordered by name and UUID."""
         with self._lock:
             try:
                 paths = [
@@ -66,7 +66,21 @@ class SceneStorage:
                     f"Could not list the scene storage directory: {error}"
                 ) from error
 
-            scenes = [self._read_path(path) for path in paths]
+            scenes: list[Scene] = []
+            for path in paths:
+                try:
+                    scenes.append(self._read_path(path))
+                except SceneStorageError as error:
+                    # Leave the failed file untouched for diagnosis or repair
+                    # while keeping every other valid scene discoverable.
+                    log_event(
+                        LOGGER,
+                        logging.ERROR,
+                        "scene.load.failed",
+                        "Scene file was skipped while listing scenes.",
+                        exception=error,
+                        scene_file=path.name,
+                    )
             scenes.sort(key=lambda scene: (scene.name, str(scene.id)))
             return [
                 SceneSummary(id=scene.id, name=scene.name) for scene in scenes
@@ -154,23 +168,13 @@ class SceneStorage:
                 f"Scene file '{path.name}' is not valid JSON or is corrupted."
             ) from error
 
-        # Earlier single-layer schemas are intentionally unsupported; no
-        # in-memory upgrade path may silently change the experiment's
-        # information model. Only the previous batch-consumption schema (v6)
-        # and the pre-reasoning schema (v7) are migrated forward before
-        # validation.
+        # v9 intentionally starts a new prompt and routing information model.
+        # Older files remain untouched and are never migrated or accepted.
         version = raw.get("schema_version") if isinstance(raw, dict) else None
-        if version == LEGACY_SCHEMA_VERSION:
-            raw = migrate_v6_to_v7(raw)
-        current_version = (
-            raw.get("schema_version") if isinstance(raw, dict) else None
-        )
-        if current_version == PREVIOUS_SCHEMA_VERSION:
-            raw = migrate_v7_to_v8(raw)
-        elif current_version != SCHEMA_VERSION:
+        if version != SCHEMA_VERSION:
             raise SceneReadError(
                 f"Scene file '{path.name}' is not schema v{SCHEMA_VERSION} "
-                "or v6."
+                "and no migration is supported."
             )
 
         try:

@@ -30,6 +30,7 @@ import {
   type ExternalEvent,
   type Layer,
   type LayerDraftResponse,
+  type Interactions,
   type ModelOption,
   type ModelReasoningBlock,
   type ModelRequestPreviewResponse,
@@ -84,6 +85,10 @@ const draftErrors = ref<Record<AgentId, string>>({
   C: "",
 });
 const eventError = ref("");
+const interactionError = ref("");
+const newInteractionTarget = ref<AgentId>("B");
+const newInteractionAddress = ref("");
+const newInteractionOccasion = ref("");
 const saveMessage = ref("");
 const openingSceneId = ref<string | null>(null);
 const isCreating = ref(false);
@@ -125,6 +130,40 @@ const activeStage = computed<Layer>(() =>
 const activeDraft = computed(
   () => drafts.value[activeAgentId.value],
 );
+
+const interactionTargets = computed(() =>
+  AGENT_IDS.filter((agentId) => agentId !== activeAgentId.value),
+);
+
+const interactionGroups = computed(() => {
+  const interactions = activeAgent.value?.interactions ?? {};
+  return AGENT_IDS.flatMap((targetId) => {
+    const labels = interactions[targetId];
+    return labels && Object.keys(labels).length > 0
+      ? [{ targetId, labels: Object.entries(labels) }]
+      : [];
+  });
+});
+
+function interactionCount(agent: Agent): number {
+  return Object.values(agent.interactions).reduce(
+    (count, labels) => count + Object.keys(labels ?? {}).length,
+    0,
+  );
+}
+
+function agentReady(agent: Agent): boolean {
+  const profile = agent.prompt_profile;
+  return (
+    [
+      profile.pronoun,
+      profile.hidden_beliefs,
+      profile.inner_memories,
+      profile.outer_memories,
+    ].every((value) => value.trim() !== "") &&
+    interactionCount(agent) > 0
+  );
+}
 
 const sceneModelAvailable = computed(() => {
   const model = currentScene.value?.model;
@@ -172,6 +211,7 @@ const canGenerate = computed(() => {
   if (
     agent === undefined ||
     !sceneModelAvailable.value ||
+    !agentReady(agent) ||
     isDirty.value ||
     editorLocked.value
   ) {
@@ -188,6 +228,8 @@ const canConfirm = computed(
     activeDraft.value !== null &&
     activeDraft.value.layer === activeStage.value &&
     activeDraft.value.content.trim() !== "" &&
+    activeAgent.value !== undefined &&
+    agentReady(activeAgent.value) &&
     !isDirty.value &&
     !editorLocked.value,
 );
@@ -323,6 +365,7 @@ function installScene(
   previews.value = {};
   previewError.value = "";
   eventError.value = "";
+  interactionError.value = "";
   saveMessage.value = "";
   actionError.value = "";
   upsertSummary(scene);
@@ -339,6 +382,7 @@ function closeScene(): void {
   previews.value = {};
   previewError.value = "";
   eventError.value = "";
+  interactionError.value = "";
   saveMessage.value = "";
   actionError.value = "";
   bindingModel.value = modelOptions.value[0]?.model ?? "";
@@ -494,19 +538,127 @@ function sceneUpdate(scene: Scene): SceneUpdate {
     agents: scene.agents.map((agent) => ({
       id: agent.id,
       name: agent.name,
-      inner_context: {
-        system_prompt: agent.inner_context.system_prompt,
-      },
-      outer_context: {
-        system_prompt: agent.outer_context.system_prompt,
-      },
+      prompt_profile: agent.prompt_profile,
+      interactions: agent.interactions,
     })),
   };
+}
+
+function addressExists(address: string, except?: string): boolean {
+  const agent = activeAgent.value;
+  if (agent === undefined) {
+    return false;
+  }
+  return Object.values(agent.interactions).some((labels) =>
+    Object.keys(labels ?? {}).some(
+      (configured) => configured === address && configured !== except,
+    ),
+  );
+}
+
+function addInteraction(): void {
+  const agent = activeAgent.value;
+  const address = newInteractionAddress.value.trim();
+  const occasion = newInteractionOccasion.value.trim();
+  const targetId = newInteractionTarget.value;
+  interactionError.value = "";
+  if (agent === undefined || targetId === agent.id) {
+    interactionError.value = "请选择另一个 Agent。";
+    return;
+  }
+  if (!address || !occasion) {
+    interactionError.value = "称呼和使用场合都不能为空。";
+    return;
+  }
+  if (addressExists(address)) {
+    interactionError.value = "同一发送方下的称呼不能重复。";
+    return;
+  }
+  const labels = agent.interactions[targetId] ?? {};
+  agent.interactions[targetId] = { ...labels, [address]: occasion };
+  newInteractionAddress.value = "";
+  newInteractionOccasion.value = "";
+}
+
+function renameInteraction(
+  targetId: AgentId,
+  oldAddress: string,
+  event: Event,
+): void {
+  const agent = activeAgent.value;
+  const input = event.target as HTMLInputElement;
+  const address = input.value.trim();
+  interactionError.value = "";
+  if (!address) {
+    input.value = oldAddress;
+    interactionError.value = "称呼不能为空。";
+    return;
+  }
+  if (address !== oldAddress && addressExists(address, oldAddress)) {
+    input.value = oldAddress;
+    interactionError.value = "同一发送方下的称呼不能重复。";
+    return;
+  }
+  const labels = agent?.interactions[targetId];
+  if (agent === undefined || labels === undefined || address === oldAddress) {
+    input.value = oldAddress;
+    return;
+  }
+  // Rebuild the object to keep the renamed entry in its page-defined order.
+  agent.interactions[targetId] = Object.fromEntries(
+    Object.entries(labels).map(([current, occasion]) => [
+      current === oldAddress ? address : current,
+      occasion,
+    ]),
+  );
+}
+
+function updateInteractionOccasion(
+  targetId: AgentId,
+  address: string,
+  event: Event,
+): void {
+  const labels = activeAgent.value?.interactions[targetId];
+  if (labels !== undefined) {
+    labels[address] = (event.target as HTMLInputElement).value;
+    interactionError.value = "";
+  }
+}
+
+function removeInteraction(targetId: AgentId, address: string): void {
+  const agent = activeAgent.value;
+  const labels = agent?.interactions[targetId];
+  if (agent === undefined || labels === undefined) {
+    return;
+  }
+  const remaining = Object.fromEntries(
+    Object.entries(labels).filter(([configured]) => configured !== address),
+  );
+  const interactions: Interactions = { ...agent.interactions };
+  if (Object.keys(remaining).length === 0) {
+    delete interactions[targetId];
+  } else {
+    interactions[targetId] = remaining;
+  }
+  agent.interactions = interactions;
+  interactionError.value = "";
 }
 
 async function saveCurrentScene(): Promise<void> {
   const scene = currentScene.value;
   if (scene === null || editorLocked.value || !isDirty.value) {
+    return;
+  }
+  const hasBlankInteraction = scene.agents.some((agent) =>
+    Object.values(agent.interactions).some((labels) =>
+      Object.entries(labels ?? {}).some(
+        ([address, occasion]) =>
+          address.trim() === "" || occasion.trim() === "",
+      ),
+    ),
+  );
+  if (hasBlankInteraction) {
+    saveMessage.value = "称呼和使用场合都不能为空。";
     return;
   }
   busyAction.value = "save";
@@ -527,14 +679,14 @@ async function saveCurrentScene(): Promise<void> {
 
 async function addEvent(): Promise<void> {
   const scene = currentScene.value;
-  const content = newEventContent.value[activeAgentId.value].trim();
+  const content = newEventContent.value[activeAgentId.value];
   if (
     scene === null ||
-    !content ||
+    !content.trim() ||
     isDirty.value ||
     editorLocked.value
   ) {
-    if (!content) {
+    if (!content.trim()) {
       eventError.value = "请输入外部事件。";
     }
     return;
@@ -567,14 +719,14 @@ function updateEventEdit(eventId: string, event: Event): void {
 
 async function saveEvent(event: ExternalEvent): Promise<void> {
   const scene = currentScene.value;
-  const content = eventEdits.value[event.id]?.trim() ?? "";
+  const content = eventEdits.value[event.id] ?? "";
   if (
     scene === null ||
-    !content ||
+    !content.trim() ||
     isDirty.value ||
     editorLocked.value
   ) {
-    if (!content) {
+    if (!content.trim()) {
       eventError.value = "外部事件不能为空。";
     }
     return;
@@ -793,6 +945,10 @@ watch(
     previewLayer.value = activeStage.value;
     previewError.value = "";
     eventError.value = "";
+    interactionError.value = "";
+    newInteractionTarget.value = interactionTargets.value[0] ?? "A";
+    newInteractionAddress.value = "";
+    newInteractionOccasion.value = "";
   },
 );
 
@@ -1132,7 +1288,7 @@ onBeforeUnmount(() => {
                     {{
                       activeStage === "inner"
                         ? "可使用多行自然文本；确认后一次性消费本 Agent 队列中的全部待处理事件。"
-                        : "必须为单行 To X: 正文；确认后才会路由事件。"
+                        : "使用“对称呼说：正文”或精确的 STOP；只有语义发言会路由事件。"
                     }}
                   </p>
                 </div>
@@ -1148,7 +1304,7 @@ onBeforeUnmount(() => {
                   :placeholder="
                     activeStage === 'inner'
                       ? '先生成内层草稿'
-                      : 'To B: 正文'
+                      : '对儿子说：正文，或 STOP'
                   "
                   :disabled="
                     editorLocked ||
@@ -1223,6 +1379,9 @@ onBeforeUnmount(() => {
                 </p>
                 <p v-else-if="isDirty" class="hint">
                   请先保存设定，再生成或确认。
+                </p>
+                <p v-else-if="!agentReady(activeAgent)" class="hint">
+                  请填写四个提示词变量，并至少配置一个互动称呼。
                 </p>
                 <p
                   v-else-if="
@@ -1371,8 +1530,8 @@ onBeforeUnmount(() => {
               <details class="settings-card">
                 <summary>
                   <span>
-                    <strong>Agent 与双层提示词</strong>
-                    <small>两份完整文本分别保存，不做槽位拼接</small>
+                    <strong>Agent 提示词变量与互动角色</strong>
+                    <small>完整 system prompt 由后端固定模板组装</small>
                   </span>
                 </summary>
                 <div class="settings-body">
@@ -1385,24 +1544,143 @@ onBeforeUnmount(() => {
                       :disabled="editorLocked"
                     />
                   </label>
-                  <label for="inner-system-prompt">
-                    <span>内层 system prompt</span>
+                  <label for="agent-pronoun">
+                    <span>代词</span>
+                    <input
+                      id="agent-pronoun"
+                      v-model="activeAgent.prompt_profile.pronoun"
+                      type="text"
+                      placeholder="例如：她"
+                      :disabled="editorLocked"
+                    />
+                  </label>
+                  <label for="hidden-beliefs">
+                    <span>不可说出口的信念</span>
                     <textarea
-                      id="inner-system-prompt"
-                      v-model="activeAgent.inner_context.system_prompt"
-                      rows="14"
+                      id="hidden-beliefs"
+                      v-model="activeAgent.prompt_profile.hidden_beliefs"
+                      rows="7"
                       :disabled="editorLocked"
                     ></textarea>
                   </label>
-                  <label for="outer-system-prompt">
-                    <span>外层 system prompt</span>
+                  <label for="inner-memories">
+                    <span>内层记忆</span>
                     <textarea
-                      id="outer-system-prompt"
-                      v-model="activeAgent.outer_context.system_prompt"
-                      rows="16"
+                      id="inner-memories"
+                      v-model="activeAgent.prompt_profile.inner_memories"
+                      rows="6"
                       :disabled="editorLocked"
                     ></textarea>
                   </label>
+                  <label for="outer-memories">
+                    <span>外层记忆</span>
+                    <textarea
+                      id="outer-memories"
+                      v-model="activeAgent.prompt_profile.outer_memories"
+                      rows="7"
+                      :disabled="editorLocked"
+                    ></textarea>
+                  </label>
+
+                  <section class="interaction-editor">
+                    <header>
+                      <div>
+                        <strong>互动角色</strong>
+                        <small>称呼在当前 Agent 下必须唯一</small>
+                      </div>
+                      <span>{{ interactionCount(activeAgent) }}</span>
+                    </header>
+
+                    <div
+                      v-for="group in interactionGroups"
+                      :key="group.targetId"
+                      class="interaction-group"
+                    >
+                      <strong>Agent {{ group.targetId }}</strong>
+                      <div
+                        v-for="([address, occasion], index) in group.labels"
+                        :key="`${group.targetId}:${address}`"
+                        class="interaction-row"
+                      >
+                        <label>
+                          <span>称呼 {{ index + 1 }}</span>
+                          <input
+                            :value="address"
+                            type="text"
+                            :disabled="editorLocked"
+                            @change="renameInteraction(group.targetId, address, $event)"
+                          />
+                        </label>
+                        <label>
+                          <span>使用场合</span>
+                          <input
+                            :value="occasion"
+                            type="text"
+                            :disabled="editorLocked"
+                            @input="updateInteractionOccasion(group.targetId, address, $event)"
+                          />
+                        </label>
+                        <button
+                          type="button"
+                          class="text-button"
+                          :disabled="editorLocked"
+                          @click="removeInteraction(group.targetId, address)"
+                        >
+                          删除
+                        </button>
+                      </div>
+                    </div>
+
+                    <form class="interaction-add" @submit.prevent="addInteraction">
+                      <label>
+                        <span>目标 Agent</span>
+                        <select
+                          v-model="newInteractionTarget"
+                          :disabled="editorLocked"
+                        >
+                          <option
+                            v-for="targetId in interactionTargets"
+                            :key="targetId"
+                            :value="targetId"
+                          >
+                            Agent {{ targetId }}
+                          </option>
+                        </select>
+                      </label>
+                      <label>
+                        <span>称呼</span>
+                        <input
+                          v-model="newInteractionAddress"
+                          type="text"
+                          placeholder="例如：儿子"
+                          :disabled="editorLocked"
+                        />
+                      </label>
+                      <label>
+                        <span>使用场合</span>
+                        <input
+                          v-model="newInteractionOccasion"
+                          type="text"
+                          placeholder="例如：一般场合"
+                          :disabled="editorLocked"
+                        />
+                      </label>
+                      <button
+                        type="submit"
+                        class="small-button"
+                        :disabled="editorLocked"
+                      >
+                        添加称呼
+                      </button>
+                    </form>
+                    <p
+                      v-if="interactionError"
+                      class="inline-error"
+                      role="alert"
+                    >
+                      {{ interactionError }}
+                    </p>
+                  </section>
                 </div>
               </details>
 
@@ -1428,7 +1706,11 @@ onBeforeUnmount(() => {
                   <button
                     type="button"
                     class="secondary-button"
-                    :disabled="editorLocked || !sceneModelAvailable"
+                    :disabled="
+                      editorLocked ||
+                      !sceneModelAvailable ||
+                      !agentReady(activeAgent)
+                    "
                     @click="loadPreview"
                   >
                     {{

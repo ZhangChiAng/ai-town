@@ -13,7 +13,12 @@ from app.model_backends import (
     ModelReasoning,
     ModelUsage,
 )
-from app.models import ConfirmLayerRequest, create_scene
+from app.models import (
+    AGENT_IDS,
+    ConfirmLayerRequest,
+    PromptProfile,
+    create_scene,
+)
 from app.storage import SceneStorage
 from tests.client import TestClient
 
@@ -167,10 +172,9 @@ def fill_prompts(
     *,
     text: str | Callable[[str, str], str] | None = None,
 ) -> dict[str, Any]:
-    """Write complete inner/outer prompts for every Agent via the PUT API.
+    """Write complete prompt variables and interactions through the PUT API.
 
-    ``text`` is either one literal string or a factory receiving the Agent
-    ID and layer; the default factory keeps every layer observably distinct.
+    ``text`` remains a compact way for tests to set every free-text variable.
     """
     factory = (
         (text if isinstance(text, Callable) else (lambda agent_id, layer: text))
@@ -183,11 +187,16 @@ def fill_prompts(
             {
                 "id": agent["id"],
                 "name": agent["name"],
-                "inner_context": {
-                    "system_prompt": factory(agent["id"], "inner")
+                "prompt_profile": {
+                    "pronoun": "她",
+                    "hidden_beliefs": factory(agent["id"], "hidden"),
+                    "inner_memories": factory(agent["id"], "inner"),
+                    "outer_memories": factory(agent["id"], "outer"),
                 },
-                "outer_context": {
-                    "system_prompt": factory(agent["id"], "outer")
+                "interactions": {
+                    target_id: {target_id: f"称呼 Agent {target_id} 的场合"}
+                    for target_id in AGENT_IDS
+                    if target_id != agent["id"]
                 },
             }
             for agent in scene["agents"]
@@ -212,23 +221,30 @@ def post_prompted_scene(
 
 
 def create_prompted_scene(name: str, model: str) -> Any:
-    """Build an unpersisted scene with complete prompts for every Agent."""
+    """Build an unpersisted scene with complete v9 prompt variables."""
     return _replace_all_prompts(create_scene(name, model))
 
 
 def _replace_all_prompts(scene: Any) -> Any:
-    """Return a scene with distinct INNER/OUTER prompts on every Agent."""
+    """Return a scene with distinct profiles and routes on every Agent."""
     return scene.model_copy(
         update={
             "agents": [
                 agent.model_copy(
                     update={
-                        "inner_context": agent.inner_context.model_copy(
-                            update={"system_prompt": f"INNER {agent.id}"}
+                        "prompt_profile": PromptProfile(
+                            pronoun="她",
+                            hidden_beliefs=f"HIDDEN {agent.id}",
+                            inner_memories=f"INNER {agent.id}",
+                            outer_memories=f"OUTER {agent.id}",
                         ),
-                        "outer_context": agent.outer_context.model_copy(
-                            update={"system_prompt": f"OUTER {agent.id}"}
-                        ),
+                        "interactions": {
+                            target_id: {
+                                target_id: f"称呼 Agent {target_id} 的场合"
+                            }
+                            for target_id in AGENT_IDS
+                            if target_id != agent.id
+                        },
                     }
                 )
                 for agent in scene.agents

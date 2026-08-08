@@ -39,6 +39,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -49,12 +50,14 @@ button {
 
 button:disabled,
 input:disabled,
+select:disabled,
 textarea:disabled {
   cursor: not-allowed;
   opacity: 0.52;
 }
 
 input,
+select,
 textarea {
   width: 100%;
   color: var(--ink);
@@ -72,6 +75,11 @@ input {
   padding: 0 12px;
 }
 
+select {
+  min-height: 42px;
+  padding: 0 10px;
+}
+
 textarea {
   padding: 10px 12px;
   line-height: 1.55;
@@ -79,6 +87,7 @@ textarea {
 }
 
 input:focus,
+select:focus,
 textarea:focus {
   border-color: var(--outer);
   box-shadow: 0 0 0 3px rgb(22 121 111 / 12%);
@@ -1123,6 +1132,97 @@ pre {
   display: block;
 }
 
+.interaction-editor {
+  display: grid;
+  gap: 10px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+
+.interaction-editor > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.interaction-editor > header div {
+  display: grid;
+  gap: 2px;
+}
+
+.interaction-editor > header strong,
+.interaction-group > strong {
+  color: var(--deep);
+  font-size: 12px;
+}
+
+.interaction-editor > header small {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.interaction-editor > header > span {
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  color: white;
+  border-radius: 50%;
+  background: var(--outer);
+  font-size: 10px;
+  font-weight: 800;
+}
+
+.interaction-group {
+  display: grid;
+  gap: 7px;
+  padding: 10px;
+  border: 1px solid #d8dfda;
+  border-radius: 9px;
+  background: #f7f9f6;
+}
+
+.interaction-row {
+  display: grid;
+  grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr) auto;
+  gap: 7px;
+  align-items: end;
+}
+
+.interaction-row label > span,
+.interaction-add label > span {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 750;
+}
+
+.interaction-row input,
+.interaction-add input,
+.interaction-add select {
+  min-height: 36px;
+  font-size: 11px;
+}
+
+.interaction-row > button {
+  min-height: 36px;
+}
+
+.interaction-add {
+  display: grid;
+  grid-template-columns: 0.65fr 1fr 1.2fr;
+  gap: 7px;
+  align-items: end;
+  padding-top: 10px;
+  border-top: 1px dashed #cfd8d2;
+}
+
+.interaction-add > button {
+  grid-column: 1 / -1;
+  justify-self: end;
+}
+
 .preview-body {
   padding-top: 14px;
 }
@@ -1314,6 +1414,15 @@ pre {
 
   .draft-actions {
     flex-wrap: wrap;
+  }
+
+  .interaction-row,
+  .interaction-add {
+    grid-template-columns: 1fr;
+  }
+
+  .interaction-add > button {
+    grid-column: auto;
   }
 
   .welcome-card {

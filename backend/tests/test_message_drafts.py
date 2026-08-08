@@ -49,7 +49,7 @@ def test_first_inner_and_outer_inputs_are_exact() -> None:
         "门外传来两声敲门。",
     )
     backend = FakeBackend(
-        ["先别开门。\n问清楚是谁。", "To B: 你在门外吗？"],
+        ["先别开门。\n问清楚是谁。", "对B说：你在门外吗？"],
         model=MODEL,
     )
     workflow = DraftWorkflow(backend)
@@ -75,7 +75,7 @@ def test_later_inner_input_names_recipient_and_uses_only_message_body(
     """Later inner input renders routed speech without its address prefix."""
     scene = add_manual_event(prompted_scene("后续", MODEL), "A", "第一件事")
     backend = FakeBackend(
-        ["内层一", f"To {recipient_id}: 外层一"],
+        ["内层一", f"对{recipient_id}说：外层一"],
         model=MODEL,
     )
     workflow = DraftWorkflow(backend)
@@ -87,9 +87,9 @@ def test_later_inner_input_names_recipient_and_uses_only_message_body(
         agent for agent in scene.agents if agent.id == recipient_id
     )
     assert scene.agents[0].outer_context.turns[-1].output == (
-        f"To {recipient_id}: 外层一"
+        f"对{recipient_id}说：外层一"
     )
-    assert recipient.pending_events[-1].content == "From A: 外层一"
+    assert recipient.pending_events[-1].content == "外层一"
     scene = add_manual_event(scene, "A", "第二件事")
 
     preview = DraftWorkflow(FakeBackend([], model=MODEL)).preview(
@@ -99,16 +99,15 @@ def test_later_inner_input_names_recipient_and_uses_only_message_body(
     )
 
     assert preview.context[-1].text == (
-        f"外层人格上一轮对 Agent {recipient_id}（{recipient_id}）说：\n"
-        "外层一\n\n外部事件：\n第二件事"
+        f"上一轮：\n你对{recipient_id}说：\n外层一\n\n外部事件：\n第二件事"
     )
 
 
-def test_later_inner_input_uses_recipient_current_name() -> None:
-    """The speech direction reflects a recipient rename after the outer turn."""
+def test_later_inner_input_keeps_saved_address_after_recipient_rename() -> None:
+    """Semantic history uses the saved address, not a target display name."""
     scene = add_manual_event(prompted_scene("改名", MODEL), "A", "第一件事")
     workflow = DraftWorkflow(
-        FakeBackend(["内层一", "To B: 外层一"], model=MODEL)
+        FakeBackend(["内层一", "对B说：外层一"], model=MODEL)
     )
     inner = _generate(workflow, scene, "A", "inner")
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
@@ -121,12 +120,8 @@ def test_later_inner_input_uses_recipient_current_name() -> None:
                 {
                     "id": agent.id,
                     "name": "儿子" if agent.id == "B" else agent.name,
-                    "inner_context": {
-                        "system_prompt": agent.inner_context.system_prompt
-                    },
-                    "outer_context": {
-                        "system_prompt": agent.outer_context.system_prompt
-                    },
+                    "prompt_profile": agent.prompt_profile.model_dump(),
+                    "interactions": agent.interactions,
                 }
                 for agent in scene.agents
             ],
@@ -141,7 +136,7 @@ def test_later_inner_input_uses_recipient_current_name() -> None:
     )
 
     assert preview.context[-1].text == (
-        "外层人格上一轮对 Agent B（儿子）说：\n外层一\n\n外部事件：\n第二件事"
+        "上一轮：\n你对B说：\n外层一\n\n外部事件：\n第二件事"
     )
 
 
@@ -153,11 +148,11 @@ def test_two_layers_send_only_their_own_complete_history() -> None:
             "agents": [
                 agent.model_copy(
                     update={
-                        "inner_context": agent.inner_context.model_copy(
-                            update={"system_prompt": f"INNER {agent.id}"}
-                        ),
-                        "outer_context": agent.outer_context.model_copy(
-                            update={"system_prompt": f"OUTER {agent.id}"}
+                        "prompt_profile": agent.prompt_profile.model_copy(
+                            update={
+                                "inner_memories": f"INNER {agent.id}",
+                                "outer_memories": f"OUTER {agent.id}",
+                            }
                         ),
                     }
                 )
@@ -167,7 +162,7 @@ def test_two_layers_send_only_their_own_complete_history() -> None:
     )
     scene = add_manual_event(scene, "A", "A first event")
     backend = FakeBackend(
-        ["A inner secret", "To B: A public text"], model=MODEL
+        ["A inner secret", "对B说：A public text"], model=MODEL
     )
     workflow = DraftWorkflow(backend)
     inner = _generate(workflow, scene, "A", "inner")
@@ -183,7 +178,7 @@ def test_two_layers_send_only_their_own_complete_history() -> None:
         ensure_ascii=False,
     )
 
-    assert preview.context[0].text == "INNER A"
+    assert "INNER A" in preview.context[0].text
     assert [(item.role, item.text) for item in preview.context[1:3]] == [
         ("user", "外部事件：\nA first event"),
         ("assistant", "A inner secret"),
@@ -200,7 +195,7 @@ def test_each_layer_keeps_every_confirmed_turn_without_truncation() -> None:
     scene = prompted_scene("完整历史", MODEL)
     outputs: list[str] = []
     for index in range(4):
-        outputs.extend((f"INNER-{index}", f"To B: OUTER-{index}"))
+        outputs.extend((f"INNER-{index}", f"对B说：OUTER-{index}"))
     workflow = DraftWorkflow(FakeBackend(outputs, model=MODEL))
 
     for index in range(4):
@@ -269,7 +264,7 @@ def test_multiline_outer_body_is_preserved_and_routed() -> None:
     body = "谁啊？\n\n*放下筷子，看着你*\n\n你最近怎么了？"
     scene = add_manual_event(prompted_scene("多行外层", MODEL), "A", "event")
     workflow = DraftWorkflow(
-        FakeBackend(["inner answer", f"To B: {body}"], model=MODEL)
+        FakeBackend(["inner answer", f"对B说：{body}"], model=MODEL)
     )
 
     inner = _generate(workflow, scene, "A", "inner")
@@ -279,9 +274,9 @@ def test_multiline_outer_body_is_preserved_and_routed() -> None:
 
     turn = scene.agents[0].outer_context.turns[-1]
     assert turn.recipient_id == "B"
-    assert turn.output == f"To B: {body}"
+    assert turn.output == f"对B说：{body}"
     recipient = next(agent for agent in scene.agents if agent.id == "B")
-    assert recipient.pending_events[-1].content == f"From A: {body}"
+    assert recipient.pending_events[-1].content == body
 
 
 def test_outer_preview_is_rejected_before_inner_confirmation() -> None:

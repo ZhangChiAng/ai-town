@@ -12,6 +12,7 @@ import type {
   ModelRequestContextItem,
   ModelRequestPreviewResponse,
   OuterTurn,
+  PromptProfile,
   Scene,
   SceneSummary,
   SceneUpdate,
@@ -142,10 +143,55 @@ function isOuterTurn(value: unknown): value is OuterTurn {
     isPositiveInteger(value.sequence) &&
     typeof value.input === "string" &&
     typeof value.output === "string" &&
-    isAgentId(value.recipient_id) &&
-    typeof value.generated_event_id === "string" &&
+    (value.recipient_id === null || isAgentId(value.recipient_id)) &&
+    (value.generated_event_id === null ||
+      typeof value.generated_event_id === "string") &&
+    ((value.output === "STOP" &&
+      value.recipient_id === null &&
+      value.generated_event_id === null) ||
+      (value.output !== "STOP" &&
+        isAgentId(value.recipient_id) &&
+        typeof value.generated_event_id === "string")) &&
     (value.reasoning === undefined || isReasoningList(value.reasoning))
   );
+}
+
+function isPromptProfile(value: unknown): value is PromptProfile {
+  return (
+    isRecord(value) &&
+    Object.keys(value).length === 4 &&
+    typeof value.pronoun === "string" &&
+    typeof value.hidden_beliefs === "string" &&
+    typeof value.inner_memories === "string" &&
+    typeof value.outer_memories === "string"
+  );
+}
+
+function hasValidInteractions(
+  value: unknown,
+  senderId: AgentId,
+): boolean {
+  if (!isRecord(value)) {
+    return false;
+  }
+  const addresses = new Set<string>();
+  return Object.entries(value).every(([targetId, labels]) => {
+    if (!isAgentId(targetId) || targetId === senderId || !isRecord(labels)) {
+      return false;
+    }
+    return Object.entries(labels).every(([address, occasion]) => {
+      if (
+        address.trim() === "" ||
+        typeof occasion !== "string" ||
+        occasion.trim() === "" ||
+        addresses.has(address)
+      ) {
+        return false;
+      }
+      addresses.add(address);
+      return true;
+    });
+  });
 }
 
 function isAgent(value: unknown): value is Agent {
@@ -153,12 +199,14 @@ function isAgent(value: unknown): value is Agent {
     isRecord(value) &&
     isAgentId(value.id) &&
     typeof value.name === "string" &&
+    isPromptProfile(value.prompt_profile) &&
+    hasValidInteractions(value.interactions, value.id) &&
     isRecord(value.inner_context) &&
-    typeof value.inner_context.system_prompt === "string" &&
+    Object.keys(value.inner_context).length === 1 &&
     Array.isArray(value.inner_context.turns) &&
     value.inner_context.turns.every(isInnerTurn) &&
     isRecord(value.outer_context) &&
-    typeof value.outer_context.system_prompt === "string" &&
+    Object.keys(value.outer_context).length === 1 &&
     Array.isArray(value.outer_context.turns) &&
     value.outer_context.turns.every(isOuterTurn) &&
     Array.isArray(value.pending_events) &&
@@ -169,7 +217,7 @@ function isAgent(value: unknown): value is Agent {
 function isScene(value: unknown): value is Scene {
   return (
     isRecord(value) &&
-    value.schema_version === 8 &&
+    value.schema_version === 9 &&
     typeof value.id === "string" &&
     typeof value.name === "string" &&
     (value.model === null ||

@@ -26,6 +26,7 @@ from app.models import (
     edit_manual_event,
     update_scene,
 )
+from app.prompts import build_system_prompt
 from tests.helpers import (
     FakeBackend,
     confirmation,
@@ -76,7 +77,7 @@ def test_preview_exposes_neutral_context_without_backend_call() -> None:
     assert backend.conversations == []
     assert backend.generate_calls == []
     assert [(item.role, item.text) for item in preview.context] == [
-        ("system", scene.agents[0].inner_context.system_prompt),
+        ("system", build_system_prompt(scene.agents[0], "inner")),
         ("user", "外部事件：\na private event"),
     ]
     assert preview.layer == "inner"
@@ -181,7 +182,7 @@ def test_event_prompt_history_or_model_changes_make_token_stale() -> None:
         confirmation(draft),
     )
     outer_draft = _generate(
-        DraftWorkflow(FakeBackend(["To B: first outer"], model=MODEL)),
+        DraftWorkflow(FakeBackend(["对B说：first outer"], model=MODEL)),
         confirmed_inner,
         "A",
         "outer",
@@ -209,7 +210,7 @@ def test_readable_context_contains_complete_alternating_layer_history() -> None:
     )
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
     outer = _generate(
-        DraftWorkflow(FakeBackend(["To B: outer one"], model=MODEL)),
+        DraftWorkflow(FakeBackend(["对B说：outer one"], model=MODEL)),
         scene,
         "A",
         "outer",
@@ -228,14 +229,13 @@ def test_readable_context_contains_complete_alternating_layer_history() -> None:
         ("assistant", "inner one"),
         (
             "user",
-            "外层人格上一轮对 Agent B（B）说：\n"
-            "outer one\n\n外部事件：\nsecond",
+            "上一轮：\n你对B说：\nouter one\n\n外部事件：\nsecond",
         ),
     ]
 
 
-def test_recipient_rename_invalidates_later_inner_draft() -> None:
-    """A recipient display-name change makes the routed-speech draft stale."""
+def test_interaction_change_invalidates_later_inner_draft() -> None:
+    """Any sender interaction change makes its browser draft stale."""
     scene = add_manual_event(
         prompted_scene("Rename stale", MODEL),
         "A",
@@ -249,7 +249,7 @@ def test_recipient_rename_invalidates_later_inner_draft() -> None:
     )
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
     outer = _generate(
-        DraftWorkflow(FakeBackend(["To B: outer one"], model=MODEL)),
+        DraftWorkflow(FakeBackend(["对B说：outer one"], model=MODEL)),
         scene,
         "A",
         "outer",
@@ -268,24 +268,24 @@ def test_recipient_rename_invalidates_later_inner_draft() -> None:
             "agents": [
                 {
                     "id": agent.id,
-                    "name": "儿子" if agent.id == "B" else agent.name,
-                    "inner_context": {
-                        "system_prompt": agent.inner_context.system_prompt
-                    },
-                    "outer_context": {
-                        "system_prompt": agent.outer_context.system_prompt
-                    },
+                    "name": agent.name,
+                    "prompt_profile": agent.prompt_profile.model_dump(),
+                    "interactions": (
+                        {"B": {"儿子": "一般场合"}}
+                        if agent.id == "A"
+                        else agent.interactions
+                    ),
                 }
                 for agent in scene.agents
             ],
         }
     )
-    renamed = update_scene(scene, update)
+    changed = update_scene(scene, update)
 
-    assert draft_state_token(renamed, "A", "inner") != draft.state_token
+    assert draft_state_token(changed, "A", "inner") != draft.state_token
     with pytest.raises(SceneConflictError, match="changed"):
         confirm_draft(
-            renamed,
+            changed,
             "A",
             "inner",
             confirmation(draft),
@@ -330,14 +330,14 @@ def test_outer_confirmation_rejects_multiline_blank_body() -> None:
     )
     scene = confirm_draft(scene, "A", "inner", confirmation(inner))
     outer = _generate(
-        DraftWorkflow(FakeBackend(["To B: first"], model=MODEL)),
+        DraftWorkflow(FakeBackend(["对B说：first"], model=MODEL)),
         scene,
         "A",
         "outer",
     )
 
-    with pytest.raises(InvalidLayerOutputError, match="non-self"):
-        confirm_draft(scene, "A", "outer", confirmation(outer, "To B: \n\n"))
+    with pytest.raises(InvalidLayerOutputError, match="semantic speech"):
+        confirm_draft(scene, "A", "outer", confirmation(outer, "对B说：\n\n"))
 
 
 def test_workflow_rejects_backend_for_a_different_scene_model() -> None:
@@ -387,7 +387,7 @@ def test_confirmed_turns_persist_reasoning_and_leave_it_out_of_requests() -> (
     )
     assert scene.agents[0].inner_context.turns[-1].reasoning == reasoning
 
-    outer_backend = FakeBackend(["To B: outer"], model=MODEL)
+    outer_backend = FakeBackend(["对B说：outer"], model=MODEL)
     outer = _generate(DraftWorkflow(outer_backend), scene, "A", "outer")
     # The next request replays only input/output turns, never reasoning.
     assert "inner thinking text" not in repr(outer_backend.generate_calls[-1])
@@ -398,7 +398,7 @@ def test_confirmed_turns_persist_reasoning_and_leave_it_out_of_requests() -> (
         _confirmation_with_reasoning(outer, []),
     )
     assert scenario.agents[0].outer_context.turns[-1].reasoning == []
-    assert scenario.agents[0].outer_context.turns[-1].output == "To B: outer"
+    assert scenario.agents[0].outer_context.turns[-1].output == "对B说：outer"
 
 
 def test_empty_reasoning_still_confirms_both_layers() -> None:
@@ -422,7 +422,7 @@ def test_empty_reasoning_still_confirms_both_layers() -> None:
     )
     assert scene.agents[0].inner_context.turns[-1].reasoning == []
     outer = _generate(
-        DraftWorkflow(FakeBackend(["To B: outer"], model=MODEL)),
+        DraftWorkflow(FakeBackend(["对B说：outer"], model=MODEL)),
         scene,
         "A",
         "outer",
@@ -437,13 +437,13 @@ def test_empty_reasoning_still_confirms_both_layers() -> None:
 
 
 def _replace_inner_prompt(scene: Any, prompt: str) -> Any:
-    """Return a valid scene with only Agent A's inner prompt changed."""
+    """Return a valid scene with only Agent A's inner memory changed."""
     agent = scene.agents[0]
     changed = agent.model_copy(
         update={
-            "inner_context": agent.inner_context.model_copy(
-                update={"system_prompt": prompt}
-            )
+            "prompt_profile": agent.prompt_profile.model_copy(
+                update={"inner_memories": prompt}
+            ),
         }
     )
     return scene.model_copy(update={"agents": [changed, *scene.agents[1:]]})

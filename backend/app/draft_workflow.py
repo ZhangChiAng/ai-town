@@ -16,6 +16,8 @@ from app.model_backends.contracts import (
     ModelTurn,
 )
 from app.models import (
+    AGENT_IDS,
+    Agent,
     AgentId,
     ConfirmLayerRequest,
     ExternalEvent,
@@ -32,8 +34,10 @@ from app.models import (
     confirm_inner_turn,
     confirm_outer_turn,
     get_agent,
-    parse_addressed_message,
+    parse_semantic_message,
+    require_agent_ready,
 )
+from app.prompts import build_system_prompt
 from app.structured_logging import bind_log_context, log_event, text_metadata
 
 LOGGER = logging.getLogger(__name__)
@@ -160,7 +164,12 @@ class DraftWorkflow:
             if layer == "outer":
                 invalid_outer = False
                 try:
-                    parse_addressed_message(generation.content, agent_id)
+                    agent = get_agent(scene, agent_id)
+                    if generation.content != "STOP":
+                        parse_semantic_message(
+                            generation.content,
+                            agent.interactions,
+                        )
                 except ValueError as error:
                     log_event(
                         LOGGER,
@@ -211,6 +220,7 @@ class DraftWorkflow:
                     layer,
                     draft.events,
                     draft.conversation,
+                    get_agent(scene, agent_id),
                 ),
             )
             log_event(
@@ -254,23 +264,18 @@ def build_model_conversation(
 ) -> tuple[tuple[UUID, ...], tuple[ExternalEvent, ...], ModelConversation]:
     """Build only the selected persona layer's complete visible context."""
     agent = get_agent(scene, agent_id)
+    require_agent_ready(agent)
     if layer == "inner":
         event_ids, current_input = build_inner_input(scene, agent_id)
         events = tuple(agent.pending_events)
-        system_prompt = agent.inner_context.system_prompt
+        system_prompt = build_system_prompt(agent, "inner")
         saved_turns = agent.inner_context.turns
     else:
         event_ids, current_input = build_outer_input(scene, agent_id)
         inner_turn = agent.inner_context.turns[-1]
         events = tuple(inner_turn.consumed_events)
-        system_prompt = agent.outer_context.system_prompt
+        system_prompt = build_system_prompt(agent, "outer")
         saved_turns: list[OuterTurn] = agent.outer_context.turns
-
-    if not system_prompt.strip():
-        # Blank prompts are saveable scene state but never reach a model.
-        raise SceneConflictError(
-            f"The {layer} system prompt must be filled before model requests."
-        )
 
     conversation = ModelConversation(
         system_prompt=system_prompt,
@@ -322,6 +327,7 @@ def draft_state_token(
         layer,
         events,
         conversation,
+        get_agent(scene, agent_id),
     )
 
 
@@ -345,6 +351,7 @@ def confirm_draft(
         layer,
         _events,
         conversation,
+        get_agent(scene, agent_id),
     )
     if not hmac.compare_digest(confirmation.state_token, current_token):
         raise SceneConflictError(
@@ -359,12 +366,16 @@ def confirm_draft(
             conversation.current_input,
         )
 
-    try:
-        parse_addressed_message(confirmation.content, agent_id)
-    except ValueError as error:
-        raise InvalidLayerOutputError(
-            "Outer output must be a non-self 'To X: body' message."
-        ) from error
+    if confirmation.content != "STOP":
+        try:
+            parse_semantic_message(
+                confirmation.content,
+                get_agent(scene, agent_id).interactions,
+            )
+        except ValueError as error:
+            raise InvalidLayerOutputError(
+                "Outer output must be configured semantic speech or exact STOP."
+            ) from error
     return confirm_outer_turn(
         scene,
         agent_id,
@@ -391,6 +402,7 @@ def _state_token(
     layer: Layer,
     events: tuple[ExternalEvent, ...],
     conversation: ModelConversation,
+    agent: Agent,
 ) -> str:
     """Hash only model identity and protocol-neutral conversation state."""
     if model is None:
@@ -408,6 +420,17 @@ def _state_token(
             for turn in conversation.turns
         ],
         "current_input": conversation.current_input,
+        # Hash the full editable configuration so any variable or interaction
+        # change expires browser-held drafts on either persona layer.
+        "prompt_configuration": {
+            "name": agent.name,
+            "prompt_profile": agent.prompt_profile.model_dump(),
+            "interactions": [
+                [target_id, list(agent.interactions[target_id].items())]
+                for target_id in AGENT_IDS
+                if target_id in agent.interactions
+            ],
+        },
     }
     serialized = json.dumps(
         state,

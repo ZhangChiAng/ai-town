@@ -9,6 +9,7 @@ import pytest
 
 from app.main import create_app
 from app.model_backends import JsonObject, ModelConversation
+from app.prompts import build_system_prompt
 from app.storage import SceneStorage
 from tests import helpers
 from tests.client import TestClient
@@ -85,12 +86,8 @@ def _scene_update(scene: dict[str, Any]) -> dict[str, Any]:
             {
                 "id": agent["id"],
                 "name": agent["name"],
-                "inner_context": {
-                    "system_prompt": agent["inner_context"]["system_prompt"]
-                },
-                "outer_context": {
-                    "system_prompt": agent["outer_context"]["system_prompt"]
-                },
+                "prompt_profile": agent["prompt_profile"],
+                "interactions": agent["interactions"],
             }
             for agent in scene["agents"]
         ],
@@ -123,7 +120,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
 ) -> None:
     """A provider-unlike backend previews and completes both manual stages."""
     storage = SceneStorage(tmp_path / "scenes")
-    backend = _backend(["INNER MODEL OUTPUT", "To B: PUBLIC OUTER OUTPUT"])
+    backend = _backend(["INNER MODEL OUTPUT", "对B说：PUBLIC OUTER OUTPUT"])
     other_backend = _backend([], model=OTHER_MODEL)
     client = TestClient(
         create_app(
@@ -148,8 +145,8 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
         agent_id = agent["id"]
         inner_prompt, outer_prompt = prompt_values[agent_id]
         agent["name"] = f"OBSERVER AGENT {agent_id} NAME"
-        agent["inner_context"]["system_prompt"] = inner_prompt
-        agent["outer_context"]["system_prompt"] = outer_prompt
+        agent["prompt_profile"]["inner_memories"] = inner_prompt
+        agent["prompt_profile"]["outer_memories"] = outer_prompt
     scene = _require_json(client.put(f"/api/scenes/{scene['id']}", json=update))
     scene = _post_event(
         client,
@@ -165,8 +162,12 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     )
     scene = _post_event(client, scene["id"], "A", "A FIRST EVENT")
 
+    persisted = storage.get(UUID(scene["id"]))
+    agent_a = persisted.agents[0]
+    inner_system_prompt = build_system_prompt(agent_a, "inner")
+    outer_system_prompt = build_system_prompt(agent_a, "outer")
     first_conversation = ModelConversation(
-        system_prompt="A INNER SYSTEM",
+        system_prompt=inner_system_prompt,
         turns=(),
         current_input="外部事件：\nA FIRST EVENT",
     )
@@ -178,7 +179,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     )
     assert set(first_preview) == {"layer", "event_ids", "context"}
     assert first_preview["context"] == [
-        {"role": "system", "text": "A INNER SYSTEM"},
+        {"role": "system", "text": inner_system_prompt},
         {"role": "user", "text": "外部事件：\nA FIRST EVENT"},
     ]
     assert backend.generate_calls == []
@@ -215,7 +216,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
         "外部事件：\nA FIRST EVENT\n\n你内心有一个声音：\nINNER CONFIRMED EDIT"
     )
     outer_conversation = ModelConversation(
-        system_prompt="A OUTER SYSTEM",
+        system_prompt=outer_system_prompt,
         turns=(),
         current_input=outer_input,
     )
@@ -227,7 +228,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     )
     assert set(outer_preview) == {"layer", "event_ids", "context"}
     assert outer_preview["context"] == [
-        {"role": "system", "text": "A OUTER SYSTEM"},
+        {"role": "system", "text": outer_system_prompt},
         {"role": "user", "text": outer_input},
     ]
     assert len(backend.generate_calls) == 1
@@ -245,7 +246,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
         "B PRIVATE QUEUE EVENT"
     )
     assert completed["agents"][1]["pending_events"][1]["content"] == (
-        "From A: PUBLIC OUTER OUTPUT"
+        "PUBLIC OUTER OUTPUT"
     )
 
     completed = _post_event(
@@ -255,8 +256,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
         "A SECOND EVENT",
     )
     later_input = (
-        "外层人格上一轮对 Agent B（OBSERVER AGENT B NAME）说：\n"
-        "PUBLIC OUTER OUTPUT\n\n外部事件：\nA SECOND EVENT"
+        "上一轮：\n你对B说：\nPUBLIC OUTER OUTPUT\n\n外部事件：\nA SECOND EVENT"
     )
     later_preview = _require_json(
         client.get(
@@ -266,7 +266,7 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     )
     assert set(later_preview) == {"layer", "event_ids", "context"}
     assert later_preview["context"] == [
-        {"role": "system", "text": "A INNER SYSTEM"},
+        {"role": "system", "text": inner_system_prompt},
         {"role": "user", "text": "外部事件：\nA FIRST EVENT"},
         {"role": "assistant", "text": "INNER CONFIRMED EDIT"},
         {"role": "user", "text": later_input},
@@ -278,7 +278,6 @@ def test_fake_third_protocol_completes_http_round_with_isolated_context(
     )
     forbidden_values = [
         "OBSERVER SCENE NAME",
-        "OBSERVER AGENT A NAME",
         "OBSERVER AGENT C NAME",
         "A OUTER SYSTEM",
         "B INNER PRIVATE SYSTEM",
@@ -336,7 +335,7 @@ def test_confirmation_persists_reasoning_and_accepts_empty_reasoning(
 ) -> None:
     """Reasoning travels with confirmation into persisted scene history."""
     storage = SceneStorage(tmp_path / "scenes")
-    backend = _backend(["inner answer", "To B: outer answer"])
+    backend = _backend(["inner answer", "对B说：outer answer"])
     client = TestClient(create_app(storage, {FAKE_MODEL: backend}))
     scene = _post_scene(client)
     scene = _post_event(client, scene["id"], "A", "pending event")
@@ -447,10 +446,10 @@ def _mutate_prompt(
     storage: SceneStorage,
     scene: dict[str, Any],
 ) -> None:
-    """Change the selected layer's system prompt after the draft."""
+    """Change the selected layer's prompt variable after the draft."""
     update = _scene_update(scene)
-    update["agents"][0]["inner_context"]["system_prompt"] = (
-        "changed inner prompt"
+    update["agents"][0]["prompt_profile"]["inner_memories"] = (
+        "changed inner memory"
     )
     saved = client.put(f"/api/scenes/{scene['id']}", json=update)
     assert saved.status_code == 200

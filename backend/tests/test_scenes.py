@@ -1,6 +1,7 @@
-"""API and persistence tests for schema-v8 two-layer scenes."""
+"""API and persistence tests for schema-v9 two-layer scenes."""
 
 import json
+import logging
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -157,7 +158,7 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
     client, _model = make_client(scene_directory)
     scene = post_scene(client)
 
-    assert scene["schema_version"] == SCHEMA_VERSION == 8
+    assert scene["schema_version"] == SCHEMA_VERSION == 9
     assert [agent["id"] for agent in scene["agents"]] == ["A", "B", "C"]
     assert set(scene) == {
         "schema_version",
@@ -172,12 +173,20 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
         assert set(agent) == {
             "id",
             "name",
+            "prompt_profile",
+            "interactions",
             "inner_context",
             "outer_context",
             "pending_events",
         }
-        assert set(agent["inner_context"]) == {"system_prompt", "turns"}
-        assert set(agent["outer_context"]) == {"system_prompt", "turns"}
+        assert set(agent["inner_context"]) == {"turns"}
+        assert set(agent["outer_context"]) == {"turns"}
+        assert set(agent["prompt_profile"]) == {
+            "pronoun",
+            "hidden_beliefs",
+            "inner_memories",
+            "outer_memories",
+        }
         for removed in (
             "persona",
             "desire",
@@ -192,15 +201,20 @@ def test_new_schema_round_trips_without_legacy_agent_fields(
     assert restarted.model_dump(mode="json") == scene
 
 
-def test_new_scene_starts_with_blank_prompts_and_blocks_model_calls(
+def test_new_scene_starts_with_blank_variables_and_blocks_model_calls(
     scene_directory: Path,
 ) -> None:
-    """Blank prompts are the default state and rejected for model calls."""
-    client, model_client = make_client(scene_directory, ["内层", "To B: 外层"])
+    """Blank profiles and interactions save but cannot reach a model."""
+    client, model_client = make_client(scene_directory, ["内层", "对B说：外层"])
     scene = helpers.post_scene(client, model=MODEL)
     for agent in scene["agents"]:
-        assert agent["inner_context"]["system_prompt"] == ""
-        assert agent["outer_context"]["system_prompt"] == ""
+        assert agent["prompt_profile"] == {
+            "pronoun": "",
+            "hidden_beliefs": "",
+            "inner_memories": "",
+            "outer_memories": "",
+        }
+        assert agent["interactions"] == {}
 
     post_event(client, scene["id"], "A", "事件")
     assert (
@@ -230,15 +244,20 @@ def test_new_scene_starts_with_blank_prompts_and_blocks_model_calls(
             {
                 "id": agent["id"],
                 "name": agent["name"],
-                "inner_context": {"system_prompt": ""},
-                "outer_context": {"system_prompt": "  "},
+                "prompt_profile": {
+                    "pronoun": "",
+                    "hidden_beliefs": "",
+                    "inner_memories": "",
+                    "outer_memories": "  ",
+                },
+                "interactions": {},
             }
             for agent in scene["agents"]
         ],
     }
     saved = client.put(f"/api/scenes/{scene['id']}", json=blank_update)
     assert saved.status_code == 200
-    assert saved.json()["agents"][0]["inner_context"]["system_prompt"] == ""
+    assert saved.json()["agents"][0]["prompt_profile"]["pronoun"] == ""
     assert (
         client.post(
             f"/api/scenes/{scene['id']}/agents/A/inner-drafts"
@@ -254,8 +273,15 @@ def test_new_scene_starts_with_blank_prompts_and_blocks_model_calls(
                 {
                     "id": agent["id"],
                     "name": agent["name"],
-                    "inner_context": {"system_prompt": f"INNER {agent['id']}"},
-                    "outer_context": {"system_prompt": f"OUTER {agent['id']}"},
+                    "prompt_profile": {
+                        "pronoun": "她",
+                        "hidden_beliefs": f"HIDDEN {agent['id']}",
+                        "inner_memories": f"INNER {agent['id']}",
+                        "outer_memories": f"OUTER {agent['id']}",
+                    },
+                    "interactions": (
+                        {"B": {"B": "一般场合"}} if agent["id"] == "A" else {}
+                    ),
                 }
                 for agent in scene["agents"]
             ],
@@ -266,7 +292,7 @@ def test_new_scene_starts_with_blank_prompts_and_blocks_model_calls(
     assert inner["content"] == "内层"
 
 
-@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize("schema_version", [1, 2, 3, 4, 5, 6, 7, 8])
 def test_old_schema_is_rejected_without_migration(
     scene_directory: Path,
     schema_version: int,
@@ -284,16 +310,46 @@ def test_old_schema_is_rejected_without_migration(
     original = json.dumps(raw).encode()
     path.write_bytes(original)
 
-    with pytest.raises(SceneReadError, match="not schema v8 or v6"):
+    with pytest.raises(SceneReadError, match="not schema v9"):
         SceneStorage(scene_directory).get(scene_id)
 
     assert path.read_bytes() == original
 
 
-def test_scene_edit_saves_two_complete_prompts_and_preserves_state(
+def test_scene_list_skips_one_unreadable_file(
+    scene_directory: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One corrupt file is logged and does not hide readable scenes."""
+    client, _model = make_client(scene_directory)
+    later = post_scene(client, name="码头")
+    earlier = post_scene(client, name="仓库")
+    corrupt_path = scene_directory / f"{uuid4()}.json"
+    corrupt_contents = b"not valid JSON"
+    corrupt_path.write_bytes(corrupt_contents)
+    caplog.set_level(logging.ERROR, logger="app.storage")
+
+    response = client.get("/api/scenes")
+
+    assert response.status_code == 200
+    assert response.json() == [
+        {"id": earlier["id"], "name": earlier["name"]},
+        {"id": later["id"], "name": later["name"]},
+    ]
+    assert corrupt_path.read_bytes() == corrupt_contents
+    [record] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "scene.load.failed"
+    ]
+    assert record.event_fields["scene_file"] == corrupt_path.name
+    assert record.event_fields["exception_type"] == "SceneReadError"
+
+
+def test_scene_edit_saves_profiles_interactions_and_preserves_state(
     scene_directory: Path,
 ) -> None:
-    """PUT only changes names and prompt text, never queue or call history."""
+    """PUT changes v9 settings but never queue or call history."""
     client, _model = make_client(scene_directory)
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "保留的事件")
@@ -303,11 +359,14 @@ def test_scene_edit_saves_two_complete_prompts_and_preserves_state(
             {
                 "id": agent["id"],
                 "name": f"居民 {agent['id']}",
-                "inner_context": {
-                    "system_prompt": f"INNER {agent['id']}\n完整文本"
+                "prompt_profile": {
+                    "pronoun": "她",
+                    "hidden_beliefs": f"HIDDEN {agent['id']}",
+                    "inner_memories": f"INNER {agent['id']}\n完整文本",
+                    "outer_memories": f"OUTER {agent['id']}\n完整文本",
                 },
-                "outer_context": {
-                    "system_prompt": f"OUTER {agent['id']}\n完整文本"
+                "interactions": {
+                    ("B" if agent["id"] == "A" else "A"): {"家人": "一般场合"}
                 },
             }
             for agent in scene["agents"]
@@ -323,7 +382,7 @@ def test_scene_edit_saves_two_complete_prompts_and_preserves_state(
         updated["agents"][0]["pending_events"]
         == (scene["agents"][0]["pending_events"])
     )
-    assert updated["agents"][0]["inner_context"]["system_prompt"] == (
+    assert updated["agents"][0]["prompt_profile"]["inner_memories"] == (
         "INNER A\n完整文本"
     )
     obsolete = deepcopy(payload)
@@ -332,6 +391,48 @@ def test_scene_edit_saves_two_complete_prompts_and_preserves_state(
         client.put(f"/api/scenes/{scene['id']}", json=obsolete).status_code
         == 422
     )
+
+
+@pytest.mark.parametrize(
+    "bad_interactions",
+    [
+        {"A": {"自己": "任何场合"}},
+        {
+            "B": {"家人": "一般场合"},
+            "C": {"家人": "正式场合"},
+        },
+    ],
+)
+def test_scene_api_rejects_self_targets_and_duplicate_addresses(
+    scene_directory: Path,
+    bad_interactions: dict[str, dict[str, str]],
+) -> None:
+    """Invalid reverse-routing configuration never reaches scene JSON."""
+    client, _model = make_client(scene_directory)
+    scene = post_scene(client)
+    payload = {
+        "name": scene["name"],
+        "agents": [
+            {
+                "id": agent["id"],
+                "name": agent["name"],
+                "prompt_profile": agent["prompt_profile"],
+                "interactions": (
+                    bad_interactions
+                    if agent["id"] == "A"
+                    else agent["interactions"]
+                ),
+            }
+            for agent in scene["agents"]
+        ],
+    }
+    path = scene_directory / f"{scene['id']}.json"
+    before = path.read_bytes()
+
+    response = client.put(f"/api/scenes/{scene['id']}", json=payload)
+
+    assert response.status_code == 422
+    assert path.read_bytes() == before
 
 
 def test_manual_events_are_fifo_editable_and_deletable_only_while_queued(
@@ -345,18 +446,21 @@ def test_manual_events_are_fifo_editable_and_deletable_only_while_queued(
     events = scene["agents"][0]["pending_events"]
     first_id = events[0]["id"]
     second_id = events[1]["id"]
-    assert [event["content"] for event in events] == ["第一件事", "第二件事"]
+    assert [event["content"] for event in events] == [
+        "  第一件事  ",
+        "第二件事",
+    ]
     assert [event["sequence"] for event in events] == [1, 2]
 
     edited = client.put(
         f"/api/scenes/{scene['id']}/agents/A/events/{second_id}",
-        json={"content": "改过的第二件事"},
+        json={"content": "  改过的第二件事\n"},
     )
     assert edited.status_code == 200
     assert [
         event["content"]
         for event in edited.json()["agents"][0]["pending_events"]
-    ] == ["第一件事", "改过的第二件事"]
+    ] == ["  第一件事  ", "  改过的第二件事\n"]
 
     wrong_owner = client.put(
         f"/api/scenes/{scene['id']}/agents/B/events/{second_id}",
@@ -404,7 +508,7 @@ def test_generation_writes_nothing_and_two_confirmations_route_atomically(
     """Only confirmations persist turns; outer confirmation routes one event."""
     client, model_client = make_client(
         scene_directory,
-        ["先观察。\n别急着表态。", "To   C ：  去码头等我。  "],
+        ["先观察。\n别急着表态。", "  对 C 说 ：  去码头等我。  "],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "潮水突然退了。")
@@ -441,11 +545,11 @@ def test_generation_writes_nothing_and_two_confirmations_route_atomically(
     assert outer_response.status_code == 200
     completed = outer_response.json()
     outer_turn = completed["agents"][0]["outer_context"]["turns"][0]
-    assert outer_turn["output"] == "To C: 去码头等我。"
+    assert outer_turn["output"] == "对C说：去码头等我。"
     assert outer_turn["recipient_id"] == "C"
     assert completed["agents"][1]["pending_events"] == []
     received = completed["agents"][2]["pending_events"][0]
-    assert received["content"] == "From A: 去码头等我。"
+    assert received["content"] == "去码头等我。"
     assert received["kind"] == "agent_message"
     assert received["source_call_id"] == outer_turn["call_id"]
     assert received["id"] == outer_turn["generated_event_id"]
@@ -459,7 +563,7 @@ def test_half_round_restores_outer_stage_after_restart(
     scene_directory: Path,
 ) -> None:
     """A saved inner turn remains ready for outer generation after reload."""
-    client, _model = make_client(scene_directory, ["内层已确认", "To B: 继续"])
+    client, _model = make_client(scene_directory, ["内层已确认", "对B说：继续"])
     scene = post_event(
         client,
         post_scene(client)["id"],
@@ -471,7 +575,7 @@ def test_half_round_restores_outer_stage_after_restart(
 
     restarted_client, _restarted_model = make_client(
         scene_directory,
-        ["To B: 继续"],
+        ["对B说：继续"],
     )
     preview = restarted_client.get(
         f"/api/scenes/{scene['id']}/agents/A/model-request-preview?layer=outer"
@@ -491,7 +595,7 @@ def test_stale_and_invalid_confirmations_never_partially_write(
     """Changed events, replayed calls, and invalid outer text fail safely."""
     client, _model = make_client(
         scene_directory,
-        ["原内层", "新内层", "To B: 合法外层"],
+        ["原内层", "新内层", "对B说：合法外层"],
     )
     scene = post_event(
         client,
@@ -528,7 +632,7 @@ def test_stale_and_invalid_confirmations_never_partially_write(
         "A",
         "outer",
         outer,
-        content="To A: 不能发给自己",
+        content="对A说：不能发给自己",
     )
     assert invalid.status_code == 422
     assert (
@@ -542,7 +646,7 @@ def test_agent_events_cannot_be_edited_deleted_or_skipped(
     """Routed messages are immutable and remain behind earlier FIFO events."""
     client, _model = make_client(
         scene_directory,
-        ["A 内层", "To B: A 发出的消息"],
+        ["A 内层", "对B说：A 发出的消息"],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "B", "B 的既有事件")
@@ -555,7 +659,7 @@ def test_agent_events_cannot_be_edited_deleted_or_skipped(
     generated_id = b_events[1]["id"]
     assert [event["content"] for event in b_events] == [
         "B 的既有事件",
-        "From A: A 发出的消息",
+        "A 发出的消息",
     ]
 
     edit = client.put(
@@ -575,7 +679,7 @@ def test_global_rollback_undoes_exactly_one_confirmed_call(
     """Inner and outer rollback restore their distinct half-round states."""
     client, _model = make_client(
         scene_directory,
-        ["A 内层", "To B: A 外层", "B 内层"],
+        ["A 内层", "对B说：A 外层", "B 内层"],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "A 手工事件")
@@ -633,7 +737,7 @@ def test_inner_round_consumes_the_whole_pending_batch_at_once(
     """One inner confirmation consumes and persists the entire FIFO batch."""
     client, _model = make_client(
         scene_directory,
-        ["A 内层", "To B: A 外层"],
+        ["A 内层", "对B说：A 外层"],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "第一件事")
@@ -681,7 +785,7 @@ def test_rollback_inner_restores_the_consumed_batch_in_fifo_order(
     """Undoing an inner batch restores every consumed event in order."""
     client, _model = make_client(
         scene_directory,
-        ["A 内层", "To C: A 外层"],
+        ["A 内层", "对C说：A 外层"],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "第一件事")
@@ -699,10 +803,10 @@ def test_rollback_inner_restores_the_consumed_batch_in_fifo_order(
     assert undone["agents"][0]["inner_context"]["turns"] == []
 
 
-def test_v6_scene_is_migrated_to_v8_on_read(
+def test_v6_scene_is_rejected_without_migration(
     scene_directory: Path,
 ) -> None:
-    """A legacy single-event v6 file loads as a v8 scene and persists."""
+    """A v6 file is rejected and remains byte-for-byte unchanged."""
     scene_directory.mkdir()
     scene_id = uuid4()
     path = scene_directory / f"{scene_id}.json"
@@ -732,6 +836,12 @@ def test_v6_scene_is_migrated_to_v8_on_read(
     }
     path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
 
+    original = path.read_bytes()
+    with pytest.raises(SceneReadError, match="not schema v9"):
+        SceneStorage(scene_directory).get(scene_id)
+    assert path.read_bytes() == original
+    return
+
     scene = SceneStorage(scene_directory).get(scene_id)
     assert scene.schema_version == SCHEMA_VERSION
     # A migrated v6 scene round-trips through validation and back to disk.
@@ -742,10 +852,10 @@ def test_v6_scene_is_migrated_to_v8_on_read(
     assert on_disk["schema_version"] == SCHEMA_VERSION
 
 
-def test_v6_scene_with_confirmed_turn_is_migrated_to_v8_batches(
+def test_v6_scene_with_confirmed_turn_is_rejected(
     scene_directory: Path,
 ) -> None:
-    """Legacy inner/outer turns keep references via single-item v8 batches."""  # noqa: E501
+    """A populated v6 scene is rejected without touching its JSON."""
     scene_directory.mkdir()
     scene_id = uuid4()
     path = scene_directory / f"{scene_id}.json"
@@ -858,6 +968,12 @@ def test_v6_scene_with_confirmed_turn_is_migrated_to_v8_batches(
     )
     path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
 
+    original = path.read_bytes()
+    with pytest.raises(SceneReadError, match="not schema v9"):
+        SceneStorage(scene_directory).get(scene_id)
+    assert path.read_bytes() == original
+    return
+
     scene = SceneStorage(scene_directory).get(scene_id)
     inner_turn = scene.agents[0].inner_context.turns[0]
     outer_turn = scene.agents[0].outer_context.turns[0]
@@ -884,13 +1000,13 @@ def _downgrade_to_v7(scene: dict[str, Any]) -> dict[str, Any]:
     return raw
 
 
-def test_v7_scene_is_migrated_to_v8_with_empty_reasoning(
+def test_v7_scene_is_rejected_without_migration(
     scene_directory: Path,
 ) -> None:
-    """A pre-reasoning v7 file loads with an empty reasoning on every turn."""
+    """A v7 file is rejected without receiving default reasoning."""
     client, _model = make_client(
         scene_directory,
-        ["A 内层", "To B: A 外层"],
+        ["A 内层", "对B说：A 外层"],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "事件")
@@ -904,6 +1020,12 @@ def test_v7_scene_is_migrated_to_v8_with_empty_reasoning(
         encoding="utf-8",
     )
 
+    original = path.read_bytes()
+    with pytest.raises(SceneReadError, match="not schema v9"):
+        SceneStorage(scene_directory).get(UUID(scene["id"]))
+    assert path.read_bytes() == original
+    return
+
     reloaded = SceneStorage(scene_directory).get(UUID(scene["id"]))
 
     assert reloaded.schema_version == SCHEMA_VERSION
@@ -915,13 +1037,13 @@ def test_v7_scene_is_migrated_to_v8_with_empty_reasoning(
     )
 
 
-def test_v8_scene_keeps_validated_historic_reasoning(
+def test_v9_scene_keeps_validated_historic_reasoning(
     scene_directory: Path,
 ) -> None:
     """Persisted reasoning validates and round-trips while empty stays legal."""  # noqa: E501
     client, _model = make_client(
         scene_directory,
-        ["A 内层", "To B: A 外层"],
+        ["A 内层", "对B说：A 外层"],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "事件")
@@ -958,7 +1080,7 @@ def test_inner_draft_goes_stale_when_a_new_event_arrives_before_confirm(
     """A generated inner draft is rejected once the queue content changes."""
     client, _model = make_client(
         scene_directory,
-        ["A 内层", "To C: A 外层"],
+        ["A 内层", "对C说：A 外层"],
     )
     scene = post_scene(client)
     scene = post_event(client, scene["id"], "A", "第一件事")
@@ -976,6 +1098,34 @@ def test_inner_draft_goes_stale_when_a_new_event_arrives_before_confirm(
         "第一件事",
         "第二件事",
     ]
+
+
+def test_stop_confirmation_has_null_route_and_rolls_back_without_event(
+    scene_directory: Path,
+) -> None:
+    """The HTTP workflow persists STOP independently from event routing."""
+    client, _model = make_client(scene_directory, ["A 内层", "STOP"])
+    scene = post_event(client, post_scene(client)["id"], "A", "事件")
+    inner = generate(client, scene["id"], "A", "inner")
+    scene = confirm(client, scene["id"], "A", "inner", inner).json()
+    outer = generate(client, scene["id"], "A", "outer")
+
+    completed = confirm(client, scene["id"], "A", "outer", outer)
+
+    assert completed.status_code == 200
+    saved = completed.json()
+    turn = saved["agents"][0]["outer_context"]["turns"][-1]
+    assert turn["output"] == "STOP"
+    assert turn["recipient_id"] is None
+    assert turn["generated_event_id"] is None
+    assert all(not agent["pending_events"] for agent in saved["agents"])
+
+    rolled_back = client.post(f"/api/scenes/{scene['id']}/rollback")
+    assert rolled_back.status_code == 200
+    assert rolled_back.json()["agents"][0]["outer_context"]["turns"] == []
+    assert all(
+        not agent["pending_events"] for agent in rolled_back.json()["agents"]
+    )
 
 
 def test_removed_single_layer_endpoints_are_absent(

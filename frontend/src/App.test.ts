@@ -15,6 +15,7 @@ import {
 import App from "./App.vue";
 import type {
   ExternalEvent,
+  Interactions,
   LayerDraftResponse,
   ModelOption,
   ModelRequestPreviewResponse,
@@ -33,21 +34,38 @@ type RouteHandler =
   | Response
   | ((init?: RequestInit) => Response | Promise<Response>);
 
+function interactionsFor(id: "A" | "B" | "C"): Interactions {
+  if (id === "A") {
+    return {
+      B: { 儿子: "一般场合", 小名: "亲昵场合" },
+      C: { 邻居: "邻里场合" },
+    };
+  }
+  return id === "B"
+    ? { A: { 母亲: "家庭场合" } }
+    : { A: { 邻居: "邻里场合" } };
+}
+
 function makeScene(): Scene {
   return {
-    schema_version: 8,
+    schema_version: 9,
     id: SCENE_ID,
     name: "海边小镇",
     model: MODEL,
     agents: (["A", "B", "C"] as const).map((id) => ({
       id,
       name: `居民 ${id}`,
+      prompt_profile: {
+        pronoun: "她",
+        hidden_beliefs: `HIDDEN ${id}`,
+        inner_memories: `INNER ${id}`,
+        outer_memories: `OUTER ${id}`,
+      },
+      interactions: interactionsFor(id),
       inner_context: {
-        system_prompt: `INNER ${id}`,
         turns: [],
       },
       outer_context: {
-        system_prompt: `OUTER ${id}`,
         turns: [],
       },
       pending_events: [],
@@ -107,7 +125,7 @@ function completeScene(): Scene {
     input:
       "外部事件：\n海面突然起雾。\n\n" +
       "你内心有一个声音：\n先观察风向。\n别急着靠岸。",
-    output: "To B: 今晚先别出海。",
+    output: "对儿子说：今晚先别出海。",
     recipient_id: "B",
     generated_event_id: GENERATED_EVENT_ID,
   });
@@ -115,7 +133,7 @@ function completeScene(): Scene {
     id: GENERATED_EVENT_ID,
     sequence: 3,
     kind: "agent_message",
-    content: "From A: 今晚先别出海。",
+    content: "今晚先别出海。",
     source_agent_id: "A",
     source_call_id: OUTER_CALL_ID,
   });
@@ -386,6 +404,114 @@ describe("App", () => {
     expect(findButton(container, "加载预览").disabled).toBe(true);
   });
 
+  it("allows only A to be configured and blocks blank B independently", async () => {
+    const scene = pendingScene();
+    scene.agents[1].prompt_profile = {
+      pronoun: "",
+      hidden_beliefs: "",
+      inner_memories: "",
+      outer_memories: "",
+    };
+    scene.agents[1].interactions = {};
+    scene.agents[1].pending_events.push(
+      manualEvent("B 的事件", "99999999-9999-4999-8999-999999999999", 2),
+    );
+    scene.next_sequence = 3;
+    await mountOpenedScene(scene);
+
+    expect(findButton(container, "生成内层草稿").disabled).toBe(false);
+    findButton(container, "居民 B").click();
+    await nextTick();
+
+    expect(findButton(container, "生成内层草稿").disabled).toBe(true);
+    expect(container.textContent).toContain(
+      "请填写四个提示词变量，并至少配置一个互动称呼。",
+    );
+    expect(findButton(container, "加载预览").disabled).toBe(true);
+  });
+
+  it("edits prompt variables and ordered interactions in the scene payload", async () => {
+    const scene = makeScene();
+    let savedBody: unknown;
+    await mountOpenedScene(scene, {
+      [`PUT /api/scenes/${SCENE_ID}`]: (init) => {
+        savedBody = JSON.parse(String(init?.body));
+        const update = savedBody as {
+          name: string;
+          agents: Scene["agents"];
+        };
+        const updated = structuredClone(scene);
+        updated.name = update.name;
+        updated.agents.forEach((agent, index) => {
+          agent.name = update.agents[index].name;
+          agent.prompt_profile = update.agents[index].prompt_profile;
+          agent.interactions = update.agents[index].interactions;
+        });
+        return jsonResponse(updated);
+      },
+    });
+
+    const settings = container.querySelector(
+      ".settings-card",
+    ) as HTMLDetailsElement;
+    settings.open = true;
+    const pronoun = settings.querySelector(
+      "#agent-pronoun",
+    ) as HTMLInputElement;
+    pronoun.value = "她自己";
+    pronoun.dispatchEvent(new Event("input", { bubbles: true }));
+
+    const firstAddress = settings.querySelector(
+      ".interaction-row input",
+    ) as HTMLInputElement;
+    firstAddress.value = "孩子";
+    firstAddress.dispatchEvent(new Event("change", { bubbles: true }));
+
+    const addInputs = settings.querySelectorAll(
+      ".interaction-add input",
+    );
+    const newAddress = addInputs[0] as HTMLInputElement;
+    const newOccasion = addInputs[1] as HTMLInputElement;
+    newAddress.value = "宝贝";
+    newAddress.dispatchEvent(new Event("input", { bubbles: true }));
+    newOccasion.value = "安慰场合";
+    newOccasion.dispatchEvent(new Event("input", { bubbles: true }));
+    findButton(settings, "添加称呼").click();
+    await nextTick();
+
+    const nicknameRow = [...settings.querySelectorAll(".interaction-row")].find(
+      (row) =>
+        (row.querySelector("input") as HTMLInputElement).value === "小名",
+    ) as HTMLElement;
+    findButton(nicknameRow, "删除").click();
+    await nextTick();
+    findButton(container, "保存设定").click();
+    await flush();
+
+    const savedUpdate = savedBody as {
+      name: string;
+      agents: Scene["agents"];
+    };
+    expect(savedUpdate.name).toBe(scene.name);
+    expect(savedUpdate.agents[0]).toMatchObject({
+      id: "A",
+      prompt_profile: {
+        pronoun: "她自己",
+        hidden_beliefs: "HIDDEN A",
+        inner_memories: "INNER A",
+        outer_memories: "OUTER A",
+      },
+      interactions: {
+        B: {
+          孩子: "一般场合",
+          宝贝: "安慰场合",
+        },
+        C: { 邻居: "邻里场合" },
+      },
+    });
+    expect(JSON.stringify(savedBody)).not.toContain("system_prompt");
+  });
+
   it("renders one mixed history with explicit neutral, inner, and outer labels", async () => {
     await mountOpenedScene(completeScene());
 
@@ -577,7 +703,7 @@ describe("App", () => {
       id: GENERATED_EVENT_ID,
       sequence: 2,
       kind: "agent_message",
-      content: "From B: 码头见。",
+      content: "码头见。",
       source_agent_id: "B",
       source_call_id: OUTER_CALL_ID,
     };
@@ -638,12 +764,12 @@ describe("App", () => {
     const createArea = container.querySelector(
       "#new-event",
     ) as HTMLTextAreaElement;
-    createArea.value = "新增潮汐报告";
+    createArea.value = "  新增潮汐报告\n";
     createArea.dispatchEvent(new Event("input", { bubbles: true }));
     await nextTick();
     findButton(container, "添加到队尾").click();
     await flush();
-    expect(createdBody).toEqual({ content: "新增潮汐报告" });
+    expect(createdBody).toEqual({ content: "  新增潮汐报告\n" });
   });
 
   it("restores an outer half-round and previews its neutral context", async () => {
@@ -655,7 +781,7 @@ describe("App", () => {
       context: [
         { role: "system", text: "OUTER A" },
         { role: "user", text: "上一轮外层输入" },
-        { role: "assistant", text: "To B: 上一轮外层输出" },
+        { role: "assistant", text: "对儿子说：上一轮外层输出" },
         {
           role: "user",
           text:

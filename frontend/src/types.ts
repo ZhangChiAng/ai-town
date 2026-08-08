@@ -49,24 +49,35 @@ export interface OuterTurn {
   sequence: number;
   input: string;
   output: string;
-  recipient_id: AgentId;
-  generated_event_id: string;
+  recipient_id: AgentId | null;
+  generated_event_id: string | null;
   reasoning?: ModelReasoningBlock[];
 }
 
 export interface InnerContext {
-  system_prompt: string;
   turns: InnerTurn[];
 }
 
 export interface OuterContext {
-  system_prompt: string;
   turns: OuterTurn[];
 }
+
+export interface PromptProfile {
+  pronoun: string;
+  hidden_beliefs: string;
+  inner_memories: string;
+  outer_memories: string;
+}
+
+export type Interactions = Partial<
+  Record<AgentId, Record<string, string>>
+>;
 
 export interface Agent {
   id: AgentId;
   name: string;
+  prompt_profile: PromptProfile;
+  interactions: Interactions;
   inner_context: InnerContext;
   outer_context: OuterContext;
   pending_events: ExternalEvent[];
@@ -79,7 +90,7 @@ export interface ConfirmedCallReference {
 }
 
 export interface Scene {
-  schema_version: 8;
+  schema_version: 9;
   id: string;
   name: string;
   model: string | null;
@@ -93,15 +104,11 @@ export interface SceneSummary {
   name: string;
 }
 
-export interface ContextUpdate {
-  system_prompt: string;
-}
-
 export interface AgentUpdate {
   id: AgentId;
   name: string;
-  inner_context: ContextUpdate;
-  outer_context: ContextUpdate;
+  prompt_profile: PromptProfile;
+  interactions: Interactions;
 }
 
 export interface SceneUpdate {
