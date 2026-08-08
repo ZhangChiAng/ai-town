@@ -56,13 +56,31 @@ model = "MiniMax-M3"
 protocol = "minimax_responses"
 base_url = "https://api.example.com/minimax"
 api_key_env = "MINIMAX_API_KEY"
+
+[[models]]
+model = "openai/gpt-5.6-luna"
+protocol = "openai_responses"
+base_url = "https://api.example.com/openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[models]]
+model = "openai/gpt-5.6-terra"
+protocol = "openai_responses"
+base_url = "https://api.example.com/openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[models]]
+model = "openai/gpt-5.6-sol"
+protocol = "openai_responses"
+base_url = "https://api.example.com/openai"
+api_key_env = "OPENAI_API_KEY"
 ```
 
 请把占位 URL 和模型名替换为兼容端点的实际值。`model` 大小写敏感且全局
 唯一；TOML 顺序就是界面顺序，可以配置任意数量模型，也可以让多个模型使用
-同一 protocol。当前正式内部 key 为 `anthropic_messages`、`deepseek_responses`
-和 `minimax_responses`。protocol、端点和密钥不会出现在模型选择、scene 数据或
-`GET /api/model-options` 中。
+同一 protocol。当前正式内部 key 为 `anthropic_messages`、
+`deepseek_responses`、`minimax_responses` 和 `openai_responses`。protocol、
+端点和密钥不会出现在模型选择、scene 数据或 `GET /api/model-options` 中。
 
 `api_key_env` 只引用环境变量名，真实 key 不得写进 `models.toml`。API key 按
 模型粒度存储：每个 `[[models]]` 通过自己的 `api_key_env` 引用独立的环境变量，
@@ -73,6 +91,7 @@ api_key_env = "MINIMAX_API_KEY"
 ANTHROPIC_API_KEY=""
 DEEPSEEK_API_KEY=""
 MINIMAX_API_KEY=""
+OPENAI_API_KEY=""
 ```
 
 进程环境优先于 `.env`；`.env` 文件本身可选，但每个 `api_key_env` 引用的值
@@ -298,6 +317,18 @@ previous response ID 或 Anthropic 缓存元数据；厂商 API 天然无状态�
 输出上限时直接报错，无需客户端截断。两种协议每次仍发送当前层完整历史，不做
 截断或摘要，并统一展示缓存写入、缓存读取、未缓存输入和输出 token 指标；短
 上下文指标为 0 属于正常情况。
+
+`openai_responses` 用于 OpenAI Responses 兼容代理；示例路由名
+`openai/gpt-5.6-luna`、`openai/gpt-5.6-terra` 和 `openai/gpt-5.6-sol`
+会逐字发送给代理，由代理分别映射到[官方 GPT-5.6 模型](https://developers.openai.com/api/docs/guides/latest-model)
+`gpt-5.6-luna`、`gpt-5.6-terra` 和 `gpt-5.6-sol`。
+请求固定发送完整文本历史、`instructions`、`store=false`，以及
+`reasoning={effort="max", summary="auto", context="current_turn"}`；其中 summary
+是显式申请的[公开推理摘要](https://developers.openai.com/api/docs/guides/reasoning#reasoning-summaries)。
+锁定的 SDK 在 `store=false` 时还会请求返回加密 reasoning，但项目不会回放或
+展示它。该协议关闭 reasoning/item ID 回放，不发送输出上限、conversation、
+previous response ID、service tier、truncation、工具或显式缓存设置；后续请求
+仍只重建当前人格层的完整纯文本历史。
 
 后端按 TOML 顺序异步创建模型 backend，并在部分启动失败或正常退出时逆序、
 幂等地关闭已创建资源；factory 构造中途失败也会先关闭 HTTP client。新增正式

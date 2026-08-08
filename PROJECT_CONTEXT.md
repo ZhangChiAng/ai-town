@@ -368,6 +368,17 @@ ID，也不发送 conversation 或 previous response ID；厂商 API 天然无�
 超过模型上限时直接返回错误，因此不引入 Anthropic 的缓存字段，也不需要客户端
 截断。
 
+OpenAI 使用独立的 `openai_responses` adapter 调用 Responses 兼容代理。模型名
+（`openai/gpt-5.6-luna`、`openai/gpt-5.6-terra` 或
+`openai/gpt-5.6-sol`）逐字发送，由代理映射到对应官方模型；请求固定设置
+`reasoning.effort="max"`、`reasoning.summary="auto"`、
+`reasoning.context="current_turn"` 和 `store=false`。SDK 在 `store=false` 时会
+申请返回加密 reasoning，但 adapter 关闭 reasoning/item ID 回放，项目既不展示
+也不在后续请求中发送该状态。该协议不发送 `max_output_tokens`、
+`previous_response_id`、conversation、service tier、truncation、工具或显式缓存
+设置。每次调用仍只发送当前层 system instructions、当前层完整纯文本历史和本轮
+输入，不发送 reasoning 或其他供应商状态。
+
 生成结果展示提供商返回的缓存写入、缓存读取、未缓存输入和输出 token 数。
 缓存门槛与是否命中由模型提供商决定，系统不填充无意义文本。
 
@@ -443,7 +454,7 @@ JSONL 每达到 10 MiB 轮转，最多保留 5 个旧文件（约 60 MiB 总量�
 - 前端：Vue 3 + TypeScript + Vite；
 - 持久化：`data/scenes/<scene-id>.json`；
 - 模型调用：Pydantic AI Direct 映射到 Anthropic Messages、DeepSeek
-  Responses 与 MiniMax Responses；
+  Responses、MiniMax Responses 与 OpenAI Responses；
 - 一个场景的三个 Agent、两个层级始终共用该场景绑定的同一模型；
 - Linux 开发，并可在安装 Python、uv、Node.js 与 npm 的 Windows 机器上
   本地运行。
@@ -456,8 +467,8 @@ JSONL 每达到 10 MiB 轮转，最多保留 5 个旧文件（约 60 MiB 总量�
 - `base_url`：有效的绝对 HTTP(S) URL；
 - `api_key_env`：按模型粒度保存该模型真实密钥的环境变量名，而非密钥本身。
 
-当前正式 protocol key 为 `anthropic_messages`、`deepseek_responses` 和
-`minimax_responses`；后两者共享 §9 的 Responses-兼容映射，并按各自 adapter 的
+当前正式 protocol key 为 `anthropic_messages`、`deepseek_responses`、
+`minimax_responses` 和 `openai_responses`；每个 Responses adapter 按 §9 的
 per-vendor 约定填写专属请求字段。
 配置层不硬编码协议枚举；注册表拒绝没有已注册 factory 的 key。TOML 声明顺序
 就是后端创建顺序和界面模型顺序，`GET /api/model-options` 的每个元素严格只有

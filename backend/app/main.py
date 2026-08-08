@@ -23,6 +23,7 @@ from app.model_backends import (
     create_deepseek_responses_backend,
     create_minimax_responses_backend,
     create_model_backend_registry,
+    create_openai_responses_backend,
 )
 from app.model_config import load_model_settings
 from app.models import (
@@ -74,6 +75,7 @@ BACKEND_FACTORIES: dict[str, BackendFactory] = {
     "anthropic_messages": create_anthropic_messages_backend,
     "deepseek_responses": create_deepseek_responses_backend,
     "minimax_responses": create_minimax_responses_backend,
+    "openai_responses": create_openai_responses_backend,
 }
 
 

@@ -23,6 +23,9 @@ from app.model_backends.deepseek_responses import (
 from app.model_backends.minimax_responses import (
     create_minimax_responses_backend,
 )
+from app.model_backends.openai_responses import (
+    create_openai_responses_backend,
+)
 from app.model_backends.pydantic_ai_backend import (
     PydanticAIBackend,
     create_request_capture_client,
@@ -53,5 +56,6 @@ __all__ = [
     "create_deepseek_responses_backend",
     "create_minimax_responses_backend",
     "create_model_backend_registry",
+    "create_openai_responses_backend",
     "create_request_capture_client",
 ]

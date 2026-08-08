@@ -15,11 +15,17 @@ FRONTEND_ROOT = REPOSITORY_ROOT / "frontend" / "src"
 ANTHROPIC_ADAPTER = MODEL_BACKENDS_ROOT / "anthropic_messages.py"
 DEEPSEEK_ADAPTER = MODEL_BACKENDS_ROOT / "deepseek_responses.py"
 MINIMAX_ADAPTER = MODEL_BACKENDS_ROOT / "minimax_responses.py"
+OPENAI_ADAPTER = MODEL_BACKENDS_ROOT / "openai_responses.py"
 PYDANTIC_AI_BACKEND = MODEL_BACKENDS_ROOT / "pydantic_ai_backend.py"
-ADAPTER_PATHS = (ANTHROPIC_ADAPTER, DEEPSEEK_ADAPTER, MINIMAX_ADAPTER)
+ADAPTER_PATHS = (
+    ANTHROPIC_ADAPTER,
+    DEEPSEEK_ADAPTER,
+    MINIMAX_ADAPTER,
+    OPENAI_ADAPTER,
+)
 SDK_OWNERS = {
     "anthropic": (ANTHROPIC_ADAPTER,),
-    "openai": (DEEPSEEK_ADAPTER, MINIMAX_ADAPTER),
+    "openai": (DEEPSEEK_ADAPTER, MINIMAX_ADAPTER, OPENAI_ADAPTER),
 }
 PROVIDER_MARKERS = (
     "anthropic",
@@ -163,6 +169,7 @@ def test_provider_factories_are_async_for_failure_cleanup() -> None:
         ANTHROPIC_ADAPTER: "create_anthropic_messages_backend",
         DEEPSEEK_ADAPTER: "create_deepseek_responses_backend",
         MINIMAX_ADAPTER: "create_minimax_responses_backend",
+        OPENAI_ADAPTER: "create_openai_responses_backend",
     }
     for path, name in factory_names.items():
         definition = _top_level_definition(path, name)
